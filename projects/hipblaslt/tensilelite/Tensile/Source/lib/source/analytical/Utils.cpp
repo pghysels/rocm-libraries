@@ -251,7 +251,7 @@ namespace TensileLite
                 }
 
                 size_t split = 1;
-                if(check_LDS_capacity(hardware, MT_M, MT_N, MT_K, element_size_A, debug))
+                if(check_LDS_capacity(hardware, MT_M, MT_N, MT_K, element_size_A, element_size_B, debug))
                 {
                     double Total_latency = compute_total_latency(hardware,
                                                                  M,
@@ -371,66 +371,68 @@ namespace TensileLite
             bool   debug,
             bool   print)
         {
-            using WGMResult = std::pair<double, size_t>; // (l2_hit_rate, WGM)
+            return select_best_wgm(hardware, M, N, K, batch, MT_M, MT_N, MT_K, element_size, element_size, WGM_list, debug);
+            
+            // using WGMResult = std::pair<double, size_t>; // (l2_hit_rate, WGM)
 
-            std::vector<WGMResult> valid_results;
-            valid_results.reserve(WGM_list.size());
+            // std::vector<WGMResult> valid_results;
+            // valid_results.reserve(WGM_list.size());
 
-            // Iterate over all candidate WGM values
-            for(const auto& candidate_wgm : WGM_list)
-            {
-                if(debug)
-                {
-                    std::cout << "Evaluating WGM=" << candidate_wgm << "\n";
-                }
+            // // Iterate over all candidate WGM values
+            // for(const auto& candidate_wgm : WGM_list)
+            // {
+            //     if(debug)
+            //     {
+            //         std::cout << "Evaluating WGM=" << candidate_wgm << "\n";
+            //     }
 
-                // Optionally ensure we do not exceed LDS capacity
-                // (If you want to factor in WGM, add it to your check_LDS_capacity signature.)
-                // For now, let's just check the tile itself:
-                if(!check_LDS_capacity(hardware, MT_M, MT_N, MT_K, element_size, debug))
-                {
-                    if(debug)
-                    {
-                        std::cout << "Skipping WGM=" << candidate_wgm << " due to LDS capacity.\n";
-                    }
-                    continue;
-                }
+            //     // Optionally ensure we do not exceed LDS capacity
+            //     // (If you want to factor in WGM, add it to your check_LDS_capacity signature.)
+            //     // For now, let's just check the tile itself:
+            //     if(!check_LDS_capacity(hardware, MT_M, MT_N, MT_K, element_size, element_size, debug))
+            //     {
+            //         if(debug)
+            //         {
+            //             std::cout << "Skipping WGM=" << candidate_wgm << " due to LDS capacity.\n";
+            //         }
+            //         continue;
+            //     }
 
-                // Compute L2 hit rate for this WGM
-                double current_hit = estimate_l2_hit(hardware,
-                                                     static_cast<int>(M),
-                                                     static_cast<int>(N),
-                                                     static_cast<int>(K),
-                                                     static_cast<int>(batch),
-                                                     static_cast<int>(MT_M),
-                                                     static_cast<int>(MT_N),
-                                                     static_cast<int>(MT_K),
-                                                     static_cast<int>(candidate_wgm),
-                                                     element_size);
+            //     // Compute L2 hit rate for this WGM
+            //     double current_hit = estimate_l2_hit(hardware,
+            //                                          static_cast<int>(M),
+            //                                          static_cast<int>(N),
+            //                                          static_cast<int>(K),
+            //                                          static_cast<int>(batch),
+            //                                          static_cast<int>(MT_M),
+            //                                          static_cast<int>(MT_N),
+            //                                          static_cast<int>(MT_K),
+            //                                          static_cast<int>(candidate_wgm),
+            //                                          element_size);
 
-                valid_results.emplace_back(current_hit, candidate_wgm);
-            }
+            //     valid_results.emplace_back(current_hit, candidate_wgm);
+            // }
 
-            // If no valid WGM was found, throw an error
-            if(valid_results.empty())
-            {
-                throw std::runtime_error("No valid WGM found.");
-            }
+            // // If no valid WGM was found, throw an error
+            // if(valid_results.empty())
+            // {
+            //     throw std::runtime_error("No valid WGM found.");
+            // }
 
-            // Find the maximum L2 hit rate in valid_results
-            // (Use max_element on the first value in the pair.)
-            auto best_it = std::max_element(
-                valid_results.begin(),
-                valid_results.end(),
-                [](const WGMResult& a, const WGMResult& b) {
-                    return a.first < b.first; // "less" => a has smaller hit rate than b
-                });
+            // // Find the maximum L2 hit rate in valid_results
+            // // (Use max_element on the first value in the pair.)
+            // auto best_it = std::max_element(
+            //     valid_results.begin(),
+            //     valid_results.end(),
+            //     [](const WGMResult& a, const WGMResult& b) {
+            //         return a.first < b.first; // "less" => a has smaller hit rate than b
+            //     });
 
-            double best_l2_hit = best_it->first;
-            size_t best_wgm    = best_it->second;
+            // double best_l2_hit = best_it->first;
+            // size_t best_wgm    = best_it->second;
 
-            // Return (l2_hit_rate, WGM)
-            return std::make_pair(best_l2_hit, best_wgm);
+            // // Return (l2_hit_rate, WGM)
+            // return std::make_pair(best_l2_hit, best_wgm);
         }
 
         // Logic to decide between two MT that are "tied"
@@ -501,7 +503,7 @@ namespace TensileLite
                               << ", MI_K=" << MI_K << "\n";
                 }
 
-                if(check_LDS_capacity(hardware, MT_M, MT_N, MT_K, element_size, debug))
+                if(check_LDS_capacity(hardware, MT_M, MT_N, MT_K, element_size, element_size, debug))
                 {
                     size_t split         = 1;
                     size_t mx_block_size = 0;

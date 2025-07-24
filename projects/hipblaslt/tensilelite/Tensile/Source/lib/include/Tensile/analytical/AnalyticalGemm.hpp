@@ -49,138 +49,6 @@ namespace TensileLite
                                            size_t                  max_timesteps,
                                            size_t                  max_iters);
 
-        // Compute the number of matrix instructions required to compute a single MT_MXMT_NXMT_K tile.
-        size_t compute_number_matrix_instructions(const Hardware& hardware,
-                                                  size_t          MT_M,
-                                                  size_t          MT_N,
-                                                  size_t          MT_K,
-                                                  size_t          MI_M,
-                                                  size_t          MI_N,
-                                                  size_t          MI_K,
-                                                  bool            debug);
-
-        // Determine the compute latency per MT_MxMT_NxMT_K Macro Tile (L_MT).
-        size_t compute_mt_compute_latency(const Hardware& hardware,
-                                          size_t          M,
-                                          size_t          N,
-                                          size_t          K,
-                                          bool            transA,
-                                          bool            transB,
-                                          size_t          MT_M,
-                                          size_t          MT_N,
-                                          size_t          MT_K,
-                                          size_t          MI_M,
-                                          size_t          MI_N,
-                                          size_t          MI_K,
-                                          size_t          element_size_A, //In bits
-                                          size_t          element_size_B, //In bits,
-                                          bool            debug);
-
-        // Computes the number of MT timesteps required to compute all MT. Last wave may be less occupied.
-        size_t compute_number_waves(const Hardware& hardware,
-                                    size_t          M,
-                                    size_t          N,
-                                    size_t          batch,
-                                    size_t          MT_M,
-                                    size_t          MT_N,
-                                    size_t          split,
-                                    bool            debug);
-
-        // Compute the amount of data loaded from A to produce a MT_MxMT_NxMT_K tile.
-        size_t compute_A_loads(size_t MT_M, size_t MT_K, bool debug);
-
-        // Compute the amount of data loaded from B to produce a MT_MxMT_NxMT_K tile.
-        size_t compute_B_loads(size_t MT_N, size_t MT_K, bool debug);
-
-        // Computes total data loads per CU per MT from A and B
-        // Reads happen every MT, Writes happen every K-complete tile.
-        size_t compute_CU_loads(size_t MT_M, size_t MT_N, size_t MT_K, bool debug);
-
-        // Computes the number of active compute units if there is only one wave and it is partial
-        // Otherwise, returns hardware.N_CU
-        size_t compute_active_CU(
-            const Hardware& hardware, size_t M, size_t N, size_t MT_M, size_t MT_N);
-
-        double compute_memory_latency(const Hardware& hardware,
-                                      size_t          M,
-                                      size_t          N,
-                                      size_t          K,
-                                      size_t          batch,
-                                      size_t          MT_M,
-                                      size_t          MT_N,
-                                      size_t          MT_K,
-                                      size_t          split,
-                                      double          H_L2,
-                                      size_t          element_size_A, //In bits
-                                      size_t          element_size_B, //In bits,
-                                      size_t          mx_block_size,
-                                      bool            debug);
-
-        // Computes the latency to compute a K-COMPLETE tile.
-        double compute_tile_latency(const Hardware& hardware,
-                                    size_t          M,
-                                    size_t          N,
-                                    size_t          K,
-                                    size_t          batch,
-                                    bool            transA,
-                                    bool            transB,
-                                    size_t          MT_M,
-                                    size_t          MT_N,
-                                    size_t          MT_K,
-                                    size_t          MI_M,
-                                    size_t          MI_N,
-                                    size_t          MI_K,
-                                    size_t          split,
-                                    double          H_L2,
-                                    size_t          element_size_A, //In bits
-                                    size_t          element_size_B, //In bits,
-                                    size_t          element_size_out, //In bits
-                                    size_t          mx_block_size,
-                                    bool            debug);
-
-        double estimate_l2_hit(const Hardware& hardware,
-                               int             M,
-                               int             N,
-                               int             K,
-                               int             batch,
-                               int             MT_M,
-                               int             MT_N,
-                               int             MT_K,
-                               int             WGM,
-                               size_t          element_size);
-        double estimate_mall_hit(const Hardware& hardware,
-                                 int             M,
-                                 int             N,
-                                 int             K,
-                                 int             batch,
-                                 int             MT_M,
-                                 int             MT_N,
-                                 int             MT_K,
-                                 int             WGM);
-
-        // Computes the latency per K-complete MT wave.
-        // A wave is defined as : The time it takes for one CU to complete one K-complete output tile
-        double compute_wave_latency(const Hardware& hardware,
-                                    size_t          M,
-                                    size_t          N,
-                                    size_t          K,
-                                    size_t          batch,
-                                    bool            transA,
-                                    bool            transB,
-                                    size_t          MT_M,
-                                    size_t          MT_N,
-                                    size_t          MT_K,
-                                    size_t          MI_M,
-                                    size_t          MI_N,
-                                    size_t          MI_K,
-                                    size_t          split,
-                                    double          H_L2,
-                                    size_t          element_size_A, //In bits
-                                    size_t          element_size_B, //In bits,
-                                    size_t          element_size_out, //In bits
-                                    size_t          mx_block_size,
-                                    bool            debug);
-
         // Compute the total latency of a gemm based on the latency of one wave multiplied by the number of waves
         // A wave is defined as : The time it takes for one CU to complete one K-complete output tile
         double compute_total_latency(const Hardware& hardware,
@@ -204,6 +72,19 @@ namespace TensileLite
                                      int             WGM,
                                      size_t          mx_block_size,
                                      bool            debug);
+
+        std::pair<double, size_t> select_best_wgm(const Hardware&            hardware,
+                                                  int                        M,
+                                                  int                        N,
+                                                  int                        K,
+                                                  int                        batch,
+                                                  int                        MT_M,
+                                                  int                        MT_N,
+                                                  int                        MT_K,
+                                                  size_t                     element_size_A,
+                                                  size_t                     element_size_B,
+                                                  const std::vector<size_t>& WGM_list,
+                                                  bool                       debug);
 
         // Compute the performance from the latency.
         // IMPORTANT : This program is NOT meant to be an analytical model for performance, but rather a way to rank different macro tile sizes.
@@ -231,7 +112,8 @@ namespace TensileLite
                                 size_t          MT_M,
                                 size_t          MT_N,
                                 size_t          MT_K,
-                                size_t          element_size,
+                                size_t          element_size_A,
+                                size_t          element_size_B,
                                 bool            debug);
 
     } // namespace analytical
