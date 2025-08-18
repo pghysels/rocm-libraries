@@ -303,7 +303,7 @@
     tailLoopOptA: false
     tailLoopOptB: false
 - [0, 1, 2, 3, 4, 5, 6, 7]  # Mmin, Mmax, Nmin, Nmax, Bmin, Bmax, Kmin, Kmax
-- - - [1, 2048, 1, 2048, -1, -1, 200000, 50000000]
+- - - [4, 512, 8, 512, -1, -1, 200000, 50000000]
     - [0, 0]
 - null
 - null
