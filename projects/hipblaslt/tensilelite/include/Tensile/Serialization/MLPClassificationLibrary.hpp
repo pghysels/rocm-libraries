@@ -151,8 +151,21 @@ namespace TensileLite
                         {
                             auto solution = slnIter->second;
                             lib.solutionmap.insert(std::make_pair(index, solution));
+
+                            lib.tile_list.emplace_back(
+                                solution->sizeMapping.macroTile.x,
+                                solution->sizeMapping.macroTile.y,
+                                solution->sizeMapping.depthU,
+                                solution->sizeMapping.matrixInstruction[0],
+                                solution->sizeMapping.matrixInstruction[1],
+                                solution->sizeMapping.matrixInstruction[2],
+                                solution->sizeMapping.CUOccupancy);
                         }
                     }
+                    // remove duplicates from tile_list
+                    std::sort(lib.tile_list.begin(), lib.tile_list.end());
+                    auto last = std::unique(lib.tile_list.begin(), lib.tile_list.end());
+                    lib.tile_list.erase(last, lib.tile_list.end());
                 }
 
                 using MLPNet = MLPClassification::MLPNet;

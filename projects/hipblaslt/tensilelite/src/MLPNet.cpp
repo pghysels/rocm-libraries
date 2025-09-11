@@ -76,6 +76,9 @@ namespace TensileLite
             virtual ~WeightMatrix() = default;
 
             virtual void operator()(const std::vector<dtype>& F, std::vector<dtype>& Fout) const;
+            virtual void operator()(const std::vector<dtype>& F,
+                                    std::vector<dtype>& Fout,
+                                    const std::vector<bool>& mask) const;
 
             std::vector<dtype> weight;
         };
@@ -93,6 +96,9 @@ namespace TensileLite
             }
 
             void operator()(const std::vector<dtype>& F, std::vector<dtype>& Fout) const override;
+            void operator()(const std::vector<dtype>& F,
+                            std::vector<dtype>& Fout,
+                            const std::vector<bool>& mask) const override;
         };
 
         void WeightMatrix::operator()(const std::vector<dtype>& F, std::vector<dtype>& Fout) const
@@ -100,6 +106,26 @@ namespace TensileLite
             for(int i = 0; i < Fout.size(); i++)
                 Fout[i] += std::inner_product(
                     F.begin(), F.end(), weight.begin() + i * F.size(), dtype(0.));
+        }
+
+        void WeightMatrix::operator()(const std::vector<dtype>& F,
+                                      std::vector<dtype>&       Fout,
+                                      const std::vector<bool>&  mask) const
+        {
+            auto W = weight.data();
+            for(int i = 0; i < Fout.size(); i++)
+            {
+                if(!mask[i])
+                    Fout[i] = std::numeric_limits<dtype>::min();
+                else
+                {
+                    dtype fi(0.);
+                    auto  Fptr = F.data();
+                    for(int j = 0; j < F.size(); j++)
+                        fi += (*W++) * (*Fptr++);
+                    Fout[i] += fi;
+                }
+            }
         }
 
         template <int N_IN>
@@ -118,6 +144,30 @@ namespace TensileLite
                 Fout[i] += fi;
             }
         }
+
+        template <int N_IN>
+        void WeightMatrixFixed<N_IN>::operator()(const std::vector<dtype>& F,
+                                                 std::vector<dtype>&       Fout,
+                                                 const std::vector<bool>&  mask) const
+        {
+            assert(F.size() == N_IN);
+            auto W = weight.data();
+            for(int i = 0; i < Fout.size(); i++)
+            {
+                if(!mask[i])
+                    Fout[i] = dtype(0.);
+                else
+                {
+                    dtype fi(0.);
+                    auto  Fptr = F.data();
+#pragma clang loop unroll_count(N_IN)
+                    for(int j = 0; j < N_IN; j++)
+                        fi += (*W++) * (*Fptr++);
+                    Fout[i] += fi;
+                }
+            }
+        }
+
 
         DenseLayer::DenseLayer(const std::vector<float>& weights, const std::vector<float>& bias)
         {
@@ -157,6 +207,15 @@ namespace TensileLite
             (*W)(F, Fout);
             return Fout;
         }
+
+        std::vector<dtype> DenseLayer::operator()(const std::vector<dtype>& F,
+                                                  const std::vector<bool>& mask) const
+        {
+            auto Fout = B;
+            (*W)(F, Fout, mask);
+            return Fout;
+        }
+
 
         bool DenseLayer::valid(bool verbose) const
         {
@@ -216,7 +275,7 @@ namespace TensileLite
             return is_valid;
         }
 
-        std::vector<dtype> MLPNet::predict(std::vector<float> const& probkey) const
+        std::vector<dtype> MLPNet::predict_hidden(std::vector<float> const& probkey) const
         {
             dtype M = probkey[0], N = probkey[1], B = probkey[2], K = probkey[3];
             M = std::min(dtype(16384), M);
@@ -239,7 +298,12 @@ namespace TensileLite
             scaler(F);
             for(auto& res : res_blocks)
                 F = res(F);
-            return dense(F);
+            return F;
+        }
+
+        std::vector<dtype> MLPNet::predict(std::vector<float> const& probkey) const
+        {
+            return dense(predict_hidden(probkey));
         }
 
         bool MLPNet::valid(bool verbose) const

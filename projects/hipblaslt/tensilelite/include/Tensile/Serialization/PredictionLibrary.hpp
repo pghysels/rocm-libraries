@@ -91,9 +91,13 @@ namespace TensileLite
                                 solution->sizeMapping.matrixInstruction[1], // MI_N
                                 solution->sizeMapping.matrixInstruction[2], // MI_K
                                 solution->sizeMapping.CUOccupancy); // Occupancy
-                            lib.tile_list.emplace_back(solution_tuple);
+                            // lib.tile_list.emplace_back(solution_tuple);
                             lib.tile_map.insert(std::make_pair(solution_tuple, index));
                         }
+                    }
+                    for (auto k : lib.tile_map)
+                    {
+                        lib.tile_list.emplace_back(k.first);
                     }
                 }
             }

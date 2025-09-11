@@ -74,6 +74,8 @@ namespace TensileLite
             DenseLayer(const std::vector<float>& weights, const std::vector<float>& bias);
 
             std::vector<dtype> operator()(const std::vector<dtype>& F) const;
+            std::vector<dtype> operator()(const std::vector<dtype>& F,
+                                          const std::vector<bool>&  mask) const;
 
             bool valid(bool verbose = false) const;
 
@@ -99,7 +101,8 @@ namespace TensileLite
         {
             MLPNet() = default;
 
-            std::vector<dtype> predict(std::vector<float> const& probkey) const;
+            std::vector<dtype> predict_hidden(const std::vector<float>& probkey) const;
+            std::vector<dtype> predict(const std::vector<float>& probkey) const;
 
             bool valid(bool verbose = false) const;
 

@@ -53,9 +53,10 @@ namespace TensileLite
         using ProblemFeatures  = std::vector<std::shared_ptr<MLFeatures::MLFeature<MyProblem>>>;
 
         std::map<int, std::shared_ptr<MySolution>> solutionmap;
-        std::shared_ptr<MLPNet>                   model;
+        std::shared_ptr<MLPNet>                    model;
         SolutionFeatures                           solFeatures;
         ProblemFeatures                            probFeatures;
+        std::vector<analytical::TileTuple>         tile_list;
 
         static std::string Type()
         {
@@ -131,29 +132,77 @@ namespace TensileLite
                 = ProblemKey::keyForProblem<std::vector<float>, MyProblem, float>(
                     problem, this->probFeatures);
 
-            auto logits = model->predict(problemkey);
-            assert(logits.size() == solutionmap.size());
+            bool                  debug   = Debug::Instance().printPropertyEvaluation();
+            hip::HipAMDGPU const* pAMDGPU = dynamic_cast<hip::HipAMDGPU const*>(&hardware);
+            const analytical::Hardware& hw = *(pAMDGPU->analyticalHardware);
+            int WGM = std::sqrt(std::floor(hw.N_CU / hw.NUM_XCD));
+            analytical::DataType miDataType = static_cast<analytical::DataType>(problem.computeInputType());
+            if(problem.f32XdlMathOp() == rocisa::DataType::XFloat32) // Check F32 compute type
+                miDataType = analytical::DataType::XFloat32;
+            auto selected_tiles = analytical::select_best_macro_tile_size(
+                problemkey[0],
+                problemkey[1],
+                problemkey[3],
+                problemkey[2],
+                problem.transA(),
+                problem.transB(),
+                hw,
+                tile_list,
+                problem.a().elementBytes() * 8,
+                problem.b().elementBytes() * 8,
+                problem.c().elementBytes() * 8,
+                miDataType,
+                0, //mx_block_size -> MX Data types come from rocroller.
+                0.8,
+                debug,
+                false,
+                WGM);
 
-            std::vector<std::pair<decltype(logits)::value_type,
-                                  std::shared_ptr<MySolution>*>> solution_ranking;
-            solution_ranking.reserve(solutionmap.size());
-            for(auto& s : solutionmap)
-                solution_ranking.emplace_back(logits[s.second->libraryLogicIndex],
-                    (std::shared_ptr<MySolution>*)(&s.second));
+            auto Fhidden = model->predict_hidden(problemkey);
+            std::vector<bool> mask(solutionmap.size());
 
             SolutionVector<MySolution> rv;
-            int numToSort = std::min(numSolutions, int(solution_ranking.size()));
-            rv.reserve(numToSort);
-            auto it = solution_ranking.begin(), it_end = solution_ranking.end();
-            while(it != it_end && numToSort)
+
+            for(const auto& tile : selected_tiles)
             {
-                std::partial_sort(it, it + numToSort, it_end, std::greater{});
-                for(; it != it + numToSort; it++)
-                    if((*((*it->second)->problemPredicate))(problem))
+                size_t i = 0;
+                for(const auto& s : solutionmap)
+                {
+                    mask[i] =
+                        std::get<1>(tile) == s.second->sizeMapping.macroTile.x &&
+                        std::get<2>(tile) == s.second->sizeMapping.macroTile.y &&
+                        std::get<3>(tile) == s.second->sizeMapping.depthU &&
+                        std::get<4>(tile) == s.second->sizeMapping.matrixInstruction[0] &&
+                        std::get<5>(tile) == s.second->sizeMapping.matrixInstruction[1] &&
+                        std::get<6>(tile) == s.second->sizeMapping.matrixInstruction[2] &&
+                        std::get<7>(tile) == s.second->sizeMapping.CUOccupancy;
+                    i++;
+                }
+                auto logits = model->dense(Fhidden, mask);
+
+                std::vector<std::pair<decltype(logits)::value_type,
+                                      std::shared_ptr<MySolution>*>> solution_ranking;
+                solution_ranking.reserve(solutionmap.size());
+                i = 0;
+                for(const auto& s : solutionmap)
+                {
+                    if(mask[i])
+                        solution_ranking.emplace_back(logits[s.second->libraryLogicIndex],
+                            (std::shared_ptr<MySolution>*)(&s.second));
+                    i++;
+                }
+                std::sort(solution_ranking.begin(), solution_ranking.end());
+                for(auto& s : solution_ranking)
+                {
+                    auto& solution = *s.second;
+                    if((*solution->hardwarePredicate)(hardware) &&
+                       (*solution->problemPredicate)(problem))
                     {
-                        rv.emplace_back(*it->second);
-                        numToSort--;
+                        rv.emplace_back(solution);
+                        if(rv.size() == numSolutions)
+                            return rv;
                     }
+                }
             }
             return rv;
         }
