@@ -99,95 +99,11 @@ namespace TensileLite
             if(searchType == SolutionLibrarySearchType::DEFAULT)
                 return rv;
 
-            // for(auto const& row : this->solutionmap)
-            // {
-            //     if(debug)
-            //         std::cout << row.second->description() << std::endl;
-            //     rv.insert(row.second);
-            // }
-            size_t                     m     = 1;
-            size_t                     n     = 1;
-            size_t                     k     = 1;
-            size_t                     batch = 1;
-            for(size_t i = 0; i < problem.freeIndicesA().size(); i++)
+            for(auto const& row : this->solutionmap)
             {
-                m *= problem.freeSizeA(i);
-            }
-            for(size_t i = 0; i < problem.freeIndicesB().size(); i++)
-            {
-                n *= problem.freeSizeB(i);
-            }
-            for(size_t i = 0; i < problem.boundIndices().size(); ++i)
-            {
-                k *= problem.boundSize(i);
-            }
-            for(size_t i = 0; i < problem.batchIndices().size(); ++i)
-            {
-                batch *= problem.batchSize(i);
-            }
-
-            hip::HipAMDGPU const* pAMDGPU = dynamic_cast<hip::HipAMDGPU const*>(&hardware);
-            size_t elementSizeA_bits
-                = problem.a().elementBytes() * 8;
-            size_t elementSizeB_bits
-                = problem.b().elementBytes() * 8;
-            size_t elementSizeC_bits
-                = problem.c().elementBytes() * 8;
-            const analytical::Hardware& analaytical_hardware = *(pAMDGPU->analyticalHardware);
-            int WGM
-                = std::sqrt(std::floor(analaytical_hardware.N_CU / analaytical_hardware.NUM_XCD));
-            analytical::DataType miDataType = static_cast<analytical::DataType>(problem.computeInputType());
-            if(problem.f32XdlMathOp() == rocisa::DataType::XFloat32) // Check F32 compute type
-                miDataType = analytical::DataType::XFloat32;
-            auto selected_tiles = analytical::select_best_macro_tile_size(
-                m,
-                n,
-                k,
-                batch,
-                problem.transA(),
-                problem.transB(),
-                *(pAMDGPU->analyticalHardware),
-                tile_list,
-                elementSizeA_bits,
-                elementSizeB_bits,
-                elementSizeC_bits,
-                miDataType,
-                0, //mx_block_size -> MX Data types come from rocroller.
-                0.8,
-                debug,
-                false,
-                WGM);
-
-            if(!selected_tiles.empty()){
-                const auto& tile = selected_tiles[0];
-                for (const auto& s : solutionmap)
-                {
-                    auto& solution = s.second;
-                    if(solution->sizeMapping.macroTile.x == std::get<1>(tile) &&
-                       solution->sizeMapping.macroTile.y == std::get<2>(tile) &&
-                       solution->sizeMapping.depthU == std::get<3>(tile) &&
-                       solution->sizeMapping.matrixInstruction[0] == std::get<4>(tile) &&
-                       solution->sizeMapping.matrixInstruction[1] == std::get<5>(tile) &&
-                       solution->sizeMapping.matrixInstruction[2] == std::get<6>(tile) &&
-                       solution->sizeMapping.CUOccupancy == std::get<7>(tile) &&
-                       (*solution->hardwarePredicate)(hardware) &&
-                       (*solution->problemPredicate)(problem))
-                    {
-                        // std::cout << "Adding solution: "
-                        //           << solution->sizeMapping.macroTile.x << ", "
-                        //           << solution->sizeMapping.macroTile.y << ", "
-                        //           << solution->sizeMapping.depthU << ", "
-                        //           << solution->sizeMapping.matrixInstruction[0] << ", "
-                        //           << solution->sizeMapping.matrixInstruction[1] << ", "
-                        //           << solution->sizeMapping.matrixInstruction[2] << ", "
-                        //           << solution->name() << std::endl;
-                        rv.insert(solution);
-                        // if(rv.size() == numSolutions)
-                        // {
-                        //     break;
-                        // }
-                    }
-                }
+                if(debug)
+                    std::cout << row.second->description() << std::endl;
+                rv.insert(row.second);
             }
 
             return rv;
@@ -273,7 +189,7 @@ namespace TensileLite
                 false,
                 WGM);
 
-            // if(tile_map.size() == tile_list.size())
+            if(tile_map.size() == solutionmap.size())
             {
                 for(const auto& tile : selected_tiles)
                 {
@@ -300,40 +216,46 @@ namespace TensileLite
                     }
                 }
             }
-            // else
-            // {
-            //     for(const auto& tile : selected_tiles)
-            //     {
-            //         for (const auto& s : solutionmap)
-            //         {
-            //             auto& solution = s.second;
-            //             if(solution->sizeMapping.macroTile.x == std::get<1>(tile) &&
-            //                solution->sizeMapping.macroTile.y == std::get<2>(tile) &&
-            //                solution->sizeMapping.depthU == std::get<3>(tile) &&
-            //                solution->sizeMapping.matrixInstruction[0] == std::get<4>(tile) &&
-            //                solution->sizeMapping.matrixInstruction[1] == std::get<5>(tile) &&
-            //                solution->sizeMapping.matrixInstruction[2] == std::get<6>(tile) &&
-            //                solution->sizeMapping.CUOccupancy == std::get<7>(tile) &&
-            //                (*solution->hardwarePredicate)(hardware) &&
-            //                (*solution->problemPredicate)(problem))
-            //             {
-            //                 // std::cout << "Adding solution: "
-            //                 //           << solution->sizeMapping.macroTile.x << ", "
-            //                 //           << solution->sizeMapping.macroTile.y << ", "
-            //                 //           << solution->sizeMapping.depthU << ", "
-            //                 //           << solution->sizeMapping.matrixInstruction[0] << ", "
-            //                 //           << solution->sizeMapping.matrixInstruction[1] << ", "
-            //                 //           << solution->sizeMapping.matrixInstruction[2] << ", "
-            //                 //           << solution->name() << std::endl;
-            //                 rv.emplace_back(solution);
-            //                 if(rv.size() == numSolutions)
-            //                 {
-            //                     break;
-            //                 }
-            //             }
-            //         }
-            //     }
-            // }
+            else
+            {
+                int nr_tiles = 0;
+                for(const auto& tile : selected_tiles)
+                {
+                    // const auto& tile = selected_tiles[0];
+                    for (const auto& s : solutionmap)
+                    {
+                        auto& solution = s.second;
+                        if(solution->sizeMapping.macroTile.x == std::get<1>(tile) &&
+                           solution->sizeMapping.macroTile.y == std::get<2>(tile) &&
+                           solution->sizeMapping.depthU == std::get<3>(tile) &&
+                           solution->sizeMapping.matrixInstruction[0] == std::get<4>(tile) &&
+                           solution->sizeMapping.matrixInstruction[1] == std::get<5>(tile) &&
+                           solution->sizeMapping.matrixInstruction[2] == std::get<6>(tile) &&
+                           solution->sizeMapping.CUOccupancy == std::get<7>(tile) &&
+                           (*solution->hardwarePredicate)(hardware) &&
+                           (*solution->problemPredicate)(problem))
+                        {
+                            // std::cout << "rv.size: " << rv.size() << " Adding solution: "
+                            //           << solution->sizeMapping.macroTile.x << ", "
+                            //           << solution->sizeMapping.macroTile.y << ", "
+                            //           << solution->sizeMapping.depthU << ", "
+                            //           << solution->sizeMapping.matrixInstruction[0] << ", "
+                            //           << solution->sizeMapping.matrixInstruction[1] << ", "
+                            //           << solution->sizeMapping.matrixInstruction[2] << ", "
+                            //           << solution->name() << std::endl;
+                            rv.emplace_back(solution);
+                            if(rv.size() == numSolutions)
+                            {
+                                return rv;
+                            }
+                        }
+                    }
+                    if(++nr_tiles == 4) // return top 4 MT only
+                    {
+                        return rv;
+                    }
+                }
+            }
 
             return rv;
         }

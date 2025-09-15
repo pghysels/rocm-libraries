@@ -155,7 +155,7 @@ namespace TensileLite
             for(int i = 0; i < Fout.size(); i++)
             {
                 if(!mask[i])
-                    Fout[i] = dtype(0.);
+                    Fout[i] = std::numeric_limits<dtype>::min();
                 else
                 {
                     dtype fi(0.);

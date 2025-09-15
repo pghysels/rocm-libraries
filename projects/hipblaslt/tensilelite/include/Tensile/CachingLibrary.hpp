@@ -213,6 +213,8 @@ namespace TensileLite
                              SolutionLibrarySearchType searchType
                              = SolutionLibrarySearchType::DEFAULT) const override
         {
+            return SolutionSet<MySolution>{};
+
             return m_subLibrary->findAllSolutions(problem, hardware, searchType);
         }
 
