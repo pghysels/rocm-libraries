@@ -165,10 +165,9 @@ namespace TensileLite
 
             for(const auto& tile : selected_tiles)
             {
-                size_t i = 0;
                 for(const auto& s : solutionmap)
                 {
-                    mask[i] =
+                    mask[s.second->libraryLogicIndex] =
                         std::get<1>(tile) == s.second->sizeMapping.macroTile.x &&
                         std::get<2>(tile) == s.second->sizeMapping.macroTile.y &&
                         std::get<3>(tile) == s.second->sizeMapping.depthU &&
@@ -176,22 +175,20 @@ namespace TensileLite
                         std::get<5>(tile) == s.second->sizeMapping.matrixInstruction[1] &&
                         std::get<6>(tile) == s.second->sizeMapping.matrixInstruction[2] &&
                         std::get<7>(tile) == s.second->sizeMapping.CUOccupancy;
-                    i++;
                 }
                 auto logits = model->dense(Fhidden, mask);
 
                 std::vector<std::pair<decltype(logits)::value_type,
                                       std::shared_ptr<MySolution>*>> solution_ranking;
                 solution_ranking.reserve(solutionmap.size());
-                i = 0;
                 for(const auto& s : solutionmap)
                 {
-                    if(mask[i])
-                        solution_ranking.emplace_back(logits[s.second->libraryLogicIndex],
+                    const auto idx = s.second->libraryLogicIndex;
+                    if(mask[idx])
+                        solution_ranking.emplace_back(logits[idx],
                             (std::shared_ptr<MySolution>*)(&s.second));
-                    i++;
                 }
-                std::sort(solution_ranking.begin(), solution_ranking.end());
+                std::sort(solution_ranking.begin(), solution_ranking.end(), std::greater<>());
                 for(auto& s : solution_ranking)
                 {
                     auto& solution = *s.second;

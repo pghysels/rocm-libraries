@@ -112,13 +112,13 @@ namespace TensileLite
                                       std::vector<dtype>&       Fout,
                                       const std::vector<bool>&  mask) const
         {
-            auto W = weight.data();
             for(int i = 0; i < Fout.size(); i++)
             {
                 if(!mask[i])
                     Fout[i] = std::numeric_limits<dtype>::min();
                 else
                 {
+                    auto W = weight.data() + i * F.size();
                     dtype fi(0.);
                     auto  Fptr = F.data();
                     for(int j = 0; j < F.size(); j++)
@@ -151,13 +151,13 @@ namespace TensileLite
                                                  const std::vector<bool>&  mask) const
         {
             assert(F.size() == N_IN);
-            auto W = weight.data();
             for(int i = 0; i < Fout.size(); i++)
             {
                 if(!mask[i])
                     Fout[i] = std::numeric_limits<dtype>::min();
                 else
                 {
+                    auto W = weight.data() + i * N_IN;
                     dtype fi(0.);
                     auto  Fptr = F.data();
 #pragma clang loop unroll_count(N_IN)
@@ -167,7 +167,6 @@ namespace TensileLite
                 }
             }
         }
-
 
         DenseLayer::DenseLayer(const std::vector<float>& weights, const std::vector<float>& bias)
         {
@@ -215,7 +214,6 @@ namespace TensileLite
             (*W)(F, Fout, mask);
             return Fout;
         }
-
 
         bool DenseLayer::valid(bool verbose) const
         {
