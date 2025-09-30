@@ -48,6 +48,8 @@ namespace TensileLite
         std::unordered_map<int, std::shared_ptr<MySolution>>        solutionmap;
         std::vector<origami::tile_tuple>             tile_list;
         std::unordered_map<origami::tile_tuple, int> tile_map;
+        // std::unique_ptr<origami::analytical_model>   origami_model;
+        std::vector<origami::solution_info>              solution_tiles;
 
         static std::string Type()
         {
@@ -173,7 +175,25 @@ namespace TensileLite
             origami::data_type_t miDataType = static_cast<origami::data_type_t>(problem.computeInputType());
             if(problem.f32XdlMathOp() == rocisa::DataType::XFloat32) // Check F32 compute type
                 miDataType = origami::data_type_t::XFloat32;
+#if 1
+            if(solution_tiles.empty())
+            {
+                
+
+                // origami_model = std::make_unique<origami::analytical_model>(
+                //     problem.transA(),  // solution->problemType.transA,
+                //     problem.transB(),  // solution->problemType.transB,
+                //     elementSizeA_bits,
+                //     elementSizeB_bits,
+                //     elementSizeC_bits,
+                //     miDataType,
+                //     0,   // mx_block_size -> MX Data types come from rocroller.
+                //     tile_list);
+            }
+            auto selected_tiles = origami_model->select_best_macro_tile_size(
+#else
             auto selected_tiles = origami::select_best_macro_tile_size(
+#endif
                 m,
                 n,
                 k,

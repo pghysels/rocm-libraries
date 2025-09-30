@@ -98,6 +98,22 @@ namespace TensileLite
 
                             lib.tile_list.emplace_back(solution_tuple);
                             lib.tile_map.insert(std::make_pair(solution_tuple, index));
+
+                            origami::solution_info t(
+                                solution->sizeMapping.macroTile.x,          // MT_M
+                                solution->sizeMapping.macroTile.y,          // MT_N
+                                solution->sizeMapping.depthU,               // MT_K
+                                solution->sizeMapping.matrixInstruction[0], // MI_M
+                                solution->sizeMapping.matrixInstruction[1], // MI_N
+                                solution->sizeMapping.matrixInstruction[2], // MI_K
+                                solution->sizeMapping.CUOccupancy,          // Occupancy
+                                solution->sizeMapping.workGroupMapping,     // WGM
+                                solution->sizeMapping.nonTemporalA,         // Cache flag: A
+                                solution->sizeMapping.nonTemporalB,          // Cache flag: B
+                                ... TODO transA, ....
+                            );
+                            if(t.fits_lds_capacity)
+                                lib.solution_tiles.push_back(std::move(t));
                         }
                     }
                 }

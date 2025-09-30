@@ -14,6 +14,7 @@
 
 namespace origami
 {
+
     /* ---------------------------------------------------------------------------------------- */
     /* Misc. functions                                                                          */
     /* ---------------------------------------------------------------------------------------- */
@@ -25,6 +26,7 @@ namespace origami
         // Static cast to undo integral promotion.
         return static_cast<N>(d == 0 ? 0 : (n / d + (n % d != 0 ? 1 : 0)));
     }
+
 
     // Computes the number of active compute units if there is only one wave and it is partial
     // Otherwise, returns hardware.N_CU
