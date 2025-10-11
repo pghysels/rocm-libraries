@@ -1282,6 +1282,32 @@ namespace TensileLite
                             std::cout << "Predicted WGM: " << defaultWGM << std::endl;
                     }
                 }
+                else if(pAMDGPU->skDynamicWGM == 2)
+                {
+                    hip::HipAMDGPU const* hipAMDGPU
+                        = dynamic_cast<hip::HipAMDGPU const*>(&hardware);
+                    auto sizes = problem.problemSizes();
+                    if(sizes.size() >= 4)
+                    {
+                        size_t elementSize = GetElementSize(problemType.aType);
+                        defaultWGM = origami::select_best_wgm_tree(sizes[0],
+                                                                   sizes[1],
+                                                                   sizes[3],
+                                                                   sizes[2],
+                                                                   *(hipAMDGPU->analyticalHardware),
+                                                                   sizeMapping.macroTile.x,
+                                                                   sizeMapping.macroTile.y,
+                                                                   sizeMapping.depthU,
+                                                                   sizeMapping.matrixInstruction[0],
+                                                                   sizeMapping.matrixInstruction[1],
+                                                                   sizeMapping.matrixInstruction[2],
+                                                                   elementSize,
+                                                                   sizeMapping.workGroupMappingXCC,
+                                                                   sizeMapping.StreamKXCCMapping);
+                        if(T_Debug)
+                            std::cout << "Predicted WGM: " << defaultWGM << std::endl;
+                    }
+                }
             }
 
             kernelArgs<T_Debug, false>(

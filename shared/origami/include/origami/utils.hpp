@@ -109,6 +109,22 @@ namespace origami
             double H_L2, // not needed for L2 hit rate but retained if your code expects it
             bool   print);
 
+        size_t select_best_wgm_tree(
+            size_t                     M,
+            size_t                     N,
+            size_t                     K,
+            size_t                     batch,
+            const hardware_t&          hardware,
+            size_t                     MT_M,
+            size_t                     MT_N,
+            size_t                     MT_K,
+            size_t                     MI_M,
+            size_t                     MI_N,
+            size_t                     MI_K,
+            size_t                     element_size,
+            int                        WorkGroupMappingXCC,
+            int                        StreamKXCCMapping);
+
         double compute_tflops_from_latency(double latency_cycles,
                                            size_t M,
                                            size_t N,

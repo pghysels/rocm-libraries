@@ -40,6 +40,7 @@ def getKeyNoInternalArgs(state, splitGSU: bool):
   state_copy["WorkGroupMapping"] = "M"
   state_copy["WorkGroupMappingXCC"] = "M"
   state_copy["WorkGroupMappingXCCGroup"] = "M"
+  state_copy["StreamKXCCMapping"] = "M"
   state_copy["StaggerU"] = "M"
   state_copy["StaggerUStride"] = "M"
   state_copy["StaggerUMapping"] = "M"
@@ -114,6 +115,7 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
     requiredParametersTemp = requiredParametersTemp.union(["WorkGroupMapping",
                                                            "WorkGroupMappingXCC",
                                                            "WorkGroupMappingXCCGroup",
+                                                           "StreamKXCCMapping",
                                                            "StaggerU",
                                                            "StaggerUStride",
                                                            "StaggerUMapping",

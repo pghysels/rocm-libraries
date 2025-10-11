@@ -117,6 +117,8 @@ namespace TensileLite
 
                 iot::mapRequired(io, "workGroupMappingXCC", s.workGroupMappingXCC);
                 iot::mapRequired(io, "workGroupMappingXCCGroup", s.workGroupMappingXCCGroup);
+                // iot::mapOptional(io, "StreamKXCCMapping", s.StreamKXCCMapping);
+                iot::mapRequired(io, "StreamKXCCMapping", s.StreamKXCCMapping);
 
                 iot::mapRequired(io, "globalSplitUCoalesced", s.globalSplitUCoalesced);
                 iot::mapRequired(io,

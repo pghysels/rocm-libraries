@@ -150,6 +150,7 @@ namespace TensileLite
 
         int  workGroupMappingXCC                    = 0;
         int  workGroupMappingXCCGroup               = 0;
+        int  StreamKXCCMapping                      = 0;
         bool globalSplitUCoalesced                  = false;
         bool globalSplitUWorkGroupMappingRoundRobin = false;
 
