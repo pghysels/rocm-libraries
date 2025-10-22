@@ -1286,6 +1286,17 @@ namespace TensileLite
                             std::cout << "Predicted WGM: " << defaultWGM << std::endl;
                     }
                 }
+                else if(pAMDGPU->skDynamicWGM == 2)
+                {
+                    auto sizes = problem.problemSizes();
+                    if(sizes[0] <= sizeMapping.macroTile.x || sizes[1] <= sizeMapping.macroTile.y)
+                    {
+                        defaultWGM = 1;
+                        if(T_Debug)
+                            std::cout << "WGM overridden to 1" << std::endl;
+                    }
+                }
+
             }
 
             kernelArgs<T_Debug, false>(

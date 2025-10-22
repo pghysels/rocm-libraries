@@ -227,7 +227,7 @@ namespace TensileLite
         int         simdPerCu        = 4;
         int         computeUnitCount = 0;
         int         skDynamicGrid    = 6;
-        int         skDynamicWGM     = 0;
+        int         skDynamicWGM     = 2;
         int         fixedWGM         = std::numeric_limits<int>::max();
         int         skMaxCUs         = 0;
         int         skGridMultiplier = 1;
@@ -260,7 +260,7 @@ namespace TensileLite
         const int getSKDynamicWGM() const
         {
             static const char* envStr = std::getenv("TENSILE_STREAMK_DYNAMIC_WGM");
-            static const int   value  = (envStr == NULL ? 0 : std::atoi(envStr));
+            static const int   value  = (envStr == NULL ? 2 : std::atoi(envStr));
             return value;
         }
 
