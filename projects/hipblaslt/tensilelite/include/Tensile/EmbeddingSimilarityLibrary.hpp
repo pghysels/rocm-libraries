@@ -110,8 +110,8 @@ namespace TensileLite
                                                             Hardware const&  hardware,
                                                             int numSolutions) const override
         {
-            if (problem.batchSize(0) > 1) // TODO Temporary patch until we have the logic for it
-                return {};
+            // if (problem.batchSize(0) > 1) // TODO Temporary patch until we have the logic for it
+            //     return {};
 
             std::vector<float> gemm_embedding = computeGEMMEmbeddings(problem);
 
