@@ -202,6 +202,7 @@ namespace TensileLite
             float m = problem.freeSizeA(0);
             float n = problem.freeSizeB(0);
             float k = problem.boundSize(0);
+            float batch = problem.batchSize(0);
 
             bool transA = problem.transA();
             bool transB = problem.transB();
@@ -220,7 +221,7 @@ namespace TensileLite
             float flops = 2 * m * n * k;
 
             std::vector<float> features
-                = {m, n, k, lda, stride_a, ldb, stride_b, ldc, stride_c, ldd, stride_d, flops};
+                = {batch, m, n, k, lda, stride_a, ldb, stride_b, ldc, stride_c, ldd, stride_d, flops};
 
             return encoder->forward(features);
         }
