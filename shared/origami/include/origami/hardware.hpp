@@ -413,6 +413,23 @@ class hardware_t {
              std::tuple<double, double, double> mem_bw_per_wg_coefficients);
 
   /**
+   * @brief Construct hardware_t with explicit parameters.
+   *
+   * @param arch GPU architecture type
+   * @param N_CU Number of compute units
+   * @param lds_capacity LDS capacity in bytes
+   * @param L2_capacity L2 cache capacity in bytes
+   * @param compute_clock_ghz Compute clock frequency in GHz
+   * @param arch_constants Architecture constants
+   */
+  hardware_t(architecture_t arch,
+             size_t N_CU,
+             size_t lds_capacity,
+             size_t L2_capacity,
+             double compute_clock_ghz,
+             const architecture_constants& arch_constants);
+
+  /**
    * @brief Construct hardware_t from HIP device properties.
    *
    * Automatically determines architecture and extracts hardware parameters
@@ -427,7 +444,7 @@ class hardware_t {
    *
    * @param other Another hardware_t instance to copy from
    */
-  hardware_t(const hardware_t& other);
+  hardware_t(const hardware_t& other) = default;
 
   /**
    * @brief Create hardware_t instance from HIP device properties.

@@ -35,22 +35,30 @@ hardware_t::hardware_t(architecture_t arch,
     , mem_bw_per_wg_coefficients(mem_bw_per_wg_coefficients)
     , NUM_XCD(NUM_XCD) {}
 
+hardware_t::hardware_t(architecture_t arch,
+                       size_t N_CU,
+                       size_t lds_capacity,
+                       size_t L2_capacity,
+                       double compute_clock_ghz,
+                       const architecture_constants& constants)
+    : arch(arch)
+    , N_CU(N_CU)
+    , lds_capacity(lds_capacity)
+    , L2_capacity(L2_capacity)
+    , CU_per_L2(N_CU / constants.num_xcds)
+    , compute_clock_ghz(compute_clock_ghz)
+    , parallel_mi_cu(constants.parallel_mi_cu)
+    , mem_bw_per_wg_coefficients(constants.mem_bw_per_wg_coefficients)
+    , NUM_XCD(constants.num_xcds) {
+  double clockRate       = 1.6 * compute_clock_ghz;
+  double memoryClockRate = clockRate / constants.mem_clock_ratio;
+  mem1_perf_ratio = 1.e9 * constants.mem1_perf_ratio / clockRate;
+  mem2_perf_ratio = 1.e9 * constants.mem2_perf_ratio / (memoryClockRate * constants.mem_clock_ratio);
+  mem3_perf_ratio = 1.e9 * constants.mem3_perf_ratio / memoryClockRate;
+}
+
 hardware_t::hardware_t(hipDeviceProp_t properties)
     : hardware_t(get_hardware_for_properties(properties)) {}
-
-hardware_t::hardware_t(const hardware_t& other)
-    : arch(other.arch)
-    , N_CU(other.N_CU)
-    , lds_capacity(other.lds_capacity)
-    , mem1_perf_ratio(other.mem1_perf_ratio)
-    , mem2_perf_ratio(other.mem2_perf_ratio)
-    , mem3_perf_ratio(other.mem3_perf_ratio)
-    , L2_capacity(other.L2_capacity)
-    , CU_per_L2(other.CU_per_L2)
-    , compute_clock_ghz(other.compute_clock_ghz)
-    , parallel_mi_cu(other.parallel_mi_cu)
-    , mem_bw_per_wg_coefficients(other.mem_bw_per_wg_coefficients)
-    , NUM_XCD(other.NUM_XCD) {}
 
 hardware_t hardware_t::get_hardware_for_properties(hipDeviceProp_t properties) {
   auto arch_name = get_before_first_colon(properties.gcnArchName);
@@ -62,17 +70,12 @@ hardware_t hardware_t::get_hardware_for_properties(hipDeviceProp_t properties) {
   }
   auto constants = get_arch_constants(arch_enum);
   return hardware_t(
-      arch_enum,
-      properties.multiProcessorCount,
-      properties.sharedMemPerBlock,
-      constants.num_xcds,
-      1e9 * constants.mem1_perf_ratio / properties.clockRate,
-      1e9 * constants.mem2_perf_ratio / (properties.memoryClockRate * constants.mem_clock_ratio),
-      1e9 * constants.mem3_perf_ratio / properties.memoryClockRate,
-      properties.l2CacheSize,
-      properties.clockRate / 1e6,
-      constants.parallel_mi_cu,
-      constants.mem_bw_per_wg_coefficients);
+    arch_enum,
+    properties.multiProcessorCount,
+    properties.sharedMemPerBlock,
+    properties.l2CacheSize,
+    properties.clockRate / 1e6,
+    constants);
 }
 
 hardware_t hardware_t::get_hardware_for_device(int deviceId) {
@@ -93,27 +96,15 @@ hardware_t hardware_t::get_hardware_for_arch(architecture_t arch,
 
   auto constants = get_arch_constants(arch);
 
-  // Calculate memory performance ratios
-  double clockRate       = compute_clock_khz;
-  double memoryClockRate = clockRate / constants.mem_clock_ratio;
-
-  double mem1_perf_ratio = 1e9 * constants.mem1_perf_ratio / clockRate;
-  double mem2_perf_ratio =
-      1e9 * constants.mem2_perf_ratio / (memoryClockRate * constants.mem_clock_ratio);
-  double mem3_perf_ratio = 1e9 * constants.mem3_perf_ratio / memoryClockRate;
-
   // Use the direct constructor
-  return hardware_t(arch,
-                    N_CU,
-                    lds_capacity,
-                    constants.num_xcds,
-                    mem1_perf_ratio,
-                    mem2_perf_ratio,
-                    mem3_perf_ratio,
-                    L2_capacity,
-                    clockRate / 1e6,  // Convert KHz to GHz
-                    constants.parallel_mi_cu,
-                    constants.mem_bw_per_wg_coefficients);
+  return hardware_t(
+    arch,
+    N_CU,
+    lds_capacity,
+    L2_capacity,
+    compute_clock_khz / 1e6,
+    constants
+  );
 }
 
 bool hardware_t::is_hardware_supported(hipDeviceProp_t properties) {
