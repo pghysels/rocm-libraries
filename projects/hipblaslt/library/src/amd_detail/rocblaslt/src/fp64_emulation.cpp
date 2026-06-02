@@ -460,6 +460,59 @@ static const double h_qpi_lo_all[OZ2_S_MAX - 1][OZ2_S_MAX] = {
 };
 
 /* =========================================================================
+ * Cumulative CRT capacity and per-call adaptive-s selection
+ * ========================================================================= */
+
+/* oz2_cum_bits — log₂(M_s) for s = 2..OZ2_S_MAX.
+ * Shared between fp64EmulationNumModuli() and the adaptive-s computation.  */
+static constexpr double oz2_cum_bits[OZ2_S_MAX - 1] = {
+     15.994,   /* s=2  */
+     23.976,   /* s=3  */
+     31.945,   /* s=4  */
+     39.894,   /* s=5  */
+     47.807,   /* s=6  */
+     55.708,   /* s=7  ← "55 bits" fixed-mode default  */
+     63.572,   /* s=8  */
+     71.411,   /* s=9  */
+     79.238,   /* s=10 ← "79 bits" ADP max */
+     87.040,   /* s=11 */
+     94.801,   /* s=12 */
+    102.522,   /* s=13 */
+    110.160,   /* s=14 */
+    117.782,   /* s=15 */
+    125.374,   /* s=16 ← default (guaranteed for all FP64 inputs) */
+    132.949,   /* s=17 */
+    140.448,   /* s=18 */
+    147.931,   /* s=19 */
+    155.365,   /* s=20 */
+};
+
+/* oz2_adaptive_num_moduli — minimum s for FP64-equivalent results.
+ *
+ * Uses C_max = max_{i,j}|C32i_prelim[i,j]| from the preliminary INT8 GEMM,
+ * which captures both the exponent range of A/B and the actual inner-product
+ * magnitudes (tighter than K alone).
+ *
+ * Derivation: the INT8 truncation error sums to ≤ 2√(k·M_s).  For FP64
+ * accuracy this must be < (M_s/2)·2^{−52}, giving
+ *   log₂(M_s) > 107 + log₂(k)                       [K-only worst case]
+ * Using C_max from the actual preliminary GEMM:
+ *   log₂(M_s) > 117 + 2·log₂(k) − log₂(C_max)       [tighter bound]
+ * A 4-bit safety margin is added → threshold = 121 + 2·log₂(k) − log₂(C_max).
+ * The result is always ≤ max_s (the caller-configured upper bound).        */
+static unsigned oz2_adaptive_num_moduli(int64_t k, int32_t C_max, unsigned max_s)
+{
+    const float log2_k    = log2f(static_cast<float>(k));
+    const float log2_cmax = (C_max > 1) ? log2f(static_cast<float>(C_max)) : 0.0f;
+    const float bits_needed = 121.0f + 2.0f * log2_k - log2_cmax;
+    for(unsigned s = 2u; s < max_s; ++s) {
+        if(static_cast<float>(oz2_cum_bits[s - 2u]) >= bits_needed)
+            return s;
+    }
+    return max_s;
+}
+
+/* =========================================================================
  * One-time constant-memory initialisation (parameterised by num_moduli)
  * ========================================================================= */
 static hipError_t oz2_init_constants(unsigned num_moduli)
@@ -559,7 +612,8 @@ size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_
            + ldc32i * static_cast<size_t>(n) * sizeof(double) * 2          /* Zhi + Zlo */
            + cola8i * sizeof(int16_t)                                       /* sftA */
            + padn   * sizeof(int16_t)                                       /* sftB */
-           + sizeof(uint32_t);                                               /* nan_flag */
+           + sizeof(uint32_t)                                                /* nan_flag   */
+           + sizeof(int32_t);                                                /* d_C_max    */
 }
 
 /**
@@ -587,33 +641,9 @@ unsigned fp64EmulationNumModuli()
         const unsigned target = static_cast<unsigned>(std::strtoul(v, nullptr, 0));
         if(target == 0u) return OZ2_S_MAX;
 
-        /* Cumulative log2 of the product of the first s moduli, for s=2..OZ2_S_MAX.
-         * Derived from the exact moduli: 256, 255, 253, 251, 247, 241, 239, 233,
-         * 229, 227, 223, 217, 211, 199, 197, 193, 191, 181, 179, 173. */
-        static constexpr double cum_bits[OZ2_S_MAX - 1] = {
-            15.994,   /* s=2  */
-            23.976,   /* s=3  */
-            31.945,   /* s=4  */
-            39.894,   /* s=5  */
-            47.807,   /* s=6  */
-            55.708,   /* s=7  ← design doc "55 bits"  */
-            63.572,   /* s=8  */
-            71.411,   /* s=9  */
-            79.238,   /* s=10 ← design doc "79 bits" */
-            87.040,   /* s=11 */
-            94.801,   /* s=12 */
-           102.522,   /* s=13 */
-           110.160,   /* s=14 */
-           117.782,   /* s=15 */
-           125.374,   /* s=16 */
-           132.949,   /* s=17 */
-           140.448,   /* s=18 */
-           147.931,   /* s=19 */
-           155.365,   /* s=20 */
-        };
-
+        /* oz2_cum_bits is defined at file scope above oz2_init_constants. */
         for(unsigned s = 2u; s <= OZ2_S_MAX; ++s) {
-            if(cum_bits[s - 2u] >= static_cast<double>(target))
+            if(oz2_cum_bits[s - 2u] >= static_cast<double>(target))
                 return s;
         }
         return OZ2_S_MAX;  /* target exceeds max capacity; use maximum */
@@ -1064,6 +1094,46 @@ oz2_finalize_kernel(const double* __restrict__ Zhi,
 }
 
 /* =========================================================================
+ * GPU kernel — global max of |C32i_prelim| for adaptive-s selection.
+ *
+ * A grid-stride loop capped at OZ2_GLOBAL_MAX_BLOCKS thread blocks limits
+ * atomicMax contention to at most OZ2_GLOBAL_MAX_BLOCKS operations regardless
+ * of matrix size.  Consecutive threads in a wavefront read consecutive rows
+ * within the same column (column-major layout) → coalesced for m ≥ blockDim.x.
+ * ========================================================================= */
+static constexpr unsigned OZ2_GLOBAL_MAX_BLOCKS = 512u;
+
+__global__ static void
+oz2_global_max_kernel(const int32_t* __restrict__ C32i,
+                      int64_t m, int64_t n, size_t ldc32i,
+                      int32_t* __restrict__ d_C_max)
+{
+    const int64_t total = m * n;
+    int32_t local_max = 0;
+
+    /* Grid-stride loop over all m×n elements (column-major layout).
+     * For flat index f: col = f/m, row = f%m → C32i[row + col*ldc32i]. */
+    for(int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        flat < total;
+        flat += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        const int64_t col = flat / m;
+        const int64_t row = flat % m;
+        const int32_t v   = C32i[static_cast<size_t>(row)
+                                 + static_cast<size_t>(col) * ldc32i];
+        const int32_t av  = (v < 0) ? -v : v;
+        if(av > local_max) local_max = av;
+    }
+
+    local_max = warp_reduce_max_abs_i32(local_max);
+    __shared__ int32_t s_wmax[8];
+    local_max = block_reduce_max_i32(local_max, s_wmax);
+
+    if(threadIdx.x == 0)
+        (void)atomicMax(d_C_max, local_max);
+}
+
+/* =========================================================================
  * fp64EmulatedGemm  (OS II accurate mode, variable number of moduli)
  * ========================================================================= */
 rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
@@ -1089,13 +1159,14 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                                     ? settings.num_moduli
                                     : fp64EmulationNumModuli();
 
-    if(oz2_init_constants(num_moduli) != hipSuccess)
-        return rocblaslt_status_internal_error;
+    /* s_adaptive is determined after the preliminary GEMM via oz2_adaptive_num_moduli.
+     * Initialised to num_moduli as a safe fallback for any early-exit path.  */
+    unsigned s_adaptive = num_moduli;
 
     /* ------------------------------------------------------------------
      * Chunk size: number of consecutive moduli batched into one
-     * oz2_chunk_accum_kernel call.  Reduces non-GEMM kernel launches from
-     * (s+1) to (ceil(s/chunk_size)+1) while keeping C32i batch ≤ 256 MiB.
+     * oz2_chunk_accum_kernel call.  Keeps C32i workspace ≤ OZ2_CHUNK_TARGET_BYTES.
+     * This is sized for num_moduli; s_adaptive will use chunk_size_adaptive ≤ chunk_size.
      * ------------------------------------------------------------------ */
     const unsigned chunk_size = oz2_compute_chunk_size(m, n, num_moduli);
 
@@ -1117,6 +1188,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
      *   sftA       [cola8i]                        INT16 per-row shifts for A
      *   sftB       [padn]                          INT16 per-col shifts for B
      *   nan_flag   [1]                             UINT32 Inf/NaN detection
+     *   d_C_max    [1]                             INT32  global max |C32i_prelim|
      * ------------------------------------------------------------------ */
     const size_t lda8i  = oz2_pad(static_cast<size_t>(k));
     const size_t cola8i = oz2_pad(static_cast<size_t>(m));
@@ -1132,6 +1204,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     const size_t szSftA   = cola8i;
     const size_t szSftB   = padn;
     const size_t szNanFlag = 1;
+    const size_t szCMax    = 1;   /* d_C_max for adaptive-s selection */
 
     const size_t wsBytes =
           szA8i           * sizeof(int8_t)
@@ -1141,7 +1214,8 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         + szZlo           * sizeof(double)
         + szSftA          * sizeof(int16_t)
         + szSftB          * sizeof(int16_t)
-        + szNanFlag       * sizeof(uint32_t);
+        + szNanFlag       * sizeof(uint32_t)
+        + szCMax          * sizeof(int32_t);      /* d_C_max */
 
     /* Use caller-provided workspace if large enough; otherwise allocate. */
     bool   ws_owned = false;
@@ -1162,10 +1236,15 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     int16_t*  const sftA       = reinterpret_cast<int16_t*>(Zlo + szZlo);
     int16_t*  const sftB       = sftA + szSftA;
     uint32_t* const nan_flag   = reinterpret_cast<uint32_t*>(sftB + szSftB);
+    int32_t*  const d_C_max    = reinterpret_cast<int32_t*>(nan_flag + szNanFlag);
     /* First C32i slice (used by preliminary GEMM and shift refinement) */
     int32_t*  const C32i       = C32i_batch;
 
     if(hipMemsetAsync(nan_flag, 0, sizeof(uint32_t), stream) != hipSuccess) {
+        (void)hipFreeAsync(ws, stream);
+        return rocblaslt_status_internal_error;
+    }
+    if(hipMemsetAsync(d_C_max, 0, sizeof(int32_t), stream) != hipSuccess) {
         (void)hipFreeAsync(ws, stream);
         return rocblaslt_status_internal_error;
     }
@@ -1250,9 +1329,44 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                     &zero_i, C32i, layoutCD, C32i, layoutCD,
                     nullptr, nullptr, 0, stream);
 
-    /* Parts 1d-e: refine shifts using the accu_log2P for the chosen num_moduli.
+    /* Reduce |C32i_prelim| to a single global max for adaptive-s selection.
+     * Capped at OZ2_GLOBAL_MAX_BLOCKS blocks to bound atomicMax contention. */
+    {
+        const int64_t mn = static_cast<int64_t>(m) * n;
+        const unsigned gmax_blks = static_cast<unsigned>(
+            std::min<int64_t>(OZ2_GLOBAL_MAX_BLOCKS, (mn + 255) / 256));
+        if(gmax_blks > 0u) {
+            hipLaunchKernelGGL(oz2_global_max_kernel,
+                               dim3(gmax_blks), dim3(256), 0, stream,
+                               C32i, m, n, ldc32i, d_C_max);
+        }
+    }
+
+    /* Sync to read d_C_max, compute s_adaptive, and initialise constant memory.
+     *
+     * The preliminary kernels (prelim_A/B, prelim GEMM, global_max) do NOT
+     * read s-dependent constants (cQpiHi/Lo, cP_hi/lo, cInvP), so
+     * oz2_init_constants is safely deferred until s_adaptive is known here.
+     * scaleA/B only need cNegMod/cInvMod/cInvModF (uploaded for all s).    */
+    {
+        if(hipStreamSynchronize(stream) != hipSuccess) {
+            if(ws_owned) (void)hipFreeAsync(ws, stream);
+            return rocblaslt_status_internal_error;
+        }
+        int32_t C_max_host = 1;
+        (void)hipMemcpy(&C_max_host, d_C_max, sizeof(int32_t),
+                        hipMemcpyDeviceToHost);
+        if(C_max_host < 1) C_max_host = 1;
+        s_adaptive = oz2_adaptive_num_moduli(k, C_max_host, num_moduli);
+    }
+    if(oz2_init_constants(s_adaptive) != hipSuccess) {
+        if(ws_owned) (void)hipFreeAsync(ws, stream);
+        return rocblaslt_status_internal_error;
+    }
+
+    /* Parts 1d-e: refine shifts tuned for s_adaptive (log2P for s_adaptive).
      * 256 threads per block: 4 wavefronts on MI300 for better occupancy.    */
-    const float accu_log2P = h_accu_log2P_all[num_moduli - 2];
+    const float accu_log2P = h_accu_log2P_all[s_adaptive - 2];
     hipLaunchKernelGGL(oz2_accu_refine_sftA_kernel,
                        dim3(static_cast<unsigned>(m)), dim3(256), 0, stream,
                        C32i, m, n, ldc32i, sftA, accu_log2P);
@@ -1268,9 +1382,9 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         const dim3 gA((k + 63) / 64, (m + 3) / 4);
         const dim3 gB((k + 63) / 64, (n + 3) / 4);
         hipLaunchKernelGGL(oz2_scaleA_kernel, gA, blk_scale, 0, stream,
-                           A, m, k, lda, tA, A8i, lda8i, cola8i, sftA, num_moduli);
+                           A, m, k, lda, tA, A8i, lda8i, cola8i, sftA, s_adaptive);
         hipLaunchKernelGGL(oz2_scaleB_kernel, gB, blk_scale, 0, stream,
-                           B, k, n, ldb, tB, B8i, ldb8i, sftB, num_moduli);
+                           B, k, n, ldb, tB, B8i, ldb8i, sftB, s_adaptive);
     }
 
     /* Parts 2a-d: chunked INT8 GEMMs + CRT accumulation.
@@ -1286,12 +1400,14 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     const size_t strideA8i = lda8i * cola8i;
     const size_t strideB8i = ldb8i * static_cast<size_t>(n);
 
+    /* chunk_size_adaptive ≤ chunk_size: workspace was allocated for chunk_size
+     * slices based on num_moduli ≥ s_adaptive, so no overflow is possible.  */
+    const unsigned chunk_size_adaptive = oz2_compute_chunk_size(m, n, s_adaptive);
+
     /* Create batch layout objects once before the loop.  For typical problem
-     * sizes chunk_size == num_moduli, so the loop body executes only once and
-     * these objects are never recreated.  For very large matrices (chunk_size
-     * < num_moduli) only the BATCH_COUNT attribute is updated on the last
-     * (partial) chunk — the three expensive Create/Destroy pairs are avoided
-     * for all full chunks.                                                   */
+     * sizes chunk_size_adaptive == s_adaptive, so the loop executes only once.
+     * For very large matrices only the BATCH_COUNT attribute is updated on
+     * the last (partial) chunk.                                               */
     hipblasLtMatrixLayout_t layoutA_b  = nullptr;
     hipblasLtMatrixLayout_t layoutB_b  = nullptr;
     hipblasLtMatrixLayout_t layoutCD_b = nullptr;
@@ -1307,7 +1423,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                                 static_cast<int64_t>(ldc32i));
 
     /* HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET is in elements, not bytes. */
-    int32_t       batch_cur  = static_cast<int32_t>(chunk_size);
+    int32_t       batch_cur  = static_cast<int32_t>(chunk_size_adaptive);
     const int64_t stride_A_b = static_cast<int64_t>(strideA8i);  /* int8 elements  */
     const int64_t stride_B_b = static_cast<int64_t>(strideB8i);  /* int8 elements  */
     const int64_t stride_C_b = static_cast<int64_t>(szC32i);     /* int32 elements */
@@ -1325,9 +1441,9 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     hipblasLtMatrixLayoutSetAttribute(layoutCD_b,
         HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_C_b, sizeof(stride_C_b));
 
-    for(unsigned chunk_start = 0; chunk_start < num_moduli; chunk_start += chunk_size) {
-        const unsigned actual = (chunk_start + chunk_size <= num_moduli)
-                                ? chunk_size : (num_moduli - chunk_start);
+    for(unsigned chunk_start = 0; chunk_start < s_adaptive; chunk_start += chunk_size_adaptive) {
+        const unsigned actual = (chunk_start + chunk_size_adaptive <= s_adaptive)
+                                ? chunk_size_adaptive : (s_adaptive - chunk_start);
 
         /* Update batch count only if the last chunk is partial */
         if(static_cast<int32_t>(actual) != batch_cur) {
