@@ -688,8 +688,9 @@ block_reduce_max_i32(int32_t warp_max, int32_t* __restrict__ s_wmax)
  * Block = dim3(OZ2_PRELIM_TILE * OZ2_PRELIM_TILE, 1) = dim3(256, 1)
  * ========================================================================= */
 static constexpr int OZ2_PRELIM_TILE_K = 64;  /* k-tile size (reduces k-tile loop count) */
-static constexpr int OZ2_PRELIM_TILE_M = 4;   /* rows/cols per tile (= blockDim.x / TILE_K) */
-/* blockDim.x = TILE_K × TILE_M = 256 threads */
+static constexpr int OZ2_PRELIM_TILE_M = 16;  /* rows/cols per tile (= blockDim.x / TILE_K) */
+/* blockDim.x = TILE_K × TILE_M = 1024 threads */
+static constexpr int OZ2_MIN_WARP_SIZE = 32;  /* minimum warpSize across supported devices */
 
 template <bool TRANS_A, bool TRANS_B, bool CHECK_NAN>
 __global__ static void
@@ -716,7 +717,7 @@ oz2_accu_prelim_kernel(const double* __restrict__ A,
      * 4× fewer __syncthreads() in Pass 2, 4× more A/B blocks → better occupancy. */
     __shared__ double  shmem[TILE_K][TILE_M + 1];
     __shared__ int16_t s_sft[TILE_M];
-    __shared__ double  s_wmax[4];
+    __shared__ double  s_wmax[OZ2_PRELIM_TILE_K * OZ2_PRELIM_TILE_M / OZ2_MIN_WARP_SIZE];
 
     if(blockIdx.x < m_blks) {
         /* ── A block ────────────────────────────────────────────────────── */
@@ -999,7 +1000,7 @@ oz2_refine_sftB_kernel(const int32_t* __restrict__ C32i,
  *   blockIdx.y >= m_y_blocks → B scaling
  * ========================================================================= */
 static constexpr unsigned OZ2_SCALE_TILE_K = 64;
-static constexpr unsigned OZ2_SCALE_TILE_M = 4;
+static constexpr unsigned OZ2_SCALE_TILE_M = 16;
 
 template <unsigned T_COUNT, bool TRANS_A, bool TRANS_B>
 __global__ static void
