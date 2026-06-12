@@ -452,15 +452,34 @@ bool fp64EmulationIsEnabled()
     return enabled;
 }
 
-bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
+/* =========================================================================
+ * Performance-model predicted times
+ * Returns all sub-times in milliseconds.  Used both for the profiling CSV
+ * and (via comparison of t_total_ms vs t_native_ms) for the performance
+ * heuristic in fp64EmulationPerformanceCheck.
+ * ========================================================================= */
+struct Fp64PerfModelTimes {
+    double t_prelim_ms;      /* prelim kernel (shift + extraction)  */
+    double t_prelim_gemm_ms; /* preliminary INT8 GEMM               */
+    double t_refine_ms;      /* sft-refinement kernels              */
+    double t_scale_ms;       /* multi-modulus scaling kernels       */
+    double t_int8_gemms_ms;  /* all INT8 GEMMs                      */
+    double t_accum_ms;       /* CRT accumulation / finalize kernels */
+    double t_launch_ms;      /* kernel-launch overhead              */
+    double t_total_ms;       /* total predicted emulation time      */
+    double t_native_ms;      /* predicted native FP64 DGEMM time    */
+};
+
+static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int64_t k,
+                                                      unsigned num_moduli)
 {
-    static constexpr double HBM_BW         = 6.4e12;
-    static constexpr double INT8_PEAK       = 3.05e15;
-    static constexpr double FP64_EFF        = 7.0e13;
-    static constexpr double LATENCY_KERNEL  = 5.0e-6;
-    static constexpr double LATENCY_MATMUL  = 10.0e-6;
-    static constexpr double LATENCY_MEMSET  = 2.0e-6;
-    static constexpr double CHUNK_BYTES_D   = static_cast<double>(OZ2_CHUNK_TARGET_BYTES);
+    static constexpr double HBM_BW        = 6.4e12;
+    static constexpr double INT8_PEAK     = 3.05e15;
+    static constexpr double FP64_EFF      = 7.0e13;
+    static constexpr double LATENCY_KERNEL = 5.0e-6;
+    static constexpr double LATENCY_MATMUL = 10.0e-6;
+    static constexpr double LATENCY_MEMSET = 2.0e-6;
+    static constexpr double CHUNK_BYTES_D  = static_cast<double>(OZ2_CHUNK_TARGET_BYTES);
 
     const double s   = static_cast<double>(num_moduli);
     const double mn  = static_cast<double>(m) * static_cast<double>(n);
@@ -471,22 +490,31 @@ bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num
     const double chunk_sz = std::max(1.0, std::min(s, CHUNK_BYTES_D / (mn * 4.0)));
     const double n_chunks = std::ceil(s / chunk_sz);
 
-    const double t_int8_gemm_bw = (mk + kn + 4.0 * mn) / HBM_BW;
-    const double t_prelim_gemm  = std::max(2.0 * mnk / INT8_PEAK, t_int8_gemm_bw);
-    const double t_prelim_kern  = (mk + kn) * 17.0 / HBM_BW;
-    const double t_refine_kern  = mn * 8.0 / HBM_BW;
-    const double t_scale_kern   = (mk + kn) * (8.0 + s) / HBM_BW;
-    const double t_int8_gemms   = s * std::max(2.0 * mnk / INT8_PEAK, t_int8_gemm_bw);
+    const double t_int8_bw     = (mk + kn + 4.0 * mn) / HBM_BW;
+    const double t_prelim_gemm = std::max(2.0 * mnk / INT8_PEAK, t_int8_bw);
+    const double t_prelim_kern = (mk + kn) * 17.0 / HBM_BW;
+    const double t_refine_kern = mn * 8.0 / HBM_BW;
+    const double t_scale_kern  = (mk + kn) * (8.0 + s) / HBM_BW;
+    const double t_int8_gemms  = s * std::max(2.0 * mnk / INT8_PEAK, t_int8_bw);
     const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / HBM_BW;
-    const double t_launch = (5.0 + n_chunks) * LATENCY_KERNEL
-                          + (1.0 + n_chunks) * LATENCY_MATMUL
-                          + LATENCY_MEMSET;
+    const double t_launch      = (5.0 + n_chunks) * LATENCY_KERNEL
+                               + (1.0 + n_chunks) * LATENCY_MATMUL
+                               + LATENCY_MEMSET;
+    const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
+                               + t_scale_kern  + t_int8_gemms  + t_accum_kern + t_launch;
+    const double t_native      = std::max(2.0 * mnk / FP64_EFF,
+                                          8.0 * (mk + kn + mn) / HBM_BW) + LATENCY_MATMUL;
 
-    const double t_emul = t_prelim_gemm + t_prelim_kern + t_refine_kern
-                        + t_scale_kern  + t_int8_gemms  + t_accum_kern + t_launch;
-    const double t_native = std::max(2.0 * mnk / FP64_EFF,
-                                     8.0 * (mk + kn + mn) / HBM_BW) + LATENCY_MATMUL;
-    return t_emul <= t_native;
+    constexpr double s2ms = 1000.0;
+    return { t_prelim_kern * s2ms, t_prelim_gemm * s2ms, t_refine_kern * s2ms,
+             t_scale_kern  * s2ms, t_int8_gemms  * s2ms, t_accum_kern  * s2ms,
+             t_launch      * s2ms, t_total       * s2ms, t_native      * s2ms };
+}
+
+bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
+{
+    const Fp64PerfModelTimes pm = fp64EmulationPerfModelTimes(m, n, k, num_moduli);
+    return pm.t_total_ms <= pm.t_native_ms;
 }
 
 bool fp64EmulationIsEager()
@@ -1658,24 +1686,33 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     if(_prof) {
         (void)hipEventRecord(_ev1, stream); (void)hipStreamSynchronize(stream);
         (void)hipEventElapsedTime(&_t_total, _ev_tot, _ev1);
+        const Fp64PerfModelTimes pm = fp64EmulationPerfModelTimes(m, n, k, num_moduli);
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f) {
             if(std::ftell(_f) == 0)
                 std::fprintf(_f,
-                    "m,n,k,num_moduli,scale_chunk_size,gemm_chunk_size,"
+                    "m,n,k,transA,transB,num_moduli,scale_chunk_size,gemm_chunk_size,"
                     "workspace_bytes,"
                     "t_prelim_ms,t_prelim_gemm_ms,t_extract_ms,t_refine_ms,"
                     "t_scale_ms,t_int8_gemm_ms,t_accum_ms,"
-                    "t_finalize_ms,t_total_ms\n");
+                    "t_finalize_ms,t_total_ms,"
+                    "pred_prelim_ms,pred_prelim_gemm_ms,pred_refine_ms,"
+                    "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
+                    "pred_launch_ms,pred_total_ms,pred_native_dgemm_ms\n");
             std::fprintf(_f,
-                "%lld,%lld,%lld,%u,%u,%u,"
+                "%lld,%lld,%lld,%c,%c,%u,%u,%u,"
                 "%llu,"
-                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                 (long long)m, (long long)n, (long long)k,
+                tA ? 'T' : 'N', tB ? 'T' : 'N',
                 num_moduli, scale_chunk_size, chunk_size,
                 (unsigned long long)wsBytes,
                 _t_prelim, _t_prelim_gemm, _t_extract, _t_refine,
-                _t_scale, _t_int8, _t_accum, _t_finalize, _t_total);
+                _t_scale, _t_int8, _t_accum, _t_finalize, _t_total,
+                pm.t_prelim_ms, pm.t_prelim_gemm_ms, pm.t_refine_ms,
+                pm.t_scale_ms, pm.t_int8_gemms_ms, pm.t_accum_ms,
+                pm.t_launch_ms, pm.t_total_ms, pm.t_native_ms);
             std::fclose(_f);
         }
         (void)hipEventDestroy(_ev_tot);
