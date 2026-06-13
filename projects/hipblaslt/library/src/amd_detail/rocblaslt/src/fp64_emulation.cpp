@@ -479,7 +479,8 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
     static constexpr double LATENCY_KERNEL = 5.0e-6;
     static constexpr double LATENCY_MATMUL = 10.0e-6;
     static constexpr double LATENCY_MEMSET = 2.0e-6;
-    static constexpr double CHUNK_BYTES_D  = static_cast<double>(OZ2_CHUNK_TARGET_BYTES);
+    static constexpr double CHUNK_BYTES_D       = static_cast<double>(OZ2_CHUNK_TARGET_BYTES);
+    static constexpr double SCALE_CHUNK_BYTES_D = static_cast<double>(OZ2_SCALE_CHUNK_TARGET_BYTES);
 
     const double s   = static_cast<double>(num_moduli);
     const double mn  = static_cast<double>(m) * static_cast<double>(n);
@@ -490,11 +491,15 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
     const double chunk_sz = std::max(1.0, std::min(s, CHUNK_BYTES_D / (mn * 4.0)));
     const double n_chunks = std::ceil(s / chunk_sz);
 
+    const double slice_bytes    = mk + kn;
+    const double scale_chunk_sz = std::min(s, std::max(chunk_sz, SCALE_CHUNK_BYTES_D / slice_bytes));
+    const double n_scale_chunks = std::ceil(s / scale_chunk_sz);
+
     const double t_int8_bw     = (mk + kn + 4.0 * mn) / HBM_BW;
     const double t_prelim_gemm = std::max(2.0 * mnk / INT8_PEAK, t_int8_bw);
     const double t_prelim_kern = (mk + kn) * 17.0 / HBM_BW;
     const double t_refine_kern = mn * 8.0 / HBM_BW;
-    const double t_scale_kern  = (mk + kn) * (8.0 + s) / HBM_BW;
+    const double t_scale_kern  = (mk + kn) * (8.0 * n_scale_chunks + s) / HBM_BW;
     const double t_int8_gemms  = s * std::max(2.0 * mnk / INT8_PEAK, t_int8_bw);
     const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / HBM_BW;
     const double t_launch      = (5.0 + n_chunks) * LATENCY_KERNEL
