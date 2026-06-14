@@ -1205,7 +1205,7 @@ oz2_chunk_accum_kernel(const int32_t* __restrict__ C32i_batch,
     const size_t idx          = static_cast<size_t>(i) + static_cast<size_t>(l) * ldc32i;
     const size_t slice_stride = ldc32i * static_cast<size_t>(n);
     double local_hi = 0.0, local_lo = 0.0;
-    #pragma unroll
+    // #pragma unroll
     for(unsigned t_local = 0; t_local < CHUNK_SIZE; ++t_local) {
         const unsigned t    = chunk_start + t_local;
         const double dc_raw = static_cast<double>(C32i_batch[t_local * slice_stride + idx]);
@@ -1244,7 +1244,7 @@ oz2_accum_finalize_kernel(const int32_t* __restrict__ C32i_batch,
     const size_t idx          = static_cast<size_t>(i) + static_cast<size_t>(l) * ldc32i;
     const size_t slice_stride = ldc32i * static_cast<size_t>(n);
     double local_hi = 0.0, local_lo = 0.0;
-    #pragma unroll
+    // #pragma unroll
     for(unsigned t_local = 0; t_local < CHUNK_SIZE; ++t_local) {
         const unsigned t    = chunk_start + t_local;
         const double dc_raw = static_cast<double>(C32i_batch[t_local * slice_stride + idx]);
