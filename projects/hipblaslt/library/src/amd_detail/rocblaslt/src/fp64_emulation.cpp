@@ -1117,81 +1117,7 @@ oz2_scale_B_T_kernel(const double* __restrict__ B,
 /* =========================================================================
  * GPU kernels — Part 2d: chunked CRT accumulation
  * ========================================================================= */
-template <bool HAS_LO>
-__global__ static void
-oz2_chunk_accum_kernel_rt(const int32_t* __restrict__ C32i_batch,
-                           double* __restrict__ Zhi, double* __restrict__ Zlo,
-                           int64_t m, int64_t n, size_t ldc32i,
-                           unsigned chunk_start, unsigned chunk_size, bool is_first_chunk)
-{
-    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t l = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
-    if(i >= m || l >= n) return;
-    const size_t idx          = static_cast<size_t>(i) + static_cast<size_t>(l) * ldc32i;
-    const size_t slice_stride = ldc32i * static_cast<size_t>(n);
-    double local_hi = 0.0, local_lo = 0.0;
-    for(unsigned t_local = 0; t_local < chunk_size; ++t_local) {
-        const unsigned t    = chunk_start + t_local;
-        const double dc_raw = static_cast<double>(C32i_batch[t_local * slice_stride + idx]);
-        const double dc     = fma(cNegMod[t], rint(dc_raw * cInvMod[t]), dc_raw);
-        const double hi     = dc * cQpiHi[t];
-        const double new_hi = local_hi + hi;
-        const double err    = hi - (new_hi - local_hi);
-        local_hi = new_hi;
-        if constexpr (HAS_LO) local_lo = fma(dc, cQpiLo[t], local_lo + err);
-        else                   local_lo += err;
-    }
-    if(is_first_chunk) { Zhi[idx] = local_hi; Zlo[idx] = local_lo; }
-    else {
-        const double old_hi = Zhi[idx];
-        const double s_hi   = old_hi + local_hi;
-        const double err    = local_hi - (s_hi - old_hi);
-        Zhi[idx] = s_hi; Zlo[idx] += err + local_lo;
-    }
-}
 
-template <bool HAS_LO>
-__global__ static void
-oz2_accum_finalize_kernel_rt(const int32_t* __restrict__ C32i_batch,
-                              const double* __restrict__ Zhi_in, const double* __restrict__ Zlo_in,
-                              const double* __restrict__ C, double* __restrict__ D,
-                              int64_t m, int64_t n, size_t ldc32i, int64_t ldc, int64_t ldd,
-                              double alpha, double beta,
-                              const int16_t* __restrict__ sftA, const int16_t* __restrict__ sftB,
-                              unsigned chunk_start, unsigned chunk_size, bool is_first_chunk)
-{
-    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t l = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
-    if(i >= m || l >= n) return;
-    const size_t idx          = static_cast<size_t>(i) + static_cast<size_t>(l) * ldc32i;
-    const size_t slice_stride = ldc32i * static_cast<size_t>(n);
-    double local_hi = 0.0, local_lo = 0.0;
-    for(unsigned t_local = 0; t_local < chunk_size; ++t_local) {
-        const unsigned t    = chunk_start + t_local;
-        const double dc_raw = static_cast<double>(C32i_batch[t_local * slice_stride + idx]);
-        const double dc     = fma(cNegMod[t], rint(dc_raw * cInvMod[t]), dc_raw);
-        const double hi     = dc * cQpiHi[t];
-        const double new_hi = local_hi + hi;
-        const double err    = hi - (new_hi - local_hi);
-        local_hi = new_hi;
-        if constexpr (HAS_LO) local_lo = fma(dc, cQpiLo[t], local_lo + err);
-        else                   local_lo += err;
-    }
-    double Zh, Zl;
-    if(is_first_chunk) { Zh = local_hi; Zl = local_lo; }
-    else {
-        const double old_hi = Zhi_in[idx];
-        const double s_hi   = old_hi + local_hi;
-        const double err    = local_hi - (s_hi - old_hi);
-        Zh = s_hi; Zl = Zlo_in[idx] + err + local_lo;
-    }
-    const double q = rint((Zh + Zl) * cInvP);
-    const double X = fma(cP_lo, q, fma(cP_hi, q, Zh) + Zl);
-    const int inv_sft = -(static_cast<int>(sftA[i]) + static_cast<int>(sftB[l]));
-    const size_t c_idx = static_cast<size_t>(i) + static_cast<size_t>(l) * static_cast<size_t>(ldc);
-    const size_t d_idx = static_cast<size_t>(i) + static_cast<size_t>(l) * static_cast<size_t>(ldd);
-    D[d_idx] = alpha * ldexp(X, inv_sft) + beta * C[c_idx];
-}
 
 template <bool HAS_LO, unsigned CHUNK_SIZE, bool IS_FIRST_CHUNK>
 __global__ static void
@@ -1593,9 +1519,6 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                         case 13: OZ2_FINALIZE(false, 13); break; case 14: OZ2_FINALIZE(false, 14); break;
                         case 15: OZ2_FINALIZE(false, 15); break; case 16: OZ2_FINALIZE(false, 16); break;
                         case 17: OZ2_FINALIZE(false, 17); break; case 18: OZ2_FINALIZE(false, 18); break;
-                        default: hipLaunchKernelGGL((oz2_accum_finalize_kernel_rt<false>), grid_acc, blk_acc, 0, stream,
-                                     C32i_batch, Zhi, Zlo, C, D, m, n, ldc32i, ldc, ldd,
-                                     *alpha, *beta, sftA, sftB, global_chunk_start, actual_gemm, is_first);
                     }
                 } else {
                     switch(actual_gemm) {
@@ -1608,9 +1531,6 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                         case 13: OZ2_FINALIZE(true, 13); break; case 14: OZ2_FINALIZE(true, 14); break;
                         case 15: OZ2_FINALIZE(true, 15); break; case 16: OZ2_FINALIZE(true, 16); break;
                         case 17: OZ2_FINALIZE(true, 17); break; case 18: OZ2_FINALIZE(true, 18); break;
-                        default: hipLaunchKernelGGL((oz2_accum_finalize_kernel_rt<true>), grid_acc, blk_acc, 0, stream,
-                                     C32i_batch, Zhi, Zlo, C, D, m, n, ldc32i, ldc, ldd,
-                                     *alpha, *beta, sftA, sftB, global_chunk_start, actual_gemm, is_first);
                     }
                 }
             } else {
@@ -1625,8 +1545,6 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                         case 13: OZ2_ACCUM(false, 13); break; case 14: OZ2_ACCUM(false, 14); break;
                         case 15: OZ2_ACCUM(false, 15); break; case 16: OZ2_ACCUM(false, 16); break;
                         case 17: OZ2_ACCUM(false, 17); break; case 18: OZ2_ACCUM(false, 18); break;
-                        default: hipLaunchKernelGGL((oz2_chunk_accum_kernel_rt<false>), grid_acc, blk_acc, 0, stream,
-                                     C32i_batch, Zhi, Zlo, m, n, ldc32i, global_chunk_start, actual_gemm, is_first);
                     }
                 } else {
                     switch(actual_gemm) {
@@ -1639,8 +1557,6 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                         case 13: OZ2_ACCUM(true, 13); break; case 14: OZ2_ACCUM(true, 14); break;
                         case 15: OZ2_ACCUM(true, 15); break; case 16: OZ2_ACCUM(true, 16); break;
                         case 17: OZ2_ACCUM(true, 17); break; case 18: OZ2_ACCUM(true, 18); break;
-                        default: hipLaunchKernelGGL((oz2_chunk_accum_kernel_rt<true>), grid_acc, blk_acc, 0, stream,
-                                     C32i_batch, Zhi, Zlo, m, n, ldc32i, global_chunk_start, actual_gemm, is_first);
                     }
                 }
             }
