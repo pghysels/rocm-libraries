@@ -496,17 +496,22 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
     const double n_scale_chunks = std::ceil(s / scale_chunk_sz);
 
     const double t_int8_bw     = (mk + kn + 4.0 * mn) / HBM_BW;
-    const double t_prelim_gemm = std::max(2.0 * mnk / INT8_PEAK, t_int8_bw);
-    const double t_prelim_kern = (mk + kn) * 17.0 / HBM_BW;
-    const double t_refine_kern = mn * 8.0 / HBM_BW;
-    const double t_scale_kern  = (mk + kn) * (8.0 * n_scale_chunks + s) / HBM_BW;
-    const double t_int8_gemms  = s * std::max(2.0 * mnk / INT8_PEAK, t_int8_bw);
-    const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / HBM_BW;
-    const double t_launch      = (5.0 + n_chunks) * LATENCY_KERNEL
-                               + (1.0 + n_chunks) * LATENCY_MATMUL
+    const double t_prelim_kern = (mk + kn) * 17.0 / HBM_BW
+                               + 2.0 * LATENCY_KERNEL;
+    const double t_prelim_gemm = std::max(2.0 * mnk / INT8_PEAK, t_int8_bw)
+                               + LATENCY_MATMUL;
+    const double t_refine_kern = mn * 8.0 / HBM_BW
+                               + 3.0 * LATENCY_KERNEL
                                + LATENCY_MEMSET;
+    const double t_scale_kern  = (mk + kn) * (8.0 * n_scale_chunks + s) / HBM_BW
+                               + 2.0 * n_scale_chunks * LATENCY_KERNEL;
+    const double t_int8_gemms  = s * std::max(2.0 * mnk / INT8_PEAK, t_int8_bw)
+                               + n_chunks * LATENCY_MATMUL;
+    const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / HBM_BW
+                               + n_chunks * LATENCY_KERNEL;
+    const double t_launch      = 0.0;   /* all launch overhead distributed into components above */
     const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
-                               + t_scale_kern  + t_int8_gemms  + t_accum_kern + t_launch;
+                               + t_scale_kern  + t_int8_gemms  + t_accum_kern;
     const double t_native      = std::max(2.0 * mnk / FP64_EFF,
                                           8.0 * (mk + kn + mn) / HBM_BW) + LATENCY_MATMUL;
 
