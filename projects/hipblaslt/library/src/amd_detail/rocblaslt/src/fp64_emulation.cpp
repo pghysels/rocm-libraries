@@ -581,9 +581,37 @@ unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
 
 /* =========================================================================
  * fp64EmulationWorkspaceSize
+ *
+ * Returns the minimum workspace in bytes required for fp64EmulatedGemm.
+ * When the performance model predicts that recursive binary-halving would
+ * be triggered, the function recurses to compute the maximum workspace
+ * needed across all sub-GEMM levels (which is always ≤ the monolithic
+ * workspace and can be significantly smaller).  Both halves share the same
+ * workspace buffer sequentially, so only the larger of the two is needed.
  * ========================================================================= */
 size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
+    /* Mirror the splitting decision in fp64EmulatedGemm. */
+    const unsigned chunk_sz = oz2_compute_chunk_size(m, n, num_moduli);
+    const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
+
+    if(n_chunks > 1u) {
+        const bool    split_m = (m >= n);
+        const int64_t half_m  = split_m ? m / 2 : m;
+        const int64_t half_n  = split_m ? n     : n / 2;
+
+        const double t_mono = fp64EmulationPerfModelTimes(m,      n,      k, num_moduli).t_total_ms;
+        const double t_half = fp64EmulationPerfModelTimes(half_m, half_n, k, num_moduli).t_total_ms;
+
+        if(2.0 * t_half <= t_mono * 1.01) {
+            const int64_t m2 = split_m ? (m - m / 2) : m;
+            const int64_t n2 = split_m ? n           : (n - n / 2);
+            return std::max(fp64EmulationWorkspaceSize(half_m, half_n, k, num_moduli),
+                            fp64EmulationWorkspaceSize(m2,     n2,     k, num_moduli));
+        }
+    }
+
+    /* Monolithic path workspace. */
     const size_t lda8i  = oz2_pad(static_cast<size_t>(k));
     const size_t cola8i = oz2_pad(static_cast<size_t>(m));
     const size_t ldb8i  = lda8i;
@@ -1234,6 +1262,59 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                                     ? settings.num_moduli : fp64EmulationNumModuli();
     if(oz2_init_constants(num_moduli) != hipSuccess)
         return rocblaslt_status_internal_error;
+
+    /* =========================================================================
+     * Recursive binary-halving for small-k shapes
+     *
+     * When the output m×n is too large for the 8 GiB workspace (n_chunks > 1),
+     * accumulation dominates.  Recursively halving max(m,n) reduces n_chunks
+     * until each sub-GEMM can run with n_chunks = 1, eliminating the extra
+     * Zhi/Zlo passes.  The performance model gates every split decision so the
+     * recursion stops automatically when splitting no longer helps (large k).
+     * ========================================================================= */
+    {
+        const unsigned chunk_sz = oz2_compute_chunk_size(m, n, num_moduli);
+        const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
+
+        if(n_chunks > 1u) {
+            const bool    split_m = (m >= n);
+            const int64_t half_m  = split_m ? m / 2 : m;
+            const int64_t half_n  = split_m ? n     : n / 2;
+
+            const double t_mono = fp64EmulationPerfModelTimes(m,      n,      k, num_moduli).t_total_ms;
+            const double t_half = fp64EmulationPerfModelTimes(half_m, half_n, k, num_moduli).t_total_ms;
+
+            /* The 1% slack absorbs kernel-launch overhead at intermediate
+             * recursion levels and prevents early termination when a single
+             * split does not yet improve n_chunks. */
+            if(2.0 * t_half <= t_mono * 1.01) {
+                const bool tA = (opA != HIPBLAS_OP_N);
+                const bool tB = (opB != HIPBLAS_OP_N);
+
+                /* First half: rows 0..half_m-1 or cols 0..half_n-1. */
+                {
+                    rocblaslt_status st =
+                        fp64EmulatedGemm(opA, opB, half_m, half_n, k, alpha,
+                                         A, lda, B, ldb, beta, C, ldc, D, ldd,
+                                         stream, settings);
+                    if(st != rocblaslt_status_success) return st;
+                }
+
+                /* Second half: rows half_m..m-1 or cols half_n..n-1. */
+                if(split_m)
+                    return fp64EmulatedGemm(opA, opB, m - m / 2, n, k, alpha,
+                                            tA ? A + half_m * lda : A + half_m, lda,
+                                            B, ldb, beta, C + half_m, ldc, D + half_m, ldd,
+                                            stream, settings);
+                else
+                    return fp64EmulatedGemm(opA, opB, m, n - n / 2, k, alpha,
+                                            A, lda, tB ? B + half_n : B + half_n * ldb, ldb,
+                                            beta, C + half_n * ldc, ldc, D + half_n * ldd, ldd,
+                                            stream, settings);
+            }
+        }
+    }
+    /* ── Existing monolithic path ──────────────────────────────────────────── */
 
     const char* const _pf   = oz2_profile_file();
     const bool        _prof = (_pf != nullptr);
