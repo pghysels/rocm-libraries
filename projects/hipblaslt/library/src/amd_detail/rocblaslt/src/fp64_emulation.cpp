@@ -521,10 +521,34 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
              t_launch      * s2ms, t_total       * s2ms, t_native      * s2ms };
 }
 
+/* Returns the minimum achievable emulation time in ms, accounting for the
+ * recursive binary-halving that fp64EmulatedGemm applies when n_chunks > 1.
+ * Both halves execute sequentially so the effective time is additive.        */
+static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s)
+{
+    const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
+    const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
+    if(n_chunks > 1u) {
+        const bool    split_m = (m >= n);
+        const int64_t half_m  = split_m ? m / 2 : m;
+        const int64_t half_n  = split_m ? n     : n / 2;
+        const double  t_mono  = fp64EmulationPerfModelTimes(m,      n,      k, s).t_total_ms;
+        const double  t_half  = fp64EmulationPerfModelTimes(half_m, half_n, k, s).t_total_ms;
+        if(2.0 * t_half <= t_mono * 1.01) {
+            const int64_t m2 = split_m ? (m - m / 2) : m;
+            const int64_t n2 = split_m ? n           : (n - n / 2);
+            return oz2_effective_time_ms(half_m, half_n, k, s)
+                 + oz2_effective_time_ms(m2,     n2,     k, s);
+        }
+    }
+    return fp64EmulationPerfModelTimes(m, n, k, s).t_total_ms;
+}
+
 bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
-    const Fp64PerfModelTimes pm = fp64EmulationPerfModelTimes(m, n, k, num_moduli);
-    return pm.t_total_ms <= pm.t_native_ms;
+    const double t_emul   = oz2_effective_time_ms(m, n, k, num_moduli);
+    const double t_native = fp64EmulationPerfModelTimes(m, n, k, num_moduli).t_native_ms;
+    return t_emul <= t_native;
 }
 
 bool fp64EmulationIsEager()
