@@ -559,6 +559,44 @@ static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s)
     return t_mono;
 }
 
+/* Returns per-component predicted times summed across ALL leaf sub-GEMMs,
+ * mirroring the recursive binary-halving of oz2_effective_time_ms.
+ * t_native_ms is always set to the top-level (m,n,k) native DGEMM time
+ * because native DGEMM does not split.                                    */
+static Fp64PerfModelTimes oz2_effective_perf_model_times(int64_t m, int64_t n, int64_t k, unsigned s)
+{
+    Fp64PerfModelTimes mono = fp64EmulationPerfModelTimes(m, n, k, s);
+
+    const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
+    const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
+    if(n_chunks > 1u) {
+        const bool    split_m = (m >= n);
+        const int64_t half_m  = split_m ? m / 2 : m;
+        const int64_t half_n  = split_m ? n     : n / 2;
+
+        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, s);
+        if(t_split <= mono.t_total_ms * 1.01) {
+            /* Recurse on one half, then double all components.
+             * Both halves are ≈ equal in size so the approximation is exact
+             * when m (or n) is even and negligible otherwise.               */
+            Fp64PerfModelTimes half = oz2_effective_perf_model_times(half_m, half_n, k, s);
+            half.t_prelim_ms      *= 2.0;
+            half.t_prelim_gemm_ms *= 2.0;
+            half.t_refine_ms      *= 2.0;
+            half.t_scale_ms       *= 2.0;
+            half.t_int8_gemms_ms  *= 2.0;
+            half.t_accum_ms       *= 2.0;
+            half.t_host_ms        *= 2.0;
+            half.t_launch_ms      *= 2.0;
+            half.t_total_ms       *= 2.0;
+            /* Native DGEMM does not split: keep the top-level prediction. */
+            half.t_native_ms = mono.t_native_ms;
+            return half;
+        }
+    }
+    return mono;
+}
+
 bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
     const double t_emul   = oz2_effective_time_ms(m, n, k, num_moduli);
@@ -1818,7 +1856,9 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
 
         const bool tA = (opA != HIPBLAS_OP_N);
         const bool tB = (opB != HIPBLAS_OP_N);
-        const Fp64PerfModelTimes pm = fp64EmulationPerfModelTimes(m, n, k, num_moduli);
+        /* Use the split-aware model: each component is the sum across all leaves.
+         * t_native_ms remains for the original (m,n,k) problem.           */
+        const Fp64PerfModelTimes pm = oz2_effective_perf_model_times(m, n, k, num_moduli);
 
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f) {
