@@ -69,8 +69,13 @@ static __host__ __device__ size_t oz2_pad(size_t n)
     return (n + OZ2_ALIGN - 1) / OZ2_ALIGN * OZ2_ALIGN;
 }
 
-static constexpr size_t OZ2_CHUNK_TARGET_BYTES = 8ull << 30;   /* 8 GiB    */
+static constexpr size_t OZ2_CHUNK_TARGET_BYTES = 16ull << 30;  /* 16 GiB   */
 static constexpr size_t OZ2_SCALE_CHUNK_TARGET_BYTES = 8ull << 30;  /* 8 GiB */
+
+/* Per-invocation host overhead: descriptor creation/destruction and
+ * hipblasLtMatmul planning overhead not captured by any component timer.
+ * Estimated from breakdown profiling data (MI35x, June 2026).             */
+static constexpr double OZ2_HOST_OVERHEAD_MS = 0.050;
 
 static unsigned oz2_compute_chunk_size(int64_t m, int64_t n, unsigned num_moduli)
 {
@@ -465,6 +470,7 @@ struct Fp64PerfModelTimes {
     double t_scale_ms;       /* multi-modulus scaling kernels       */
     double t_int8_gemms_ms;  /* all INT8 GEMMs                      */
     double t_accum_ms;       /* CRT accumulation / finalize kernels */
+    double t_host_ms;        /* per-call host overhead              */
     double t_launch_ms;      /* kernel-launch overhead              */
     double t_total_ms;       /* total predicted emulation time      */
     double t_native_ms;      /* predicted native FP64 DGEMM time    */
@@ -509,39 +515,48 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
                                + n_chunks * LATENCY_MATMUL;
     const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / HBM_BW
                                + n_chunks * LATENCY_KERNEL;
+    const double t_host        = OZ2_HOST_OVERHEAD_MS * 1e-3;
     const double t_launch      = 0.0;   /* all launch overhead distributed into components above */
     const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
-                               + t_scale_kern  + t_int8_gemms  + t_accum_kern;
+                               + t_scale_kern  + t_int8_gemms  + t_accum_kern
+                               + t_host;
     const double t_native      = std::max(2.0 * mnk / FP64_EFF,
                                           8.0 * (mk + kn + mn) / HBM_BW) + LATENCY_MATMUL;
 
     constexpr double s2ms = 1000.0;
     return { t_prelim_kern * s2ms, t_prelim_gemm * s2ms, t_refine_kern * s2ms,
              t_scale_kern  * s2ms, t_int8_gemms  * s2ms, t_accum_kern  * s2ms,
-             t_launch      * s2ms, t_total       * s2ms, t_native      * s2ms };
+             t_host        * s2ms, t_launch      * s2ms,
+             t_total       * s2ms, t_native      * s2ms };
 }
 
 /* Returns the minimum achievable emulation time in ms, accounting for the
  * recursive binary-halving that fp64EmulatedGemm applies when n_chunks > 1.
- * Both halves execute sequentially so the effective time is additive.        */
+ * Both halves execute sequentially so the effective time is additive.
+ *
+ * The gate comparison uses the RECURSIVE effective times of each half
+ * (not the flat perf-model times).  This correctly handles the case where
+ * one split does not yet reduce n_chunks but further splitting would: the
+ * recursive sub-call for the half discovers and accounts for those deeper
+ * splits, returning the true best achievable time for that half.       */
 static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s)
 {
+    const double t_mono = fp64EmulationPerfModelTimes(m, n, k, s).t_total_ms;
+
     const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
     const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
     if(n_chunks > 1u) {
         const bool    split_m = (m >= n);
         const int64_t half_m  = split_m ? m / 2 : m;
         const int64_t half_n  = split_m ? n     : n / 2;
-        const double  t_mono  = fp64EmulationPerfModelTimes(m,      n,      k, s).t_total_ms;
-        const double  t_half  = fp64EmulationPerfModelTimes(half_m, half_n, k, s).t_total_ms;
-        if(2.0 * t_half <= t_mono * 1.01) {
-            const int64_t m2 = split_m ? (m - m / 2) : m;
-            const int64_t n2 = split_m ? n           : (n - n / 2);
-            return oz2_effective_time_ms(half_m, half_n, k, s)
-                 + oz2_effective_time_ms(m2,     n2,     k, s);
-        }
+
+        /* Both halves are nearly identical in size (differ by at most 1 when
+         * m or n is odd), so approximate t_split = 2 × t_half.             */
+        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, s);
+        if(t_split <= t_mono * 1.01)
+            return t_split;
     }
-    return fp64EmulationPerfModelTimes(m, n, k, s).t_total_ms;
+    return t_mono;
 }
 
 bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
@@ -623,13 +638,13 @@ size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_
         const bool    split_m = (m >= n);
         const int64_t half_m  = split_m ? m / 2 : m;
         const int64_t half_n  = split_m ? n     : n / 2;
+        const int64_t m2      = split_m ? (m - m / 2) : m;
+        const int64_t n2      = split_m ? n            : (n - n / 2);
 
-        const double t_mono = fp64EmulationPerfModelTimes(m,      n,      k, num_moduli).t_total_ms;
-        const double t_half = fp64EmulationPerfModelTimes(half_m, half_n, k, num_moduli).t_total_ms;
+        const double t_mono  = fp64EmulationPerfModelTimes(m, n, k, num_moduli).t_total_ms;  // includes OZ2_HOST_OVERHEAD_MS
+        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, num_moduli);
 
-        if(2.0 * t_half <= t_mono * 1.01) {
-            const int64_t m2 = split_m ? (m - m / 2) : m;
-            const int64_t n2 = split_m ? n           : (n - n / 2);
+        if(t_split <= t_mono * 1.01) {
             return std::max(fp64EmulationWorkspaceSize(half_m, half_n, k, num_moduli),
                             fp64EmulationWorkspaceSize(m2,     n2,     k, num_moduli));
         }
@@ -1304,14 +1319,17 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
             const bool    split_m = (m >= n);
             const int64_t half_m  = split_m ? m / 2 : m;
             const int64_t half_n  = split_m ? n     : n / 2;
+            const int64_t m2      = split_m ? (m - m / 2) : m;
+            const int64_t n2      = split_m ? n            : (n - n / 2);
 
-            const double t_mono = fp64EmulationPerfModelTimes(m,      n,      k, num_moduli).t_total_ms;
-            const double t_half = fp64EmulationPerfModelTimes(half_m, half_n, k, num_moduli).t_total_ms;
+            /* Use recursive effective times (not flat model times) so the gate
+             * correctly evaluates the best achievable cost of each half including
+             * any further splitting those halves may need.  OZ2_HOST_OVERHEAD_MS
+             * is included in every sub-call, penalising excessive splitting.   */
+            const double t_mono  = fp64EmulationPerfModelTimes(m, n, k, num_moduli).t_total_ms;  // includes OZ2_HOST_OVERHEAD_MS
+            const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, num_moduli);
 
-            /* The 1% slack absorbs kernel-launch overhead at intermediate
-             * recursion levels and prevents early termination when a single
-             * split does not yet improve n_chunks. */
-            if(2.0 * t_half <= t_mono * 1.01) {
+            if(t_split <= t_mono * 1.01) {
                 const bool tA = (opA != HIPBLAS_OP_N);
                 const bool tB = (opB != HIPBLAS_OP_N);
 
@@ -1706,12 +1724,12 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                     "t_finalize_ms,t_total_ms,"
                     "pred_prelim_ms,pred_prelim_gemm_ms,pred_refine_ms,"
                     "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
-                    "pred_launch_ms,pred_total_ms,pred_native_dgemm_ms\n");
+                    "pred_host_ms,pred_launch_ms,pred_total_ms,pred_native_dgemm_ms\n");
             std::fprintf(_f,
                 "%lld,%lld,%lld,%c,%c,%u,%u,%u,"
                 "%llu,"
                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                 (long long)m, (long long)n, (long long)k,
                 tA ? 'T' : 'N', tB ? 'T' : 'N',
                 num_moduli, scale_chunk_size, chunk_size,
@@ -1720,7 +1738,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                 _t_scale, _t_int8, _t_accum, _t_finalize, _t_total,
                 pm.t_prelim_ms, pm.t_prelim_gemm_ms, pm.t_refine_ms,
                 pm.t_scale_ms, pm.t_int8_gemms_ms, pm.t_accum_ms,
-                pm.t_launch_ms, pm.t_total_ms, pm.t_native_ms);
+                pm.t_host_ms, pm.t_launch_ms, pm.t_total_ms, pm.t_native_ms);
             std::fclose(_f);
         }
         (void)hipEventDestroy(_ev_tot);
