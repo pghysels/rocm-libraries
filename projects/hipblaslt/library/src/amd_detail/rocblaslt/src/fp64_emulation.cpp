@@ -1277,25 +1277,45 @@ static const char* oz2_profile_file()
 }
 
 /* =========================================================================
- * fp64EmulatedGemm
+ * fp64EmulatedGemm — profiling accumulator + implementation
  * ========================================================================= */
-rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
-                                  hipblasOperation_t           opB,
-                                  int64_t                      m,
-                                  int64_t                      n,
-                                  int64_t                      k,
-                                  const double*                alpha,
-                                  const double*                A,
-                                  int64_t                      lda,
-                                  const double*                B,
-                                  int64_t                      ldb,
-                                  const double*                beta,
-                                  const double*                C,
-                                  int64_t                      ldc,
-                                  double*                      D,
-                                  int64_t                      ldd,
-                                  hipStream_t                  stream,
-                                  const Fp64EmulationSettings& settings)
+
+/* Aggregates per-component GPU times across all leaf sub-GEMMs and counts
+ * how many leaf (monolithic) sub-GEMMs were executed.  Owned by the public
+ * fp64EmulatedGemm wrapper; passed by pointer through recursive calls.     */
+struct Fp64ProfileAccum {
+    float    t_prelim      = 0.f;
+    float    t_prelim_gemm = 0.f;
+    float    t_extract     = 0.f;
+    float    t_refine      = 0.f;
+    float    t_scale       = 0.f;
+    float    t_int8        = 0.f;
+    float    t_accum       = 0.f;
+    float    t_finalize    = 0.f;
+    unsigned n_sub_gemms   = 0u;
+};
+
+/* Internal implementation — called recursively during binary-halving.
+ * prof != nullptr enables per-component accumulation across all leaves.   */
+static rocblaslt_status
+fp64EmulatedGemmImpl(hipblasOperation_t           opA,
+                     hipblasOperation_t           opB,
+                     int64_t                      m,
+                     int64_t                      n,
+                     int64_t                      k,
+                     const double*                alpha,
+                     const double*                A,
+                     int64_t                      lda,
+                     const double*                B,
+                     int64_t                      ldb,
+                     const double*                beta,
+                     const double*                C,
+                     int64_t                      ldc,
+                     double*                      D,
+                     int64_t                      ldd,
+                     hipStream_t                  stream,
+                     const Fp64EmulationSettings& settings,
+                     Fp64ProfileAccum*            prof)
 {
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
@@ -1336,34 +1356,33 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                 /* First half: rows 0..half_m-1 or cols 0..half_n-1. */
                 {
                     rocblaslt_status st =
-                        fp64EmulatedGemm(opA, opB, half_m, half_n, k, alpha,
-                                         A, lda, B, ldb, beta, C, ldc, D, ldd,
-                                         stream, settings);
+                        fp64EmulatedGemmImpl(opA, opB, half_m, half_n, k, alpha,
+                                             A, lda, B, ldb, beta, C, ldc, D, ldd,
+                                             stream, settings, prof);
                     if(st != rocblaslt_status_success) return st;
                 }
 
                 /* Second half: rows half_m..m-1 or cols half_n..n-1. */
                 if(split_m)
-                    return fp64EmulatedGemm(opA, opB, m - m / 2, n, k, alpha,
-                                            tA ? A + half_m * lda : A + half_m, lda,
-                                            B, ldb, beta, C + half_m, ldc, D + half_m, ldd,
-                                            stream, settings);
+                    return fp64EmulatedGemmImpl(opA, opB, m - m / 2, n, k, alpha,
+                                                tA ? A + half_m * lda : A + half_m, lda,
+                                                B, ldb, beta, C + half_m, ldc, D + half_m, ldd,
+                                                stream, settings, prof);
                 else
-                    return fp64EmulatedGemm(opA, opB, m, n - n / 2, k, alpha,
-                                            A, lda, tB ? B + half_n : B + half_n * ldb, ldb,
-                                            beta, C + half_n * ldc, ldc, D + half_n * ldd, ldd,
-                                            stream, settings);
+                    return fp64EmulatedGemmImpl(opA, opB, m, n - n / 2, k, alpha,
+                                                A, lda, tB ? B + half_n : B + half_n * ldb, ldb,
+                                                beta, C + half_n * ldc, ldc, D + half_n * ldd, ldd,
+                                                stream, settings, prof);
             }
         }
     }
     /* ── Existing monolithic path ──────────────────────────────────────────── */
 
-    const char* const _pf   = oz2_profile_file();
-    const bool        _prof = (_pf != nullptr);
-    hipEvent_t _ev0{}, _ev1{}, _ev_tot{};
+    const bool   _prof = (prof != nullptr);
+    hipEvent_t _ev0{}, _ev1{};
     float _t_prelim = 0, _t_prelim_gemm = 0, _t_extract = 0, _t_refine = 0,
-          _t_scale  = 0, _t_int8 = 0, _t_accum = 0, _t_finalize = 0, _t_total = 0;
-    if(_prof) { (void)hipEventCreate(&_ev0); (void)hipEventCreate(&_ev1); (void)hipEventCreate(&_ev_tot); }
+          _t_scale  = 0, _t_int8 = 0, _t_accum = 0, _t_finalize = 0;
+    if(_prof) { (void)hipEventCreate(&_ev0); (void)hipEventCreate(&_ev1); }
     auto _pstart = [&]() noexcept { if(_prof) (void)hipEventRecord(_ev0, stream); };
     auto _pstop  = [&](float& t) noexcept {
         if(_prof) {
@@ -1422,8 +1441,6 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     uint32_t* const nan_flag   = reinterpret_cast<uint32_t*>(sftB + szSftB);
     int32_t*  const row_max    = reinterpret_cast<int32_t*>(nan_flag + szNanFlag);
     int32_t*  const C32i       = C32i_batch;
-
-    if(_prof) (void)hipEventRecord(_ev_tot, stream);
 
     int8_t* const A8i_high = A8i;
     int8_t* const B8i_high = B8i;
@@ -1710,15 +1727,105 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     }
 
     if(_prof) {
-        (void)hipEventRecord(_ev1, stream); (void)hipStreamSynchronize(stream);
-        (void)hipEventElapsedTime(&_t_total, _ev_tot, _ev1);
+        /* Accumulate component times into the caller's accumulator. */
+        prof->t_prelim      += _t_prelim;
+        prof->t_prelim_gemm += _t_prelim_gemm;
+        prof->t_extract     += _t_extract;
+        prof->t_refine      += _t_refine;
+        prof->t_scale       += _t_scale;
+        prof->t_int8        += _t_int8;
+        prof->t_accum       += _t_accum;
+        prof->t_finalize    += _t_finalize;
+        prof->n_sub_gemms   += 1u;
+        (void)hipEventDestroy(_ev1);
+        (void)hipEventDestroy(_ev0);
+    }
+    return rocblaslt_status_success;
+}
+
+/* =========================================================================
+ * fp64EmulatedGemm — public wrapper
+ *
+ * Owns the profiling accumulator.  Records a single HIP event pair around
+ * the entire call (including all recursive sub-GEMMs) to measure the true
+ * GPU wall-clock time, then writes one summary CSV row with:
+ *   – summed component times across all leaf sub-GEMMs
+ *   – the measured t_total_ms for the full call
+ *   – num_sub_gemms (number of monolithic leaf calls executed)
+ * ========================================================================= */
+rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
+                                  hipblasOperation_t           opB,
+                                  int64_t                      m,
+                                  int64_t                      n,
+                                  int64_t                      k,
+                                  const double*                alpha,
+                                  const double*                A,
+                                  int64_t                      lda,
+                                  const double*                B,
+                                  int64_t                      ldb,
+                                  const double*                beta,
+                                  const double*                C,
+                                  int64_t                      ldc,
+                                  double*                      D,
+                                  int64_t                      ldd,
+                                  hipStream_t                  stream,
+                                  const Fp64EmulationSettings& settings)
+{
+    const char* const _pf   = oz2_profile_file();
+    const bool        _prof = (_pf != nullptr);
+
+    Fp64ProfileAccum accum{};
+    hipEvent_t ev_start{}, ev_end{};
+    if(_prof) {
+        (void)hipEventCreate(&ev_start);
+        (void)hipEventCreate(&ev_end);
+        (void)hipEventRecord(ev_start, stream);
+    }
+
+    const rocblaslt_status st =
+        fp64EmulatedGemmImpl(opA, opB, m, n, k, alpha, A, lda, B, ldb,
+                             beta, C, ldc, D, ldd, stream, settings,
+                             _prof ? &accum : nullptr);
+
+    if(_prof) {
+        (void)hipEventRecord(ev_end, stream);
+        (void)hipStreamSynchronize(stream);
+        float t_total = 0.f;
+        (void)hipEventElapsedTime(&t_total, ev_start, ev_end);
+
+        const unsigned num_moduli =
+            (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
+                ? settings.num_moduli : fp64EmulationNumModuli();
+        const unsigned chunk_size = oz2_compute_chunk_size(m, n, num_moduli);
+        const unsigned scale_chunk_size =
+            oz2_compute_scale_chunk_size(m, n, k, num_moduli, chunk_size);
+
+        const size_t lda8i  = oz2_pad(static_cast<size_t>(k));
+        const size_t cola8i = oz2_pad(static_cast<size_t>(m));
+        const size_t ldb8i  = lda8i;
+        const size_t ldc32i = cola8i;
+        const size_t padn   = oz2_pad(static_cast<size_t>(n));
+        const size_t szC32i = ldc32i * static_cast<size_t>(n);
+        const size_t wsBytes =
+              scale_chunk_size * lda8i * cola8i * sizeof(int8_t)
+            + scale_chunk_size * ldb8i * static_cast<size_t>(n) * sizeof(int8_t)
+            + chunk_size * szC32i * sizeof(int32_t)
+            + szC32i * sizeof(double) * 2
+            + cola8i * sizeof(int16_t)
+            + padn   * sizeof(int16_t)
+            + sizeof(uint32_t)
+            + cola8i * sizeof(int32_t);
+
+        const bool tA = (opA != HIPBLAS_OP_N);
+        const bool tB = (opB != HIPBLAS_OP_N);
         const Fp64PerfModelTimes pm = fp64EmulationPerfModelTimes(m, n, k, num_moduli);
+
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f) {
             if(std::ftell(_f) == 0)
                 std::fprintf(_f,
                     "m,n,k,transA,transB,num_moduli,scale_chunk_size,gemm_chunk_size,"
-                    "workspace_bytes,"
+                    "workspace_bytes,num_sub_gemms,"
                     "t_prelim_ms,t_prelim_gemm_ms,t_extract_ms,t_refine_ms,"
                     "t_scale_ms,t_int8_gemm_ms,t_accum_ms,"
                     "t_finalize_ms,t_total_ms,"
@@ -1727,23 +1834,22 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                     "pred_host_ms,pred_launch_ms,pred_total_ms,pred_native_dgemm_ms\n");
             std::fprintf(_f,
                 "%lld,%lld,%lld,%c,%c,%u,%u,%u,"
-                "%llu,"
+                "%llu,%u,"
                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                 "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                 (long long)m, (long long)n, (long long)k,
                 tA ? 'T' : 'N', tB ? 'T' : 'N',
                 num_moduli, scale_chunk_size, chunk_size,
-                (unsigned long long)wsBytes,
-                _t_prelim, _t_prelim_gemm, _t_extract, _t_refine,
-                _t_scale, _t_int8, _t_accum, _t_finalize, _t_total,
+                (unsigned long long)wsBytes, accum.n_sub_gemms,
+                accum.t_prelim, accum.t_prelim_gemm, accum.t_extract, accum.t_refine,
+                accum.t_scale, accum.t_int8, accum.t_accum, accum.t_finalize, t_total,
                 pm.t_prelim_ms, pm.t_prelim_gemm_ms, pm.t_refine_ms,
                 pm.t_scale_ms, pm.t_int8_gemms_ms, pm.t_accum_ms,
                 pm.t_host_ms, pm.t_launch_ms, pm.t_total_ms, pm.t_native_ms);
             std::fclose(_f);
         }
-        (void)hipEventDestroy(_ev_tot);
-        (void)hipEventDestroy(_ev1);
-        (void)hipEventDestroy(_ev0);
+        (void)hipEventDestroy(ev_end);
+        (void)hipEventDestroy(ev_start);
     }
-    return rocblaslt_status_success;
+    return st;
 }
