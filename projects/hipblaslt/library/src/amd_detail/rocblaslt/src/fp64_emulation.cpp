@@ -1067,10 +1067,17 @@ oz2_refine_sftB_kernel(const int32_t* __restrict__ C32i,
  * SHMEM kernels: TILE_M=16 → 4× fewer blocks/syncs; 8.7 KB LDS per block.
  * ========================================================================= */
 static constexpr unsigned OZ2_SCALE_TILE_K         = 64;
-static constexpr unsigned OZ2_SCALE_COALESC_TILE_M = 4;   /* blockDim=256, no SHMEM */
+/* Coalesced kernels (A_T, B_N) process 2 k-positions per thread (K_UNROLL=2):
+ * effective k-tile per block = OZ2_SCALE_TILE_K * 2 = 128.                  */
+static constexpr unsigned OZ2_SCALE_COALESC_TILE_M = 8;   /* blockDim=512, no SHMEM */
 static constexpr unsigned OZ2_SCALE_SHMEM_TILE_M   = 16;  /* blockDim=1024, uses SHMEM */
 
-/* ── A_T: TRANS_A=true, k-fast coalesced, blockDim=256, TILE_M=4 ── */
+/* ── A_T: TRANS_A=true, k-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=2 ──
+ * Each thread processes TWO adjacent k-positions: j0 and j0+1.
+ * j0 = blockIdx.x * 2*TILE_K + (t%TILE_K)*2  →  always even  →  16-byte aligned.
+ * Loads:  one double2 (128-bit) per thread (j0 & j0+1 together).
+ * Stores: one uint16_t NT store per modulus per thread (packs INT8[j0] & INT8[j1]).
+ * This halves both load and store instruction counts vs. two separate scalar ops. */
 template <unsigned T_COUNT>
 __global__ static void
 oz2_scale_A_T_kernel(const double* __restrict__ A,
@@ -1079,25 +1086,54 @@ oz2_scale_A_T_kernel(const double* __restrict__ A,
                      const int16_t* __restrict__ sftA,
                      int64_t k, unsigned t_start)
 {
-    static constexpr int TILE_K = static_cast<int>(OZ2_SCALE_TILE_K);
-    static constexpr int TILE_M = static_cast<int>(OZ2_SCALE_COALESC_TILE_M);
+    static constexpr int TILE_K = static_cast<int>(OZ2_SCALE_TILE_K);   /* 64 */
+    static constexpr int TILE_M = static_cast<int>(OZ2_SCALE_COALESC_TILE_M); /* 8 */
     const int t = static_cast<int>(threadIdx.x);
     const int64_t m_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
-    const int64_t j = static_cast<int64_t>(blockIdx.x) * TILE_K + (t % TILE_K);
-    const int64_t i = m_base + (t / TILE_K);
-    if(i >= m || j >= k) return;
-    const double val  = A[i * lda + j];                                 /* COALESCED */
-    const double ival = trunc(ldexp(val, static_cast<int>(sftA[i])));
-    const size_t stride = lda8i * cola8i;
-    const size_t offset = static_cast<size_t>(j) + static_cast<size_t>(i) * lda8i;
+    /* j0 is always even → the double2 load is 16-byte aligned when lda is even. */
+    const int64_t j0 = static_cast<int64_t>(blockIdx.x) * (TILE_K * 2)
+                       + static_cast<int64_t>(t % TILE_K) * 2;
+    const int64_t j1 = j0 + 1;          /* adjacent element */
+    const int64_t i  = m_base + (t / TILE_K);
+    if(i >= m || j0 >= k) return;
+    const int  sft    = static_cast<int>(sftA[i]);
+    const bool valid1 = (j1 < k);
+    double ival0, ival1;
+    if(valid1) {
+        /* 128-bit load: reads j0 and j0+1 in one instruction (j0 is even → aligned). */
+        const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0);
+        ival0 = trunc(ldexp(vv.x, sft));
+        ival1 = trunc(ldexp(vv.y, sft));
+    } else {
+        ival0 = trunc(ldexp(A[i * lda + j0], sft));
+        ival1 = 0.0;
+    }
+    const size_t stride   = lda8i * cola8i;
+    const size_t off_base = static_cast<size_t>(i) * lda8i;
+    const size_t off0 = static_cast<size_t>(j0) + off_base; /* always even → uint16_t aligned */
     #pragma unroll
     for(unsigned t_local = 0; t_local < T_COUNT; ++t_local) {
-        const unsigned tidx = t_start + t_local;
-        const double  r  = fma(cNegMod[tidx], rint(ival * cInvMod[tidx]), ival);
-        const float   rf = static_cast<float>(r);
-        const float  rf2 = fmaf(rintf(rf * cInvModF[tidx]), static_cast<float>(cNegMod[tidx]), rf);
-        __builtin_nontemporal_store(static_cast<int8_t>(static_cast<int32_t>(rf2)),
-                                    A8i + t_local * stride + offset);
+        const unsigned tidx    = t_start + t_local;
+        const double  neg_mod  = cNegMod[tidx];
+        const double  inv_mod  = cInvMod[tidx];
+        const float   inv_modf = cInvModF[tidx];
+        const double  r0   = fma(neg_mod, rint(ival0 * inv_mod), ival0);
+        const float   rf0  = static_cast<float>(r0);
+        const auto    b0   = static_cast<int8_t>(static_cast<int32_t>(
+                                 fmaf(rintf(rf0 * inv_modf), static_cast<float>(neg_mod), rf0)));
+        if(valid1) {
+            /* Pack INT8[j0] and INT8[j0+1] into one 16-bit NT store. */
+            const double  r1   = fma(neg_mod, rint(ival1 * inv_mod), ival1);
+            const float   rf1  = static_cast<float>(r1);
+            const auto    b1   = static_cast<int8_t>(static_cast<int32_t>(
+                                     fmaf(rintf(rf1 * inv_modf), static_cast<float>(neg_mod), rf1)));
+            const uint16_t packed = static_cast<uint8_t>(b0)
+                                  | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
+            __builtin_nontemporal_store(packed,
+                reinterpret_cast<uint16_t*>(A8i + t_local * stride + off0));
+        } else {
+            __builtin_nontemporal_store(b0, A8i + t_local * stride + off0);
+        }
     }
 }
 
@@ -1147,7 +1183,8 @@ oz2_scale_A_N_kernel(const double* __restrict__ A,
     }
 }
 
-/* ── B_N: TRANS_B=false, j-fast coalesced, blockDim=256, TILE_M=4 ── */
+/* ── B_N: TRANS_B=false, j-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=2 ──
+ * Mirrors oz2_scale_A_T_kernel: double2 load + uint16_t packed store. */
 template <unsigned T_COUNT>
 __global__ static void
 oz2_scale_B_N_kernel(const double* __restrict__ B,
@@ -1156,25 +1193,51 @@ oz2_scale_B_N_kernel(const double* __restrict__ B,
                      const int16_t* __restrict__ sftB,
                      int64_t k, unsigned t_start)
 {
-    static constexpr int TILE_K = static_cast<int>(OZ2_SCALE_TILE_K);
-    static constexpr int TILE_M = static_cast<int>(OZ2_SCALE_COALESC_TILE_M);
+    static constexpr int TILE_K = static_cast<int>(OZ2_SCALE_TILE_K);   /* 64 */
+    static constexpr int TILE_M = static_cast<int>(OZ2_SCALE_COALESC_TILE_M); /* 8 */
     const int t = static_cast<int>(threadIdx.x);
     const int64_t n_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
-    const int64_t j   = static_cast<int64_t>(blockIdx.x) * TILE_K + (t % TILE_K);
+    const int64_t j0  = static_cast<int64_t>(blockIdx.x) * (TILE_K * 2)
+                        + static_cast<int64_t>(t % TILE_K) * 2;
+    const int64_t j1  = j0 + 1;         /* adjacent element */
     const int64_t col = n_base + (t / TILE_K);
-    if(col >= n || j >= k) return;
-    const double val  = B[col * ldb + j];                               /* COALESCED */
-    const double ival = trunc(ldexp(val, static_cast<int>(sftB[col])));
-    const size_t stride = ldb8i * static_cast<size_t>(n);
-    const size_t offset = static_cast<size_t>(j) + static_cast<size_t>(col) * ldb8i;
+    if(col >= n || j0 >= k) return;
+    const int  sft    = static_cast<int>(sftB[col]);
+    const bool valid1 = (j1 < k);
+    double ival0, ival1;
+    if(valid1) {
+        const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0);
+        ival0 = trunc(ldexp(vv.x, sft));
+        ival1 = trunc(ldexp(vv.y, sft));
+    } else {
+        ival0 = trunc(ldexp(B[col * ldb + j0], sft));
+        ival1 = 0.0;
+    }
+    const size_t stride   = ldb8i * static_cast<size_t>(n);
+    const size_t off_base = static_cast<size_t>(col) * ldb8i;
+    const size_t off0 = static_cast<size_t>(j0) + off_base; /* always even → uint16_t aligned */
     #pragma unroll
     for(unsigned t_local = 0; t_local < T_COUNT; ++t_local) {
-        const unsigned tidx = t_start + t_local;
-        const double  r  = fma(cNegMod[tidx], rint(ival * cInvMod[tidx]), ival);
-        const float   rf = static_cast<float>(r);
-        const float  rf2 = fmaf(rintf(rf * cInvModF[tidx]), static_cast<float>(cNegMod[tidx]), rf);
-        __builtin_nontemporal_store(static_cast<int8_t>(static_cast<int32_t>(rf2)),
-                                    B8i + t_local * stride + offset);
+        const unsigned tidx    = t_start + t_local;
+        const double  neg_mod  = cNegMod[tidx];
+        const double  inv_mod  = cInvMod[tidx];
+        const float   inv_modf = cInvModF[tidx];
+        const double  r0   = fma(neg_mod, rint(ival0 * inv_mod), ival0);
+        const float   rf0  = static_cast<float>(r0);
+        const auto    b0   = static_cast<int8_t>(static_cast<int32_t>(
+                                 fmaf(rintf(rf0 * inv_modf), static_cast<float>(neg_mod), rf0)));
+        if(valid1) {
+            const double  r1   = fma(neg_mod, rint(ival1 * inv_mod), ival1);
+            const float   rf1  = static_cast<float>(r1);
+            const auto    b1   = static_cast<int8_t>(static_cast<int32_t>(
+                                     fmaf(rintf(rf1 * inv_modf), static_cast<float>(neg_mod), rf1)));
+            const uint16_t packed = static_cast<uint8_t>(b0)
+                                  | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
+            __builtin_nontemporal_store(packed,
+                reinterpret_cast<uint16_t*>(B8i + t_local * stride + off0));
+        } else {
+            __builtin_nontemporal_store(b0, B8i + t_local * stride + off0);
+        }
     }
 }
 
@@ -1583,13 +1646,16 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     /* Scale: separate A and B kernels with optimal blockDim per path.
      * Coalesced (_T for A, _N for B): TILE_M=4, blockDim=256, no SHMEM.
      * SHMEM    (_N for A, _T for B):  TILE_M=16, blockDim=1024.          */
-    const dim3 blk_scale_T(OZ2_SCALE_TILE_K * OZ2_SCALE_COALESC_TILE_M);  /* 256  */
+    const dim3 blk_scale_T(OZ2_SCALE_TILE_K * OZ2_SCALE_COALESC_TILE_M);  /* 512  */
     const dim3 blk_scale_N(OZ2_SCALE_TILE_K * OZ2_SCALE_SHMEM_TILE_M);    /* 1024 */
+    /* SHMEM kernels: standard TILE_K per block. */
     const unsigned k_x_blks = static_cast<unsigned>((k + OZ2_SCALE_TILE_K - 1) / OZ2_SCALE_TILE_K);
-    const dim3 g_scale_A_T(k_x_blks, static_cast<unsigned>((m + OZ2_SCALE_COALESC_TILE_M - 1) / OZ2_SCALE_COALESC_TILE_M));
-    const dim3 g_scale_A_N(k_x_blks, static_cast<unsigned>((m + OZ2_SCALE_SHMEM_TILE_M    - 1) / OZ2_SCALE_SHMEM_TILE_M));
-    const dim3 g_scale_B_N(k_x_blks, static_cast<unsigned>((n + OZ2_SCALE_COALESC_TILE_M - 1) / OZ2_SCALE_COALESC_TILE_M));
-    const dim3 g_scale_B_T(k_x_blks, static_cast<unsigned>((n + OZ2_SCALE_SHMEM_TILE_M    - 1) / OZ2_SCALE_SHMEM_TILE_M));
+    /* Coalesced kernels: K_UNROLL=2 → each block covers 2*TILE_K k-positions. */
+    const unsigned k_x_blks_c = static_cast<unsigned>((k + 2u * OZ2_SCALE_TILE_K - 1u) / (2u * OZ2_SCALE_TILE_K));
+    const dim3 g_scale_A_T(k_x_blks_c, static_cast<unsigned>((m + OZ2_SCALE_COALESC_TILE_M - 1) / OZ2_SCALE_COALESC_TILE_M));
+    const dim3 g_scale_A_N(k_x_blks,   static_cast<unsigned>((m + OZ2_SCALE_SHMEM_TILE_M    - 1) / OZ2_SCALE_SHMEM_TILE_M));
+    const dim3 g_scale_B_N(k_x_blks_c, static_cast<unsigned>((n + OZ2_SCALE_COALESC_TILE_M - 1) / OZ2_SCALE_COALESC_TILE_M));
+    const dim3 g_scale_B_T(k_x_blks,   static_cast<unsigned>((n + OZ2_SCALE_SHMEM_TILE_M    - 1) / OZ2_SCALE_SHMEM_TILE_M));
     const dim3 blk_acc(64, 8);
     const dim3 grid_acc((m + 63) / 64, (n + 7) / 8);
     const size_t strideA8i = lda8i * cola8i;
