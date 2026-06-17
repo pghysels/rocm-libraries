@@ -1903,22 +1903,10 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         const unsigned chunk_size = oz2_compute_chunk_size(m, n, num_moduli);
         const unsigned scale_chunk_size =
             oz2_compute_scale_chunk_size(m, n, k, num_moduli, chunk_size);
-
-        const size_t lda8i  = oz2_pad(static_cast<size_t>(k));
-        const size_t cola8i = oz2_pad(static_cast<size_t>(m));
-        const size_t ldb8i  = lda8i;
-        const size_t ldc32i = cola8i;
-        const size_t padn   = oz2_pad(static_cast<size_t>(n));
-        const size_t szC32i = ldc32i * static_cast<size_t>(n);
-        const size_t wsBytes =
-              scale_chunk_size * lda8i * cola8i * sizeof(int8_t)
-            + scale_chunk_size * ldb8i * static_cast<size_t>(n) * sizeof(int8_t)
-            + chunk_size * szC32i * sizeof(int32_t)
-            + szC32i * sizeof(double) * 2
-            + cola8i * sizeof(int16_t)
-            + padn   * sizeof(int16_t)
-            + sizeof(uint32_t)
-            + cola8i * sizeof(int32_t);
+        /* For split shapes fp64EmulationWorkspaceSize returns the max leaf
+         * workspace (= actual peak allocation), which is more accurate than
+         * the monolithic formula for the CSV workspace_bytes column.         */
+        const size_t wsBytes = fp64EmulationWorkspaceSize(m, n, k, num_moduli);
 
         const bool tA = (opA != HIPBLAS_OP_N);
         const bool tB = (opB != HIPBLAS_OP_N);
