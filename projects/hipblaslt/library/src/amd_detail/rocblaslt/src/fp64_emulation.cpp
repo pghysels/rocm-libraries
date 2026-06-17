@@ -1511,26 +1511,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     const size_t szNanFlag = 1;
     const size_t szRowMax  = cola8i;
 
-    const size_t wsBytes =
-          szA8i    * sizeof(int8_t)
-        + szB8i    * sizeof(int8_t)
-        + chunk_size * szC32i * sizeof(int32_t)
-        + szZhi    * sizeof(double)
-        + szZlo    * sizeof(double)
-        + szSftA   * sizeof(int16_t)
-        + szSftB   * sizeof(int16_t)
-        + szNanFlag * sizeof(uint32_t)
-        + szRowMax  * sizeof(int32_t);
-
-    bool   ws_owned = false;
-    char*  ws       = nullptr;
-    if(settings.workspace != nullptr && settings.workspace_bytes >= wsBytes) {
-        ws = static_cast<char*>(settings.workspace);
-    } else {
-        ws_owned = true;
-        if(hipMallocAsync(&ws, wsBytes, stream) != hipSuccess)
-            return rocblaslt_status_memory_error;
-    }
+    char* const ws = static_cast<char*>(settings.workspace);
 
     int8_t*   const A8i        = reinterpret_cast<int8_t*>(ws);
     int8_t*   const B8i        = A8i + szA8i;
@@ -1553,9 +1534,8 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
                                 ? settings.sv_mask : fp64EmulationSpecialValuesMask();
 
     if(svmask != 0u) {
-        if(hipMemsetAsync(nan_flag, 0, sizeof(uint32_t), stream) != hipSuccess) {
-            (void)hipFreeAsync(ws, stream); return rocblaslt_status_internal_error;
-        }
+        if(hipMemsetAsync(nan_flag, 0, sizeof(uint32_t), stream) != hipSuccess)
+            return rocblaslt_status_internal_error;
     }
 
     hipblasLtMatrixLayout_t layoutA  = nullptr;
@@ -1610,17 +1590,13 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     /* _t_extract remains 0: extraction is now fused into _t_prelim */
 
     if(svmask != 0u) {
-        if(hipStreamSynchronize(stream) != hipSuccess) {
-            (void)hipFreeAsync(ws, stream); return rocblaslt_status_internal_error;
-        }
+        if(hipStreamSynchronize(stream) != hipSuccess)
+            return rocblaslt_status_internal_error;
         uint32_t detected = 0u;
-        if(hipMemcpy(&detected, nan_flag, sizeof(uint32_t), hipMemcpyDeviceToHost) != hipSuccess) {
-            (void)hipFreeAsync(ws, stream); return rocblaslt_status_internal_error;
-        }
-        if(detected & svmask) {
-            if(ws_owned) (void)hipFreeAsync(ws, stream);
+        if(hipMemcpy(&detected, nan_flag, sizeof(uint32_t), hipMemcpyDeviceToHost) != hipSuccess)
+            return rocblaslt_status_internal_error;
+        if(detected & svmask)
             return rocblaslt_status_invalid_value;
-        }
     }
 
     /* Preliminary INT8 GEMM: C32i_prelim = A8i_high^T × B8i_high */
@@ -1644,7 +1620,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     _pstop(_t_refine);
 
     /* Scale: separate A and B kernels with optimal blockDim per path.
-     * Coalesced (_T for A, _N for B): TILE_M=4, blockDim=256, no SHMEM.
+     * Coalesced (_T for A, _N for B): TILE_M=8, blockDim=512, no SHMEM.
      * SHMEM    (_N for A, _T for B):  TILE_M=16, blockDim=1024.          */
     const dim3 blk_scale_T(OZ2_SCALE_TILE_K * OZ2_SCALE_COALESC_TILE_M);  /* 512  */
     const dim3 blk_scale_N(OZ2_SCALE_TILE_K * OZ2_SCALE_SHMEM_TILE_M);    /* 1024 */
@@ -1825,11 +1801,6 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     hipblasLtMatrixLayoutDestroy(layoutB);
     hipblasLtMatrixLayoutDestroy(layoutA);
 
-    if(ws_owned) {
-        if(hipFreeAsync(ws, stream) != hipSuccess)
-            return rocblaslt_status_internal_error;
-    }
-
     if(_prof) {
         /* Accumulate component times into the caller's accumulator. */
         prof->t_prelim      += _t_prelim;
@@ -1875,6 +1846,30 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                                   hipStream_t                  stream,
                                   const Fp64EmulationSettings& settings)
 {
+    /* ── Pre-allocate a single workspace for the entire call ──────────────────
+     * fp64EmulatedGemmImpl recurses for split shapes; without a pre-allocated
+     * buffer each leaf sub-GEMM would do its own hipMallocAsync/hipFreeAsync.
+     * Allocating once here and passing it through settings eliminates that
+     * overhead (e.g. 16 redundant alloc/free pairs for the 65K square case).
+     * If the caller already provided a sufficient workspace we use it as-is.  */
+    const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
+                                    ? settings.num_moduli : fp64EmulationNumModuli();
+    const size_t wsNeeded = fp64EmulationWorkspaceSize(m, n, k, num_moduli);
+
+    Fp64EmulationSettings effectiveSettings = settings;
+    void* ws_toplevel = nullptr;
+
+    if(wsNeeded > 0 &&
+       (effectiveSettings.workspace == nullptr ||
+        effectiveSettings.workspace_bytes < wsNeeded))
+    {
+        if(hipMallocAsync(&ws_toplevel, wsNeeded, stream) != hipSuccess)
+            return rocblaslt_status_memory_error;
+        effectiveSettings.workspace       = ws_toplevel;
+        effectiveSettings.workspace_bytes = wsNeeded;
+    }
+    /* ────────────────────────────────────────────────────────────────────── */
+
     const char* const _pf   = oz2_profile_file();
     const bool        _prof = (_pf != nullptr);
 
@@ -1888,8 +1883,12 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
 
     const rocblaslt_status st =
         fp64EmulatedGemmImpl(opA, opB, m, n, k, alpha, A, lda, B, ldb,
-                             beta, C, ldc, D, ldd, stream, settings,
+                             beta, C, ldc, D, ldd, stream, effectiveSettings,
                              _prof ? &accum : nullptr);
+
+    /* Release the top-level workspace now that all leaves have finished.    */
+    if(ws_toplevel != nullptr)
+        (void)hipFreeAsync(ws_toplevel, stream);
 
     if(_prof) {
         (void)hipEventRecord(ev_end, stream);
@@ -1897,17 +1896,9 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         float t_total = 0.f;
         (void)hipEventElapsedTime(&t_total, ev_start, ev_end);
 
-        const unsigned num_moduli =
-            (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
-                ? settings.num_moduli : fp64EmulationNumModuli();
         const unsigned chunk_size = oz2_compute_chunk_size(m, n, num_moduli);
         const unsigned scale_chunk_size =
             oz2_compute_scale_chunk_size(m, n, k, num_moduli, chunk_size);
-        /* For split shapes fp64EmulationWorkspaceSize returns the max leaf
-         * workspace (= actual peak allocation), which is more accurate than
-         * the monolithic formula for the CSV workspace_bytes column.         */
-        const size_t wsBytes = fp64EmulationWorkspaceSize(m, n, k, num_moduli);
-
         const bool tA = (opA != HIPBLAS_OP_N);
         const bool tB = (opB != HIPBLAS_OP_N);
         /* Use the split-aware model: each component is the sum across all leaves.
@@ -1934,7 +1925,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                 (long long)m, (long long)n, (long long)k,
                 tA ? 'T' : 'N', tB ? 'T' : 'N',
                 num_moduli, scale_chunk_size, chunk_size,
-                (unsigned long long)wsBytes, accum.n_sub_gemms,
+                (unsigned long long)wsNeeded, accum.n_sub_gemms,
                 accum.t_prelim, accum.t_prelim_gemm, accum.t_extract, accum.t_refine,
                 accum.t_scale, accum.t_int8, accum.t_accum, accum.t_finalize, t_total,
                 pm.t_prelim_ms, pm.t_prelim_gemm_ms, pm.t_refine_ms,
