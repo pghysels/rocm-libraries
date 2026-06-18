@@ -46,10 +46,13 @@
 #include "hipblaslt/hipblaslt.h"
 #include <hip/hip_runtime.h>
 
-#include <cstdlib>   // std::getenv
-#include <cstdio>    // std::fopen / std::fprintf / std::fclose / std::ftell
-#include <cstring>   // std::strcmp
-#include <cmath>     // std::log2, std::floor, etc.
+#include <cstdlib>      // std::getenv
+#include <cstdio>       // std::fopen / std::fprintf / std::fclose / std::ftell
+#include <cstring>      // std::strcmp
+#include <cmath>        // std::log2, std::floor, etc.
+#include <optional>     // std::optional
+#include <unordered_map>// std::unordered_map
+#include <cassert>      // assert
 
 /* =========================================================================
  * Tuning constants
@@ -458,6 +461,57 @@ bool fp64EmulationIsEnabled()
 }
 
 /* =========================================================================
+ * Architecture-specific performance-model parameters
+ *
+ * Keyed on hipDeviceProp_t::pciDeviceID — unique per silicon SKU.
+ * If the running device is not in the table, emulation is disabled and
+ * native DGEMM is used instead (avoids unvalidated perf predictions).
+ * ========================================================================= */
+struct Oz2PerfModelParams {
+    double hbm_bw;    /* peak HBM bandwidth          (bytes/sec) */
+    double int8_peak; /* peak INT8 tensor throughput  (ops/sec)  */
+    double fp64_peak; /* peak FP64 DGEMM throughput   (ops/sec)  */
+};
+
+static const std::unordered_map<uint32_t, Oz2PerfModelParams>
+oz2_hw_params_by_pci_id = {
+    // /* gfx1201 Navi48 XTX */
+    // { 0x7551u, { 0., 0., 0. } },
+    // /* gfx1150 Strix Point */
+    // { 0x150e, { 0., 0., 0. } },
+    // /* gfx1151 Strix Halo */
+    // { 0x1586, { 0., 0., 0. } },
+
+    /* MI300X (or MI300X_A1) (gfx942) */
+    { 0x74a0u, { 3.93e12, 1746.42e12, 10.37e12 } },
+    { 0x74a1u, { 3.93e12, 1746.42e12, 10.37e12 } },
+    { 0x74a9u, { 3.93e12, 1746.42e12, 10.37e12 } },
+};
+
+/* Per-device cache.   */
+static std::optional<std::optional<Oz2PerfModelParams>> oz2_device_params_cache[64];
+
+/* Returns the perf-model parameters for the given HIP device, or nullopt if
+ * the device is not in the table (in which case emulation should not run). */
+static std::optional<Oz2PerfModelParams> oz2_get_perf_model_params(int device)
+{
+    if(device < 0 || device >= 64) return std::nullopt;
+    auto& entry = oz2_device_params_cache[device];
+    if(!entry) {
+        int chip_id = 0;
+        const hipError_t attr_err =
+            hipDeviceGetAttribute(&chip_id,
+                                  hipDeviceAttributePciChipId, device);
+        const uint32_t pci_device_id = static_cast<uint32_t>(chip_id) & 0xFFFFu;
+        auto it = oz2_hw_params_by_pci_id.find(pci_device_id);
+        entry = (it != oz2_hw_params_by_pci_id.end())
+              ? std::optional<Oz2PerfModelParams>{it->second}
+              : std::optional<Oz2PerfModelParams>{};
+    }
+    return *entry;
+}
+
+/* =========================================================================
  * Performance-model predicted times
  * Returns all sub-times in milliseconds.  Used both for the profiling CSV
  * and (via comparison of t_total_ms vs t_native_ms) for the performance
@@ -477,11 +531,13 @@ struct Fp64PerfModelTimes {
 };
 
 static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int64_t k,
-                                                      unsigned num_moduli)
+                                                      unsigned num_moduli, int device)
 {
-    static constexpr double HBM_BW        = 6.4e12;
-    static constexpr double INT8_PEAK     = 3.05e15;
-    static constexpr double FP64_EFF      = 7.0e13;
+    const auto hw_opt = oz2_get_perf_model_params(device);
+    assert(hw_opt.has_value() &&
+           "fp64EmulationPerfModelTimes called for a device not in oz2_hw_params_by_pci_id");
+    const Oz2PerfModelParams& hw = *hw_opt;
+
     static constexpr double LATENCY_KERNEL = 5.0e-6;
     static constexpr double LATENCY_MATMUL = 10.0e-6;
     static constexpr double LATENCY_MEMSET = 2.0e-6;
@@ -501,27 +557,27 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
     const double scale_chunk_sz = std::min(s, std::max(chunk_sz, SCALE_CHUNK_BYTES_D / slice_bytes));
     const double n_scale_chunks = std::ceil(s / scale_chunk_sz);
 
-    const double t_int8_bw     = (mk + kn + 4.0 * mn) / HBM_BW;
-    const double t_prelim_kern = (mk + kn) * 17.0 / HBM_BW
+    const double t_int8_bw     = (mk + kn + 4.0 * mn) / hw.hbm_bw;
+    const double t_prelim_kern = (mk + kn) * 17.0 / hw.hbm_bw
                                + 2.0 * LATENCY_KERNEL;
-    const double t_prelim_gemm = std::max(2.0 * mnk / INT8_PEAK, t_int8_bw)
+    const double t_prelim_gemm = std::max(2.0 * mnk / hw.int8_peak, t_int8_bw)
                                + LATENCY_MATMUL;
-    const double t_refine_kern = mn * 8.0 / HBM_BW
+    const double t_refine_kern = mn * 8.0 / hw.hbm_bw
                                + 3.0 * LATENCY_KERNEL
                                + LATENCY_MEMSET;
-    const double t_scale_kern  = (mk + kn) * (8.0 * n_scale_chunks + s) / HBM_BW
+    const double t_scale_kern  = (mk + kn) * (8.0 * n_scale_chunks + s) / hw.hbm_bw
                                + 2.0 * n_scale_chunks * LATENCY_KERNEL;
-    const double t_int8_gemms  = s * std::max(2.0 * mnk / INT8_PEAK, t_int8_bw)
+    const double t_int8_gemms  = s * std::max(2.0 * mnk / hw.int8_peak, t_int8_bw)
                                + n_chunks * LATENCY_MATMUL;
-    const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / HBM_BW
+    const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / hw.hbm_bw
                                + n_chunks * LATENCY_KERNEL;
     const double t_host        = OZ2_HOST_OVERHEAD_MS * 1e-3;
     const double t_launch      = 0.0;   /* all launch overhead distributed into components above */
     const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
                                + t_scale_kern  + t_int8_gemms  + t_accum_kern
                                + t_host;
-    const double t_native      = std::max(2.0 * mnk / FP64_EFF,
-                                          8.0 * (mk + kn + mn) / HBM_BW) + LATENCY_MATMUL;
+    const double t_native      = std::max(2.0 * mnk / hw.fp64_peak,
+                                          8.0 * (mk + kn + mn) / hw.hbm_bw) + LATENCY_MATMUL;
 
     constexpr double s2ms = 1000.0;
     return { t_prelim_kern * s2ms, t_prelim_gemm * s2ms, t_refine_kern * s2ms,
@@ -539,9 +595,9 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
  * one split does not yet reduce n_chunks but further splitting would: the
  * recursive sub-call for the half discovers and accounts for those deeper
  * splits, returning the true best achievable time for that half.       */
-static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s)
+static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s, int device)
 {
-    const double t_mono = fp64EmulationPerfModelTimes(m, n, k, s).t_total_ms;
+    const double t_mono = fp64EmulationPerfModelTimes(m, n, k, s, device).t_total_ms;
 
     const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
     const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -552,7 +608,7 @@ static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s)
 
         /* Both halves are nearly identical in size (differ by at most 1 when
          * m or n is odd), so approximate t_split = 2 × t_half.             */
-        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, s);
+        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, s, device);
         if(t_split <= t_mono * 1.01)
             return t_split;
     }
@@ -563,9 +619,9 @@ static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s)
  * mirroring the recursive binary-halving of oz2_effective_time_ms.
  * t_native_ms is always set to the top-level (m,n,k) native DGEMM time
  * because native DGEMM does not split.                                    */
-static Fp64PerfModelTimes oz2_effective_perf_model_times(int64_t m, int64_t n, int64_t k, unsigned s)
+static Fp64PerfModelTimes oz2_effective_perf_model_times(int64_t m, int64_t n, int64_t k, unsigned s, int device)
 {
-    Fp64PerfModelTimes mono = fp64EmulationPerfModelTimes(m, n, k, s);
+    Fp64PerfModelTimes mono = fp64EmulationPerfModelTimes(m, n, k, s, device);
 
     const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
     const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -574,12 +630,12 @@ static Fp64PerfModelTimes oz2_effective_perf_model_times(int64_t m, int64_t n, i
         const int64_t half_m  = split_m ? m / 2 : m;
         const int64_t half_n  = split_m ? n     : n / 2;
 
-        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, s);
+        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, s, device);
         if(t_split <= mono.t_total_ms * 1.01) {
             /* Recurse on one half, then double all components.
              * Both halves are ≈ equal in size so the approximation is exact
              * when m (or n) is even and negligible otherwise.               */
-            Fp64PerfModelTimes half = oz2_effective_perf_model_times(half_m, half_n, k, s);
+            Fp64PerfModelTimes half = oz2_effective_perf_model_times(half_m, half_n, k, s, device);
             half.t_prelim_ms      *= 2.0;
             half.t_prelim_gemm_ms *= 2.0;
             half.t_refine_ms      *= 2.0;
@@ -597,10 +653,12 @@ static Fp64PerfModelTimes oz2_effective_perf_model_times(int64_t m, int64_t n, i
     return mono;
 }
 
-bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
+bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli,
+                                   const _rocblaslt_handle* handle)
 {
-    const double t_emul   = oz2_effective_time_ms(m, n, k, num_moduli);
-    const double t_native = fp64EmulationPerfModelTimes(m, n, k, num_moduli).t_native_ms;
+    const int device = handle->device;
+    const double t_emul   = oz2_effective_time_ms(m, n, k, num_moduli, device);
+    const double t_native = fp64EmulationPerfModelTimes(m, n, k, num_moduli, device).t_native_ms;
     return t_emul <= t_native;
 }
 
@@ -639,10 +697,14 @@ bool fp64EmulationWouldApply(const _rocblaslt_handle* h, hipDataType type_a,
     const bool emulEnabled = (h->emulation.enabled == 1)
                            || (h->emulation.enabled != 0 && fp64EmulationIsEnabled());
     if(!emulEnabled) return false;
+    /* Disable emulation on devices not listed in the perf-model table to
+     * avoid running with unvalidated performance predictions.              */
+    const int dev = h->device;
+    if(!oz2_get_perf_model_params(dev)) return false;
     const bool eager = (h->emulation.strategy == 2)
                      || (h->emulation.strategy != 1 && fp64EmulationIsEager());
     const unsigned s = fp64EmulationEffectiveNumModuli(h);
-    return eager || fp64EmulationPerformanceCheck(m, n, k, s);
+    return eager || fp64EmulationPerformanceCheck(m, n, k, s, h);
 }
 
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
@@ -666,8 +728,11 @@ unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
  * workspace and can be significantly smaller).  Both halves share the same
  * workspace buffer sequentially, so only the larger of the two is needed.
  * ========================================================================= */
-size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
+size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_moduli,
+                                  const _rocblaslt_handle* handle)
 {
+    const int device = handle->device;
+
     /* Mirror the splitting decision in fp64EmulatedGemm. */
     const unsigned chunk_sz = oz2_compute_chunk_size(m, n, num_moduli);
     const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
@@ -679,12 +744,12 @@ size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_
         const int64_t m2      = split_m ? (m - m / 2) : m;
         const int64_t n2      = split_m ? n            : (n - n / 2);
 
-        const double t_mono  = fp64EmulationPerfModelTimes(m, n, k, num_moduli).t_total_ms;  // includes OZ2_HOST_OVERHEAD_MS
-        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, num_moduli);
+        const double t_mono  = fp64EmulationPerfModelTimes(m, n, k, num_moduli, device).t_total_ms;
+        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, num_moduli, device);
 
         if(t_split <= t_mono * 1.01) {
-            return std::max(fp64EmulationWorkspaceSize(half_m, half_n, k, num_moduli),
-                            fp64EmulationWorkspaceSize(m2,     n2,     k, num_moduli));
+            return std::max(fp64EmulationWorkspaceSize(half_m, half_n, k, num_moduli, handle),
+                            fp64EmulationWorkspaceSize(m2,     n2,     k, num_moduli, handle));
         }
     }
 
@@ -1447,8 +1512,9 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
              * correctly evaluates the best achievable cost of each half including
              * any further splitting those halves may need.  OZ2_HOST_OVERHEAD_MS
              * is included in every sub-call, penalising excessive splitting.   */
-            const double t_mono  = fp64EmulationPerfModelTimes(m, n, k, num_moduli).t_total_ms;  // includes OZ2_HOST_OVERHEAD_MS
-            const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, num_moduli);
+            const int device = reinterpret_cast<const _rocblaslt_handle*>(settings.handle)->device;
+            const double t_mono  = fp64EmulationPerfModelTimes(m, n, k, num_moduli, device).t_total_ms;
+            const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, num_moduli, device);
 
             if(t_split <= t_mono * 1.01) {
                 const bool tA = (opA != HIPBLAS_OP_N);
@@ -1854,7 +1920,9 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
      * If the caller already provided a sufficient workspace we use it as-is.  */
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
-    const size_t wsNeeded = fp64EmulationWorkspaceSize(m, n, k, num_moduli);
+    const int device = reinterpret_cast<const _rocblaslt_handle*>(settings.handle)->device;
+    const size_t wsNeeded = fp64EmulationWorkspaceSize(m, n, k, num_moduli,
+                                reinterpret_cast<const _rocblaslt_handle*>(settings.handle));
 
     Fp64EmulationSettings effectiveSettings = settings;
     void* ws_toplevel = nullptr;
@@ -1903,7 +1971,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         const bool tB = (opB != HIPBLAS_OP_N);
         /* Use the split-aware model: each component is the sum across all leaves.
          * t_native_ms remains for the original (m,n,k) problem.           */
-        const Fp64PerfModelTimes pm = oz2_effective_perf_model_times(m, n, k, num_moduli);
+        const Fp64PerfModelTimes pm = oz2_effective_perf_model_times(m, n, k, num_moduli, device);
 
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f) {
