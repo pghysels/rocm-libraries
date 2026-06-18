@@ -27,10 +27,19 @@
  * The environment variable is read once and cached. */
 bool fp64EmulationIsEnabled();
 
+/* Forward declaration — callers already include handle.h which provides the full
+ * definition.  Declared here so the functions below can use the type.       */
+struct _rocblaslt_handle;
+
 /* Returns true when the emulation is estimated to be at least as fast as
  * native FP64 DGEMM for the given problem size and number of moduli.
- * Uses a Roofline performance model calibrated for the target hardware. */
-bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli);
+ * Uses a Roofline performance model calibrated for the target hardware.
+ * The handle is used to obtain the target device for the performance model. */
+bool fp64EmulationPerformanceCheck(int64_t                  m,
+                                   int64_t                  n,
+                                   int64_t                  k,
+                                   unsigned                 num_moduli,
+                                   const _rocblaslt_handle* handle);
 
 /* Returns true when HIPBLASLT_EMULATION_STRATEGY=eager is set.
  * In eager mode emulation is used regardless of arithmetic intensity. */
@@ -52,12 +61,13 @@ uint32_t fp64EmulationSpecialValuesMask();
 unsigned fp64EmulationNumModuli();
 
 /* Returns the byte count of the emulation workspace for the given problem.
- * Use this to check whether a caller-provided workspace is sufficient. */
-size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_moduli);
-
-/* Forward declaration — callers already include handle.h which provides the full
- * definition.  Declared here so the two helpers below can use the type.     */
-struct _rocblaslt_handle;
+ * Use this to check whether a caller-provided workspace is sufficient.
+ * The handle is used to obtain the target device for the performance model. */
+size_t fp64EmulationWorkspaceSize(int64_t                  m,
+                                  int64_t                  n,
+                                  int64_t                  k,
+                                  unsigned                 num_moduli,
+                                  const _rocblaslt_handle* handle);
 
 /* Returns true when FP64 emulation would intercept a GEMM with these parameters.
  * Checks: emulation enabled for the handle, FP64 data type, non-batched, and the

@@ -1251,6 +1251,8 @@ hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t hand
  *  heuristic selects a compatible algorithm, and allocate at least this many
  *  bytes for the workspace pointer supplied to \ref hipblasLtMatmul.
  *
+ *  @param[in]  handle      hipBLASLt handle (provides device selection for the
+ *                          performance model).
  *  @param[in]  m           Number of rows of op(A) and D.
  *  @param[in]  n           Number of columns of op(B) and D.
  *  @param[in]  k           Shared dimension of op(A) and op(B).
@@ -1259,10 +1261,11 @@ hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t hand
  *  \retval  Workspace size in bytes, or 0 on error.
  */
 HIPBLASLT_EXPORT
-size_t hipblasLtFp64EmulationWorkspaceSize(int64_t  m,
-                                           int64_t  n,
-                                           int64_t  k,
-                                           unsigned num_moduli);
+size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t handle,
+                                           int64_t           m,
+                                           int64_t           n,
+                                           int64_t           k,
+                                           unsigned          num_moduli);
 
 #ifdef __cplusplus
 }
