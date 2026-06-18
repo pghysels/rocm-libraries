@@ -23,6 +23,7 @@
 #include "rocblaslt.h"
 #include <hip/hip_runtime_api.h>
 
+
 /* Returns true when HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 is set.
  * The environment variable is read once and cached. */
 bool fp64EmulationIsEnabled();
