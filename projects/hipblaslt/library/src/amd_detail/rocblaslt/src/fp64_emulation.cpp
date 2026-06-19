@@ -75,11 +75,6 @@ static __host__ __device__ size_t oz2_pad(size_t n)
 static constexpr size_t OZ2_CHUNK_TARGET_BYTES = 16ull << 30;  /* 16 GiB   */
 static constexpr size_t OZ2_SCALE_CHUNK_TARGET_BYTES = 8ull << 30;  /* 8 GiB */
 
-/* Per-invocation host overhead: descriptor creation/destruction and
- * hipblasLtMatmul planning overhead not captured by any component timer.
- * Estimated from breakdown profiling data (MI35x, June 2026).             */
-static constexpr double OZ2_HOST_OVERHEAD_MS = 0.050;
-
 static unsigned oz2_compute_chunk_size(int64_t m, int64_t n, unsigned num_moduli)
 {
     const size_t mn4 = static_cast<size_t>(m) * static_cast<size_t>(n) * 4u;
@@ -528,7 +523,8 @@ struct Fp64PerfModelTimes {
     double t_native_ms;      /* predicted native FP64 DGEMM time    */
 };
 
-static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int64_t k,
+static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool transA, bool transB,
+                                                      int64_t m, int64_t n, int64_t k,
                                                       unsigned num_moduli, int device)
 {
     const auto hw_opt = oz2_get_perf_model_params(device);
@@ -559,13 +555,19 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
     const double scale_chunk_sz = std::min(s, std::max(chunk_sz, SCALE_CHUNK_BYTES_D / slice_bytes));
     const double n_scale_chunks = std::ceil(s / scale_chunk_sz);
 
+    const double EFF_PRELIM_KERN = transA ? (transB ? 0.628 : 0.797) : (transB ? 0.550 : 0.622);
+    const double EFF_SCALE_KERN  = transA ? (transB ? 0.401 : 0.461) : (transB ? 0.354 : 0.405);
+    static constexpr double EFF_REFINE_KERN      = 0.511;
+    static constexpr double EFF_ACCUM_KERN       = 0.775;
+    static constexpr double OZ2_HOST_OVERHEAD_MS = 0.100;
+
     const double t_int8_bw     = (mk + kn + 4.0 * mn) / c0;
-    const double t_prelim_kern = (mk + kn) * 17.0 / c0 + 2.0 * LATENCY_KERNEL;
+    const double t_prelim_kern = ((mk + kn) * 17.0 / c0 + 2.0 * LATENCY_KERNEL) / EFF_PRELIM_KERN;
     const double t_prelim_gemm = std::max(2.0 * mnk / c2, t_int8_bw) + LATENCY_MATMUL;
-    const double t_refine_kern = mn * 8.0 / c0 + 3.0 * LATENCY_KERNEL + LATENCY_MEMSET;
-    const double t_scale_kern  = (mk + kn) * (8.0 * n_scale_chunks + s) / c0 + 2.0 * n_scale_chunks * LATENCY_KERNEL;
+    const double t_refine_kern = (mn * 8.0 / c0 + 3.0 * LATENCY_KERNEL + LATENCY_MEMSET) / EFF_REFINE_KERN;
+    const double t_scale_kern  = ((mk + kn) * (8.0 * n_scale_chunks + s) / c0 + 2.0 * n_scale_chunks * LATENCY_KERNEL) / EFF_SCALE_KERN;
     const double t_int8_gemms  = s * std::max(2.0 * mnk / c2, t_int8_bw) + n_chunks * LATENCY_MATMUL;
-    const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / c0 + n_chunks * LATENCY_KERNEL;
+    const double t_accum_kern  = (mn * (4.0 * s + 32.0 * n_chunks - 16.0) / c0 + n_chunks * LATENCY_KERNEL) / EFF_ACCUM_KERN;
     const double t_host        = OZ2_HOST_OVERHEAD_MS * 1e-3;
     const double t_launch      = 0.0;   /* all launch overhead distributed into components above */
     const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
@@ -588,9 +590,10 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
  * one split does not yet reduce n_chunks but further splitting would: the
  * recursive sub-call for the half discovers and accounts for those deeper
  * splits, returning the true best achievable time for that half.       */
-static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s, int device)
+static double oz2_effective_time_ms(bool transA, bool transB,
+                                    int64_t m, int64_t n, int64_t k, unsigned s, int device)
 {
-    const double t_mono = fp64EmulationPerfModelTimes(m, n, k, s, device).t_total_ms;
+    const double t_mono = fp64EmulationPerfModelTimes(transA, transB, m, n, k, s, device).t_total_ms;
 
     const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
     const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -601,7 +604,7 @@ static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s,
 
         /* Both halves are nearly identical in size (differ by at most 1 when
          * m or n is odd), so approximate t_split = 2 × t_half.             */
-        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, s, device);
+        const double t_split = 2. * oz2_effective_time_ms(transA, transB, half_m, half_n, k, s, device);
         if(t_split <= t_mono * 1.01)
             return t_split;
     }
@@ -612,9 +615,11 @@ static double oz2_effective_time_ms(int64_t m, int64_t n, int64_t k, unsigned s,
  * mirroring the recursive binary-halving of oz2_effective_time_ms.
  * t_native_ms is always set to the top-level (m,n,k) native DGEMM time
  * because native DGEMM does not split.                                    */
-static Fp64PerfModelTimes oz2_effective_perf_model_times(int64_t m, int64_t n, int64_t k, unsigned s, int device)
+static Fp64PerfModelTimes oz2_effective_perf_model_times(bool transA, bool transB,
+                                                         int64_t m, int64_t n, int64_t k,
+                                                         unsigned s, int device)
 {
-    Fp64PerfModelTimes mono = fp64EmulationPerfModelTimes(m, n, k, s, device);
+    Fp64PerfModelTimes mono = fp64EmulationPerfModelTimes(transA, transB, m, n, k, s, device);
 
     const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
     const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -623,12 +628,12 @@ static Fp64PerfModelTimes oz2_effective_perf_model_times(int64_t m, int64_t n, i
         const int64_t half_m  = split_m ? m / 2 : m;
         const int64_t half_n  = split_m ? n     : n / 2;
 
-        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, s, device);
+        const double t_split = 2. * oz2_effective_time_ms(transA, transB, half_m, half_n, k, s, device);
         if(t_split <= mono.t_total_ms * 1.01) {
             /* Recurse on one half, then double all components.
              * Both halves are ≈ equal in size so the approximation is exact
              * when m (or n) is even and negligible otherwise.               */
-            Fp64PerfModelTimes half = oz2_effective_perf_model_times(half_m, half_n, k, s, device);
+            Fp64PerfModelTimes half = oz2_effective_perf_model_times(transA, transB, half_m, half_n, k, s, device);
             half.t_prelim_ms      *= 2.0;
             half.t_prelim_gemm_ms *= 2.0;
             half.t_refine_ms      *= 2.0;
@@ -646,12 +651,15 @@ static Fp64PerfModelTimes oz2_effective_perf_model_times(int64_t m, int64_t n, i
     return mono;
 }
 
-bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli,
-                                   const _rocblaslt_handle* handle)
+bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* handle,
+                                   hipblasOperation_t opA, hipblasOperation_t opB,
+                                   int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
-    const int device = handle->device;
-    const double t_emul   = oz2_effective_time_ms(m, n, k, num_moduli, device);
-    const double t_native = fp64EmulationPerfModelTimes(m, n, k, num_moduli, device).t_native_ms;
+    const int  device = handle->device;
+    const bool tA     = (opA != HIPBLAS_OP_N);
+    const bool tB     = (opB != HIPBLAS_OP_N);
+    const double t_emul   = oz2_effective_time_ms(tA, tB, m, n, k, num_moduli, device);
+    const double t_native = fp64EmulationPerfModelTimes(tA, tB, m, n, k, num_moduli, device).t_native_ms;
     return t_emul <= t_native;
 }
 
@@ -684,6 +692,7 @@ static constexpr double oz2_cum_bits[OZ2_S_MAX - 1] = {
 };
 
 bool fp64EmulationWouldApply(const _rocblaslt_handle* h, hipDataType type_a,
+                              hipblasOperation_t opA, hipblasOperation_t opB,
                               int64_t m, int64_t n, int64_t k, int batch_count)
 {
     if(type_a != HIP_R_64F || batch_count != 1) return false;
@@ -697,7 +706,7 @@ bool fp64EmulationWouldApply(const _rocblaslt_handle* h, hipDataType type_a,
     const bool eager = (h->emulation.strategy == 2)
                      || (h->emulation.strategy != 1 && fp64EmulationIsEager());
     const unsigned s = fp64EmulationEffectiveNumModuli(h);
-    return eager || fp64EmulationPerformanceCheck(m, n, k, s, h);
+    return eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, s);
 }
 
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
@@ -721,8 +730,8 @@ unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
  * workspace and can be significantly smaller).  Both halves share the same
  * workspace buffer sequentially, so only the larger of the two is needed.
  * ========================================================================= */
-size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_moduli,
-                                  const _rocblaslt_handle* handle)
+size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle* handle,
+                                  int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
     const int device = handle->device;
 
@@ -737,12 +746,12 @@ size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_
         const int64_t m2      = split_m ? (m - m / 2) : m;
         const int64_t n2      = split_m ? n            : (n - n / 2);
 
-        const double t_mono  = fp64EmulationPerfModelTimes(m, n, k, num_moduli, device).t_total_ms;
-        const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, num_moduli, device);
+        const double t_mono  = fp64EmulationPerfModelTimes(false, false, m, n, k, num_moduli, device).t_total_ms;
+        const double t_split = 2. * oz2_effective_time_ms(false, false, half_m, half_n, k, num_moduli, device);
 
         if(t_split <= t_mono * 1.01) {
-            return std::max(fp64EmulationWorkspaceSize(half_m, half_n, k, num_moduli, handle),
-                            fp64EmulationWorkspaceSize(m2,     n2,     k, num_moduli, handle));
+            return std::max(fp64EmulationWorkspaceSize(handle, half_m, half_n, k, num_moduli),
+                            fp64EmulationWorkspaceSize(handle, m2,     n2,     k, num_moduli));
         }
     }
 
@@ -1481,15 +1490,6 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     if(oz2_init_constants(num_moduli) != hipSuccess)
         return rocblaslt_status_internal_error;
 
-    /* =========================================================================
-     * Recursive binary-halving for small-k shapes
-     *
-     * When the output m×n is too large for the 8 GiB workspace (n_chunks > 1),
-     * accumulation dominates.  Recursively halving max(m,n) reduces n_chunks
-     * until each sub-GEMM can run with n_chunks = 1, eliminating the extra
-     * Zhi/Zlo passes.  The performance model gates every split decision so the
-     * recursion stops automatically when splitting no longer helps (large k).
-     * ========================================================================= */
     {
         const unsigned chunk_sz = oz2_compute_chunk_size(m, n, num_moduli);
         const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
@@ -1501,18 +1501,13 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
             const int64_t m2      = split_m ? (m - m / 2) : m;
             const int64_t n2      = split_m ? n            : (n - n / 2);
 
-            /* Use recursive effective times (not flat model times) so the gate
-             * correctly evaluates the best achievable cost of each half including
-             * any further splitting those halves may need.  OZ2_HOST_OVERHEAD_MS
-             * is included in every sub-call, penalising excessive splitting.   */
             const int device = reinterpret_cast<const _rocblaslt_handle*>(settings.handle)->device;
-            const double t_mono  = fp64EmulationPerfModelTimes(m, n, k, num_moduli, device).t_total_ms;
-            const double t_split = 2. * oz2_effective_time_ms(half_m, half_n, k, num_moduli, device);
+            const bool tA = (opA != HIPBLAS_OP_N);
+            const bool tB = (opB != HIPBLAS_OP_N);
+            const double t_mono  = fp64EmulationPerfModelTimes(tA, tB, m, n, k, num_moduli, device).t_total_ms;
+            const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, num_moduli, device);
 
             if(t_split <= t_mono * 1.01) {
-                const bool tA = (opA != HIPBLAS_OP_N);
-                const bool tB = (opB != HIPBLAS_OP_N);
-
                 /* First half: rows 0..half_m-1 or cols 0..half_n-1. */
                 {
                     rocblaslt_status st =
@@ -1904,8 +1899,9 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
     const int device = reinterpret_cast<const _rocblaslt_handle*>(settings.handle)->device;
-    const size_t wsNeeded = fp64EmulationWorkspaceSize(m, n, k, num_moduli,
-                                reinterpret_cast<const _rocblaslt_handle*>(settings.handle));
+    const size_t wsNeeded = fp64EmulationWorkspaceSize(
+                                reinterpret_cast<const _rocblaslt_handle*>(settings.handle),
+                                m, n, k, num_moduli);
 
     Fp64EmulationSettings effectiveSettings = settings;
     void* ws_toplevel = nullptr;
@@ -1954,7 +1950,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         const bool tB = (opB != HIPBLAS_OP_N);
         /* Use the split-aware model: each component is the sum across all leaves.
          * t_native_ms remains for the original (m,n,k) problem.           */
-        const Fp64PerfModelTimes pm = oz2_effective_perf_model_times(m, n, k, num_moduli, device);
+        const Fp64PerfModelTimes pm = oz2_effective_perf_model_times(tA, tB, m, n, k, num_moduli, device);
 
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f) {

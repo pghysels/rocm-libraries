@@ -34,12 +34,15 @@ struct _rocblaslt_handle;
 /* Returns true when the emulation is estimated to be at least as fast as
  * native FP64 DGEMM for the given problem size and number of moduli.
  * Uses a Roofline performance model calibrated for the target hardware.
- * The handle is used to obtain the target device for the performance model. */
-bool fp64EmulationPerformanceCheck(int64_t                  m,
+ * The handle is used to obtain the target device for the performance model.
+ * opA/opB select per-transpose efficiency factors in the BW-kernel model. */
+bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* handle,
+                                   hipblasOperation_t       opA,
+                                   hipblasOperation_t       opB,
+                                   int64_t                  m,
                                    int64_t                  n,
                                    int64_t                  k,
-                                   unsigned                 num_moduli,
-                                   const _rocblaslt_handle* handle);
+                                   unsigned                 num_moduli);
 
 /* Returns true when HIPBLASLT_EMULATION_STRATEGY=eager is set.
  * In eager mode emulation is used regardless of arithmetic intensity. */
@@ -63,19 +66,22 @@ unsigned fp64EmulationNumModuli();
 /* Returns the byte count of the emulation workspace for the given problem.
  * Use this to check whether a caller-provided workspace is sufficient.
  * The handle is used to obtain the target device for the performance model. */
-size_t fp64EmulationWorkspaceSize(int64_t                  m,
+size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle* handle,
+                                  int64_t                  m,
                                   int64_t                  n,
                                   int64_t                  k,
-                                  unsigned                 num_moduli,
-                                  const _rocblaslt_handle* handle);
+                                  unsigned                 num_moduli);
 
 /* Returns true when FP64 emulation would intercept a GEMM with these parameters.
  * Checks: emulation enabled for the handle, FP64 data type, non-batched, and the
  * arithmetic-intensity heuristic (or EAGER strategy).  Does NOT check epilogue-
  * specific conditions (bias, scaleAlpha, E, pointermode) — those remain the
- * caller's responsibility.                                                   */
+ * caller's responsibility.
+ * opA/opB are forwarded to the performance model for per-transpose efficiency. */
 bool fp64EmulationWouldApply(const _rocblaslt_handle* h,
                               hipDataType              type_a,
+                              hipblasOperation_t       opA,
+                              hipblasOperation_t       opB,
                               int64_t                  m,
                               int64_t                  n,
                               int64_t                  k,
