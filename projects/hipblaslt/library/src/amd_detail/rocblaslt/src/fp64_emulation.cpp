@@ -50,6 +50,9 @@
 #include <cstdio>    // std::fopen / std::fprintf / std::fclose / std::ftell
 #include <cstring>   // std::strcmp
 #include <cmath>     // std::log2, std::floor, etc.
+#include <cerrno>
+#include <climits>
+#include <atomic>
 
 /* =========================================================================
  * Tuning constants
@@ -443,13 +446,101 @@ static hipError_t oz2_init_constants(unsigned num_moduli)
 /* =========================================================================
  * Host-side emulation control functions
  * ========================================================================= */
+static constexpr unsigned FP64_EMULATION_DEFAULT_NUM_MODULI = 16u;
+static constexpr unsigned FP64_EMULATION_MAX_MANTISSA_BITS  = 140u;
+
+static bool parse_unsigned_env(const char* value, unsigned max_value, unsigned* out)
+{
+    if(value == nullptr || *value == '\0' || value[0] == '+' || value[0] == '-')
+        return false;
+
+    errno       = 0;
+    char* end   = nullptr;
+    unsigned long parsed = std::strtoul(value, &end, 0);
+    if(errno != 0 || end == value || *end != '\0' || parsed > max_value)
+        return false;
+
+    *out = static_cast<unsigned>(parsed);
+    return true;
+}
+
+Fp64EmulationEnvValue fp64EmulationParseEnabledEnv(const char* value)
+{
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0u};
+    if(std::strcmp(value, "0") == 0) return {FP64_EMULATION_ENV_VALID, 0u};
+    if(std::strcmp(value, "1") == 0) return {FP64_EMULATION_ENV_VALID, 1u};
+    return {FP64_EMULATION_ENV_INVALID, 0u};
+}
+
+Fp64EmulationEnvValue fp64EmulationParseStrategyEnv(const char* value)
+{
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0u};
+    if(std::strcmp(value, "performant") == 0)
+        return {FP64_EMULATION_ENV_VALID,
+                static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT)};
+    if(std::strcmp(value, "eager") == 0)
+        return {FP64_EMULATION_ENV_VALID,
+                static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_EAGER)};
+    return {FP64_EMULATION_ENV_INVALID, 0u};
+}
+
+Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value)
+{
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0x3u};
+
+    unsigned parsed = 0u;
+    if(!parse_unsigned_env(value, UINT_MAX, &parsed))
+        return {FP64_EMULATION_ENV_INVALID, 0u};
+    return {FP64_EMULATION_ENV_VALID, parsed};
+}
+
+Fp64EmulationEnvValue fp64EmulationParseMantissaBitCountEnv(const char* value)
+{
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0u};
+
+    unsigned parsed = 0u;
+    if(!parse_unsigned_env(value, FP64_EMULATION_MAX_MANTISSA_BITS, &parsed))
+        return {FP64_EMULATION_ENV_INVALID, 0u};
+    return {FP64_EMULATION_ENV_VALID, parsed};
+}
+
+bool fp64EmulationIsValidMantissaBitCount(int value)
+{
+    return value >= -1 && value <= static_cast<int>(FP64_EMULATION_MAX_MANTISSA_BITS);
+}
+
+static const Fp64EmulationEnvValue& cached_enabled_env()
+{
+    static const Fp64EmulationEnvValue parsed =
+        fp64EmulationParseEnabledEnv(std::getenv("HIPBLASLT_EMULATE_DOUBLE_PRECISION"));
+    return parsed;
+}
+
+static const Fp64EmulationEnvValue& cached_strategy_env()
+{
+    static const Fp64EmulationEnvValue parsed =
+        fp64EmulationParseStrategyEnv(std::getenv("HIPBLASLT_EMULATION_STRATEGY"));
+    return parsed;
+}
+
+static const Fp64EmulationEnvValue& cached_special_values_mask_env()
+{
+    static const Fp64EmulationEnvValue parsed = fp64EmulationParseSpecialValuesMaskEnv(
+        std::getenv("HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK"));
+    return parsed;
+}
+
+static const Fp64EmulationEnvValue& cached_mantissa_bit_count_env()
+{
+    static const Fp64EmulationEnvValue parsed = fp64EmulationParseMantissaBitCountEnv(
+        std::getenv("HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT"));
+    return parsed;
+}
+
 bool fp64EmulationIsEnabled()
 {
-    static const bool enabled = []() -> bool {
-        const char* v = std::getenv("HIPBLASLT_EMULATE_DOUBLE_PRECISION");
-        return (v != nullptr && std::strcmp(v, "1") == 0);
-    }();
-    return enabled;
+    const auto& env = cached_enabled_env();
+    return env.state == FP64_EMULATION_ENV_VALID && env.value != 0u;
 }
 
 bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
@@ -491,21 +582,15 @@ bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num
 
 bool fp64EmulationIsEager()
 {
-    static const bool eager = []() -> bool {
-        const char* v = std::getenv("HIPBLASLT_EMULATION_STRATEGY");
-        return (v != nullptr && std::strcmp(v, "eager") == 0);
-    }();
-    return eager;
+    const auto& env = cached_strategy_env();
+    return env.state == FP64_EMULATION_ENV_VALID
+           && env.value == static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_EAGER);
 }
 
 uint32_t fp64EmulationSpecialValuesMask()
 {
-    static const uint32_t mask = []() -> uint32_t {
-        const char* v = std::getenv("HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK");
-        if(v == nullptr) return 0x3u;
-        return static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
-    }();
-    return mask;
+    const auto& env = cached_special_values_mask_env();
+    return env.state == FP64_EMULATION_ENV_VALID ? env.value : 0x3u;
 }
 
 static constexpr double oz2_cum_bits[OZ2_S_MAX - 1] = {
@@ -517,28 +602,122 @@ static constexpr double oz2_cum_bits[OZ2_S_MAX - 1] = {
     132.949,  /* s=17 */ 140.448,  /* s=18 */
 };
 
-bool fp64EmulationWouldApply(const _rocblaslt_handle* h, hipDataType type_a,
-                              int64_t m, int64_t n, int64_t k, int batch_count)
+static unsigned num_moduli_for_mantissa_bits(unsigned target)
 {
-    if(type_a != HIP_R_64F || batch_count != 1) return false;
-    const bool emulEnabled = (h->emulation.enabled == 1)
-                           || (h->emulation.enabled != 0 && fp64EmulationIsEnabled());
-    if(!emulEnabled) return false;
-    const bool eager = (h->emulation.strategy == 2)
-                     || (h->emulation.strategy != 1 && fp64EmulationIsEager());
-    const unsigned s = fp64EmulationEffectiveNumModuli(h);
-    return eager || fp64EmulationPerformanceCheck(m, n, k, s);
+    for(unsigned s = 2u; s <= OZ2_S_MAX; ++s)
+        if(oz2_cum_bits[s - 2u] >= static_cast<double>(target)) return s;
+    return OZ2_S_MAX;
+}
+
+static rocblaslt_status invalid_if_set(const Fp64EmulationEnvValue& env)
+{
+    return env.state == FP64_EMULATION_ENV_INVALID ? rocblaslt_status_invalid_value
+                                                   : rocblaslt_status_success;
+}
+
+struct Fp64EmulationMantissaPolicy {
+    rocblaslt_status status;
+    unsigned int     num_moduli;
+    bool             dynamic_mode;
+};
+
+static Fp64EmulationMantissaPolicy resolve_mantissa_policy(const _rocblaslt_handle* h)
+{
+    const auto& mantissa_env = cached_mantissa_bit_count_env();
+    if((h->emulation.mantissa_control < 0
+        || (h->emulation.mantissa_control == HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED
+            && h->emulation.max_mantissa_bits < 0))
+       && invalid_if_set(mantissa_env) != rocblaslt_status_success) {
+        return {rocblaslt_status_invalid_value, 0u, false};
+    }
+
+    if(h->emulation.mantissa_control == HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED
+       && h->emulation.max_mantissa_bits >= 0) {
+        return {rocblaslt_status_success,
+                num_moduli_for_mantissa_bits(static_cast<unsigned>(h->emulation.max_mantissa_bits)),
+                false};
+    }
+
+    if(h->emulation.mantissa_control < 0
+       && mantissa_env.state == FP64_EMULATION_ENV_VALID) {
+        return {rocblaslt_status_success,
+                num_moduli_for_mantissa_bits(mantissa_env.value),
+                false};
+    }
+
+    return {rocblaslt_status_success, FP64_EMULATION_DEFAULT_NUM_MODULI, true};
 }
 
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
 {
-    if(h->emulation.mantissa_control == 1 && h->emulation.max_mantissa_bits >= 0) {
-        const unsigned target = static_cast<unsigned>(h->emulation.max_mantissa_bits);
-        for(unsigned s = 2u; s <= OZ2_S_MAX; ++s)
-            if(oz2_cum_bits[s - 2u] >= static_cast<double>(target)) return s;
-        return OZ2_S_MAX;
+    const Fp64EmulationMantissaPolicy policy = resolve_mantissa_policy(h);
+    return policy.status == rocblaslt_status_success ? policy.num_moduli
+                                                     : FP64_EMULATION_DEFAULT_NUM_MODULI;
+}
+
+Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
+                                            hipDataType              type_a,
+                                            int64_t                  m,
+                                            int64_t                  n,
+                                            int64_t                  k,
+                                            int                      batch_count)
+{
+    Fp64EmulationDecision result{rocblaslt_status_success, false, 0u, 0x3u, false};
+    if(type_a != HIP_R_64F || batch_count != 1) return result;
+
+    const auto& enabled_env = cached_enabled_env();
+    bool emul_enabled = false;
+    if(h->emulation.enabled == 0) {
+        return result;
+    } else if(h->emulation.enabled == 1) {
+        emul_enabled = true;
+    } else {
+        result.status = invalid_if_set(enabled_env);
+        if(result.status != rocblaslt_status_success) return result;
+        emul_enabled = enabled_env.state == FP64_EMULATION_ENV_VALID && enabled_env.value;
     }
-    return fp64EmulationNumModuli();
+    if(!emul_enabled) return result;
+
+    const auto& strategy_env = cached_strategy_env();
+    result.status = invalid_if_set(strategy_env);
+    if(result.status != rocblaslt_status_success) return result;
+
+    const unsigned strategy = (strategy_env.state == FP64_EMULATION_ENV_VALID)
+                                  ? strategy_env.value
+                                  : static_cast<unsigned>(
+                                        (h->emulation.strategy >= 0)
+                                            ? h->emulation.strategy
+                                            : HIPBLASLT_EMULATION_STRATEGY_PERFORMANT);
+
+    const auto& mask_env = cached_special_values_mask_env();
+    result.status = invalid_if_set(mask_env);
+    if(result.status != rocblaslt_status_success) return result;
+    result.sv_mask = (mask_env.state == FP64_EMULATION_ENV_VALID)
+                         ? mask_env.value
+                         : ((h->emulation.special_values_mask != ~0u)
+                                ? h->emulation.special_values_mask
+                                : 0x3u);
+
+    const Fp64EmulationMantissaPolicy mantissa = resolve_mantissa_policy(h);
+    result.status = mantissa.status;
+    if(result.status != rocblaslt_status_success) return result;
+
+    result.num_moduli   = mantissa.num_moduli;
+    result.dynamic_mode = mantissa.dynamic_mode;
+    result.apply = (strategy == static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_EAGER))
+                   || fp64EmulationPerformanceCheck(m, n, k, result.num_moduli);
+    return result;
+}
+
+void fp64EmulationWarnDynamicTemporary()
+{
+    static std::atomic<bool> warned{false};
+    bool expected = false;
+    if(warned.compare_exchange_strong(expected, true)) {
+        std::fprintf(stderr,
+                     "hipBLASLt FP64 emulation: dynamic mantissa control currently "
+                     "uses the existing 16-moduli path; runtime ADP is not enabled yet.\n");
+    }
 }
 
 /* =========================================================================
@@ -568,10 +747,9 @@ size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_
 unsigned fp64EmulationNumModuli()
 {
     static const unsigned num_moduli = []() -> unsigned {
-        const char* v = std::getenv("HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT");
-        if(v == nullptr) return 16u;
-        const unsigned target = static_cast<unsigned>(std::strtoul(v, nullptr, 0));
-        if(target == 0u) return OZ2_S_MAX;
+        const auto& env = cached_mantissa_bit_count_env();
+        if(env.state != FP64_EMULATION_ENV_VALID) return FP64_EMULATION_DEFAULT_NUM_MODULI;
+        const unsigned target = env.value;
         for(unsigned s = 2u; s <= OZ2_S_MAX; ++s)
             if(oz2_cum_bits[s - 2u] >= static_cast<double>(target)) return s;
         return OZ2_S_MAX;
@@ -1301,8 +1479,13 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                                   hipStream_t                  stream,
                                   const Fp64EmulationSettings& settings)
 {
+    if(settings.num_moduli == 0u
+       && cached_mantissa_bit_count_env().state == FP64_EMULATION_ENV_INVALID)
+        return rocblaslt_status_invalid_value;
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
+    if(settings.dynamic_mode)
+        fp64EmulationWarnDynamicTemporary();
     if(oz2_init_constants(num_moduli) != hipSuccess)
         return rocblaslt_status_internal_error;
 
@@ -1391,16 +1574,42 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     hipblasLtMatrixLayout_t layoutA  = nullptr;
     hipblasLtMatrixLayout_t layoutB  = nullptr;
     hipblasLtMatrixLayout_t layoutCD = nullptr;
+    hipblasLtMatrixLayout_t layoutA_b  = nullptr;
+    hipblasLtMatrixLayout_t layoutB_b  = nullptr;
+    hipblasLtMatrixLayout_t layoutCD_b = nullptr;
     hipblasLtMatmulDesc_t   matmulDesc = nullptr;
 
-    hipblasLtMatrixLayoutCreate(&layoutA,  HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(m), static_cast<int64_t>(lda8i));
-    hipblasLtMatrixLayoutCreate(&layoutB,  HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(ldb8i));
-    hipblasLtMatrixLayoutCreate(&layoutCD, HIP_R_32I, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(ldc32i));
-    hipblasLtMatmulDescCreate(&matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I);
+    auto cleanup = [&]() noexcept {
+        bool ok = true;
+        if(layoutCD_b) (void)hipblasLtMatrixLayoutDestroy(layoutCD_b);
+        if(layoutB_b)  (void)hipblasLtMatrixLayoutDestroy(layoutB_b);
+        if(layoutA_b)  (void)hipblasLtMatrixLayoutDestroy(layoutA_b);
+        if(matmulDesc) (void)hipblasLtMatmulDescDestroy(matmulDesc);
+        if(layoutCD)   (void)hipblasLtMatrixLayoutDestroy(layoutCD);
+        if(layoutB)    (void)hipblasLtMatrixLayoutDestroy(layoutB);
+        if(layoutA)    (void)hipblasLtMatrixLayoutDestroy(layoutA);
+        if(ws_owned && hipFreeAsync(ws, stream) != hipSuccess) ok = false;
+        return ok;
+    };
+    auto fail_internal = [&]() {
+        cleanup();
+        return rocblaslt_status_internal_error;
+    };
+
+    if(hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(m), static_cast<int64_t>(lda8i)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(ldb8i)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutCreate(&layoutCD, HIP_R_32I, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(ldc32i)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatmulDescCreate(&matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
     {
         hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
-        hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
-        hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+        if(hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)) != HIPBLAS_STATUS_SUCCESS)
+            return fail_internal();
+        if(hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)) != HIPBLAS_STATUS_SUCCESS)
+            return fail_internal();
     }
 
     const int32_t one_i = 1, zero_i = 0;
@@ -1440,23 +1649,25 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
 
     if(svmask != 0u) {
         if(hipStreamSynchronize(stream) != hipSuccess) {
-            (void)hipFreeAsync(ws, stream); return rocblaslt_status_internal_error;
+            return fail_internal();
         }
         uint32_t detected = 0u;
         if(hipMemcpy(&detected, nan_flag, sizeof(uint32_t), hipMemcpyDeviceToHost) != hipSuccess) {
-            (void)hipFreeAsync(ws, stream); return rocblaslt_status_internal_error;
+            return fail_internal();
         }
         if(detected & svmask) {
-            if(ws_owned) (void)hipFreeAsync(ws, stream);
+            cleanup();
             return rocblaslt_status_invalid_value;
         }
     }
 
     /* Preliminary INT8 GEMM: C32i_prelim = A8i_high^T × B8i_high */
     _pstart();
-    hipblasLtMatmul(settings.handle, matmulDesc,
-                    &one_i, A8i_high, layoutA, B8i_high, layoutB,
-                    &zero_i, C32i, layoutCD, C32i, layoutCD, nullptr, nullptr, 0, stream);
+    if(hipblasLtMatmul(settings.handle, matmulDesc,
+                       &one_i, A8i_high, layoutA, B8i_high, layoutB,
+                       &zero_i, C32i, layoutCD, C32i, layoutCD, nullptr, nullptr, 0, stream)
+       != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
     _pstop(_t_prelim_gemm);
 
     const float accu_log2P = h_accu_log2P_all[num_moduli - 2];
@@ -1482,23 +1693,29 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     const size_t strideA8i = lda8i * cola8i;
     const size_t strideB8i = ldb8i * static_cast<size_t>(n);
 
-    hipblasLtMatrixLayout_t layoutA_b  = nullptr;
-    hipblasLtMatrixLayout_t layoutB_b  = nullptr;
-    hipblasLtMatrixLayout_t layoutCD_b = nullptr;
-    hipblasLtMatrixLayoutCreate(&layoutA_b,  HIP_R_8I,  static_cast<uint64_t>(k), static_cast<uint64_t>(m), static_cast<int64_t>(lda8i));
-    hipblasLtMatrixLayoutCreate(&layoutB_b,  HIP_R_8I,  static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(ldb8i));
-    hipblasLtMatrixLayoutCreate(&layoutCD_b, HIP_R_32I, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(ldc32i));
+    if(hipblasLtMatrixLayoutCreate(&layoutA_b, HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(m), static_cast<int64_t>(lda8i)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutCreate(&layoutB_b, HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(ldb8i)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutCreate(&layoutCD_b, HIP_R_32I, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(ldc32i)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
 
     int32_t       batch_cur  = static_cast<int32_t>(chunk_size);
     const int64_t stride_A_b = static_cast<int64_t>(strideA8i);
     const int64_t stride_B_b = static_cast<int64_t>(strideB8i);
     const int64_t stride_C_b = static_cast<int64_t>(szC32i);
-    hipblasLtMatrixLayoutSetAttribute(layoutA_b,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
-    hipblasLtMatrixLayoutSetAttribute(layoutA_b,  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_A_b, sizeof(stride_A_b));
-    hipblasLtMatrixLayoutSetAttribute(layoutB_b,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
-    hipblasLtMatrixLayoutSetAttribute(layoutB_b,  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_B_b, sizeof(stride_B_b));
-    hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
-    hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_C_b, sizeof(stride_C_b));
+    if(hipblasLtMatrixLayoutSetAttribute(layoutA_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutSetAttribute(layoutA_b, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_A_b, sizeof(stride_A_b)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutSetAttribute(layoutB_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutSetAttribute(layoutB_b, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_B_b, sizeof(stride_B_b)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
+    if(hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_C_b, sizeof(stride_C_b)) != HIPBLAS_STATUS_SUCCESS)
+        return fail_internal();
 
     for(unsigned scale_start = 0; scale_start < num_moduli; scale_start += scale_chunk_size) {
         const unsigned actual_scale = (scale_start + scale_chunk_size <= num_moduli)
@@ -1546,17 +1763,22 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                                          ? chunk_size : (actual_scale - gemm_local);
             if(static_cast<int32_t>(actual_gemm) != batch_cur) {
                 batch_cur = static_cast<int32_t>(actual_gemm);
-                hipblasLtMatrixLayoutSetAttribute(layoutA_b,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
-                hipblasLtMatrixLayoutSetAttribute(layoutB_b,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
-                hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
+                if(hipblasLtMatrixLayoutSetAttribute(layoutA_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur)) != HIPBLAS_STATUS_SUCCESS)
+                    return fail_internal();
+                if(hipblasLtMatrixLayoutSetAttribute(layoutB_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur)) != HIPBLAS_STATUS_SUCCESS)
+                    return fail_internal();
+                if(hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur)) != HIPBLAS_STATUS_SUCCESS)
+                    return fail_internal();
             }
             const int8_t* const A8i_gemm = A8i + gemm_local * strideA8i;
             const int8_t* const B8i_gemm = B8i + gemm_local * strideB8i;
             _pstart();
-            hipblasLtMatmul(settings.handle, matmulDesc,
-                            &one_i, A8i_gemm, layoutA_b, B8i_gemm, layoutB_b,
-                            &zero_i, C32i_batch, layoutCD_b, C32i_batch, layoutCD_b,
-                            nullptr, nullptr, 0, stream);
+            if(hipblasLtMatmul(settings.handle, matmulDesc,
+                               &one_i, A8i_gemm, layoutA_b, B8i_gemm, layoutB_b,
+                               &zero_i, C32i_batch, layoutCD_b, C32i_batch, layoutCD_b,
+                               nullptr, nullptr, 0, stream)
+               != HIPBLAS_STATUS_SUCCESS)
+                return fail_internal();
             _pstop(_t_int8);
 
             const unsigned global_chunk_start = scale_start + gemm_local;
@@ -1642,18 +1864,8 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         }
     }
 
-    hipblasLtMatrixLayoutDestroy(layoutCD_b);
-    hipblasLtMatrixLayoutDestroy(layoutB_b);
-    hipblasLtMatrixLayoutDestroy(layoutA_b);
-    hipblasLtMatmulDescDestroy(matmulDesc);
-    hipblasLtMatrixLayoutDestroy(layoutCD);
-    hipblasLtMatrixLayoutDestroy(layoutB);
-    hipblasLtMatrixLayoutDestroy(layoutA);
-
-    if(ws_owned) {
-        if(hipFreeAsync(ws, stream) != hipSuccess)
-            return rocblaslt_status_internal_error;
-    }
+    if(!cleanup())
+        return rocblaslt_status_internal_error;
 
     if(_prof) {
         (void)hipEventRecord(_ev1, stream); (void)hipStreamSynchronize(stream);
