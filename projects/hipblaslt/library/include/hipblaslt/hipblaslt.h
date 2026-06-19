@@ -1284,11 +1284,13 @@ hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t hand
  *  \retval  Workspace size in bytes, or 0 on error.
  */
 HIPBLASLT_EXPORT
-size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t handle,
-                                           int64_t           m,
-                                           int64_t           n,
-                                           int64_t           k,
-                                           unsigned          num_moduli);
+size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t  handle,
+                                           hipblasOperation_t opA,
+                                           hipblasOperation_t opB,
+                                           int64_t            m,
+                                           int64_t            n,
+                                           int64_t            k,
+                                           unsigned           num_moduli);
 
 #ifdef __cplusplus
 }
