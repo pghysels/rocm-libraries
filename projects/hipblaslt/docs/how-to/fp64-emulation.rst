@@ -150,7 +150,8 @@ Environment variables reference
 ==================================
 
 The following environment variables apply process-wide to all hipBLASLt handles.
-Per-handle API calls take precedence over environment variables.
+When both are set, FP64 emulation environment variables take precedence over
+per-handle API settings to match the cuBLAS environment-variable contract.
 
 .. csv-table::
    :header: "Environment Variable", "Default", "Description"
