@@ -144,7 +144,7 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
        && E             == nullptr
        && !matmul_descr->pointermode
        && epilogue      == ROCBLASLT_EPILOGUE_DEFAULT
-       && fp64EmulationWouldApply(handle, type_a, m, n, k, num_batches_a))
+       && fp64EmulationWouldApply(handle, type_a, opA, opB, m, n, k, num_batches_a))
     {
         /* Build per-call settings from handle overrides + env var fallbacks. */
         Fp64EmulationSettings emulSettings;
