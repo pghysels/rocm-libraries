@@ -13,18 +13,36 @@
  * Environment variable:
  *   HIPBLASLT_EMULATE_DOUBLE_PRECISION=1   enables emulation
  *
- * Performance model (in fp64_emulation.cpp — fp64EmulationPerformanceCheck):
- *   A Roofline-based estimate comparing t_emulation vs t_native_DGEMM.
- *   Calibrated for MI350 (HBM_BW=6.4 TB/s, INT8_PEAK=3050 TOPS,
- *   FP64_EFF=70 TFLOPS effective).  Update the hardware constants for
- *   other architectures.
+ * See docs/how-to/fp64-emulation.rst
  */
 
 #include "rocblaslt.h"
 #include <hip/hip_runtime_api.h>
 
+/* =========================================================================
+ * Environment variable parsing infrastructure
+ * ========================================================================= */
+enum Fp64EmulationEnvState {
+    FP64_EMULATION_ENV_UNSET   = 0,
+    FP64_EMULATION_ENV_VALID   = 1,
+    FP64_EMULATION_ENV_INVALID = 2,
+};
+
+struct Fp64EmulationEnvValue {
+    Fp64EmulationEnvState state;
+    unsigned int          value;
+};
+
+/* Pure parsers used by tests and by the cached runtime readers below. */
+Fp64EmulationEnvValue fp64EmulationParseEnabledEnv(const char* value);
+Fp64EmulationEnvValue fp64EmulationParseStrategyEnv(const char* value);
+Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value);
+Fp64EmulationEnvValue fp64EmulationParseMantissaBitCountEnv(const char* value);
+bool                  fp64EmulationIsValidMantissaBitCount(int value);
+
 /* Returns true when HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 is set.
- * The environment variable is read once and cached. */
+ * The environment variable is read once and cached. Invalid values are reported
+ * through fp64EmulationDecision(), not through this legacy bool helper. */
 bool fp64EmulationIsEnabled();
 
 /* Forward declaration — callers already include handle.h which provides the full
@@ -45,7 +63,8 @@ bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
                                    unsigned                 num_moduli);
 
 /* Returns true when HIPBLASLT_EMULATION_STRATEGY=eager is set.
- * In eager mode emulation is used regardless of arithmetic intensity. */
+ * In eager mode emulation is used regardless of arithmetic intensity.
+ * The environment variable is read once and cached. */
 bool fp64EmulationIsEager();
 
 /* Returns the special-values support mask from
@@ -58,7 +77,8 @@ uint32_t fp64EmulationSpecialValuesMask();
 /* Returns the number of INT8 GEMMs (moduli) to use, in the range [2, 18].
  * Reads HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT; maps the
  * requested precision in bits to the minimum number of moduli required.
- * Default (env var absent or 0): 16 moduli (~125 bits of CRT capacity).
+ * Default (env var absent): 16 moduli (~125 bits of CRT capacity).
+ * A set env var is validated strictly; 0 or 1 selects the minimum of 2 moduli.
  * Maximum supported: 18 moduli (~140 bits of CRT capacity).
  * Notable values: 55 bits → 7 GEMMs, 79 bits → 10 GEMMs, 110 bits → 14 GEMMs. */
 unsigned fp64EmulationNumModuli();
@@ -74,27 +94,40 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle* h,
                                   int64_t                  k,
                                   unsigned                 num_moduli);
 
-/* Returns true when FP64 emulation would intercept a GEMM with these parameters.
- * Checks: emulation enabled for the handle, FP64 data type, non-batched, and the
- * arithmetic-intensity heuristic (or EAGER strategy).  Does NOT check epilogue-
- * specific conditions (bias, scaleAlpha, E, pointermode) — those remain the
- * caller's responsibility.
- * opA/opB are forwarded to the performance model for per-transpose efficiency. */
-bool fp64EmulationWouldApply(const _rocblaslt_handle* h,
-                              hipDataType              type_a,
-                              hipblasOperation_t       opA,
-                              hipblasOperation_t       opB,
-                              int64_t                  m,
-                              int64_t                  n,
-                              int64_t                  k,
-                              int                      batch_count);
+/* =========================================================================
+ * Decision struct and gate function — status-propagating
+ * ========================================================================= */
+struct Fp64EmulationDecision {
+    rocblaslt_status status;       /* rocblaslt_status_invalid_value on bad env   */
+    bool             apply;        /* true → use emulation; false → native path  */
+    unsigned int     num_moduli;   /* resolved moduli count to pass to settings  */
+    unsigned int     sv_mask;      /* resolved special-values mask               */
+    bool             dynamic_mode; /* true when temporary DYNAMIC path selected  */
+};
+
+/* Status-returning FP64 emulation gate. Invalid env-var values return
+ * rocblaslt_status_invalid_value so callers do not silently fall back to
+ * native FP64. On success, apply=false means the native path should be used
+ * without error.
+ * opA/opB select per-transpose efficiency factors in the performance model. */
+Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
+                                            hipDataType              type_a,
+                                            hipblasOperation_t       opA,
+                                            hipblasOperation_t       opB,
+                                            int64_t                  m,
+                                            int64_t                  n,
+                                            int64_t                  k,
+                                            int                      batch_count);
+
+void fp64EmulationWarnDynamicTemporary();
 
 /* Returns the effective number of CRT moduli (2..18) given the handle's emulation
  * settings.
  *   FIXED mode (mantissa_control=1, max_mantissa_bits≥0): maps the bit count to
  *     the minimum s whose CRT capacity ≥ max_mantissa_bits.
- *   DYNAMIC mode or max_mantissa_bits<0: defers to fp64EmulationNumModuli()
- *     (process-wide env var / default = 16).                                 */
+ *   Default/env mode with HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT:
+ *     forces FIXED at the requested bit count.
+ *   DYNAMIC mode or no precision hint: uses the current non-ADP 16-moduli path. */
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h);
 
 /* Per-call emulation settings.
@@ -103,6 +136,7 @@ unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h);
 struct Fp64EmulationSettings {
     unsigned int      num_moduli;      /* 2..18; 0 = derive from env var          */
     unsigned int      sv_mask;         /* special-values mask; ~0u = env var      */
+    bool              dynamic_mode;    /* current temporary DYNAMIC path selected */
     void*             workspace;       /* caller workspace; nullptr = allocate     */
     size_t            workspace_bytes; /* size of caller workspace                */
     hipblasLtHandle_t handle;          /* caller handle for INT8 GEMMs             */
@@ -118,20 +152,20 @@ struct Fp64EmulationSettings {
  *         rocblaslt_status_memory_error if workspace allocation fails,
  *         rocblaslt_status_not_supported if Inf/NaN is detected (caller
  *             should fall back to native FP64). */
-rocblaslt_status fp64EmulatedGemm(hipblasOperation_t          opA,
-                                  hipblasOperation_t          opB,
-                                  int64_t                     m,
-                                  int64_t                     n,
-                                  int64_t                     k,
-                                  const double*               alpha,
-                                  const double*               A,
-                                  int64_t                     lda,
-                                  const double*               B,
-                                  int64_t                     ldb,
-                                  const double*               beta,
-                                  const double*               C,
-                                  int64_t                     ldc,
-                                  double*                     D,
-                                  int64_t                     ldd,
-                                  hipStream_t                 stream,
+rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
+                                  hipblasOperation_t           opB,
+                                  int64_t                      m,
+                                  int64_t                      n,
+                                  int64_t                      k,
+                                  const double*                alpha,
+                                  const double*                A,
+                                  int64_t                      lda,
+                                  const double*                B,
+                                  int64_t                      ldb,
+                                  const double*                beta,
+                                  const double*                C,
+                                  int64_t                      ldc,
+                                  double*                      D,
+                                  int64_t                      ldd,
+                                  hipStream_t                  stream,
                                   const Fp64EmulationSettings& settings);

@@ -512,11 +512,12 @@ try
         (rocblaslt_matmul_heuristic_result*)heuristicResultsArray,
         returnAlgoCount));
 
-    /* ── FP64 emulation workspace override */
-    const auto* h           = reinterpret_cast<const _rocblaslt_handle*>(handle);
-    const bool emul_enabled = (h->emulation.enabled == 1)
-                            || (h->emulation.enabled != 0 && fp64EmulationIsEnabled());
-    if(emul_enabled) {
+    /* FP64 emulation workspace override. Only inspect descriptors after the
+     * normal heuristic path has accepted the caller's arguments. */
+    if(status == HIPBLAS_STATUS_SUCCESS && handle && matmulDesc && Adesc && Ddesc
+       && heuristicResultsArray && returnAlgoCount)
+    {
+        const auto* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
         /* Read layout dimensions directly from the internal struct — the public
          * get_attribute API only exposes attributes managed via set_attribute;
          * creation-time fields (m, n, type) live in the struct itself.        */
@@ -532,19 +533,17 @@ try
         const int32_t     batch_count = A_layout->batch_count;
         const hipDataType type_a      = A_layout->type;
 
-        if(fp64EmulationWouldApply(h, type_a, desc_ptr->op_A, desc_ptr->op_B, m, n, k, batch_count)) {
+        const Fp64EmulationDecision emulDecision =
+            fp64EmulationDecision(h, type_a, desc_ptr->op_A, desc_ptr->op_B, m, n, k, batch_count);
+        if(emulDecision.status != rocblaslt_status_success)
+            return RocBlasLtStatusToHIPStatus(emulDecision.status);
+        if(emulDecision.apply && *returnAlgoCount > 0)
+        {
             const size_t emul_ws =
                 fp64EmulationWorkspaceSize(h, desc_ptr->op_A, desc_ptr->op_B,
-                                          m, n, k, fp64EmulationEffectiveNumModuli(h));
-            if(status == HIPBLAS_STATUS_SUCCESS && returnAlgoCount && *returnAlgoCount > 0) {
-                heuristicResultsArray[0].workspaceSize = emul_ws;
-            } else if(requestedAlgoCount >= 1 && returnAlgoCount) {
-                memset(&heuristicResultsArray[0], 0, sizeof(heuristicResultsArray[0]));
-                heuristicResultsArray[0].workspaceSize = emul_ws;
-                heuristicResultsArray[0].state         = HIPBLAS_STATUS_SUCCESS;
-                *returnAlgoCount = 1;
-                status           = HIPBLAS_STATUS_SUCCESS;
-            }
+                                           m, n, k, emulDecision.num_moduli);
+            for(int i = 0; i < *returnAlgoCount; ++i)
+                heuristicResultsArray[i].workspaceSize = emul_ws;
         }
     }
 
@@ -890,6 +889,9 @@ hipblasStatus_t hipblasLtSetFixedPointEmulationMantissaControl(
 try
 {
     if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
+    if(control < HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC
+       || control > HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED)
+        return HIPBLAS_STATUS_INVALID_VALUE;
     auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
     h->emulation.mantissa_control = static_cast<int>(control);
     return HIPBLAS_STATUS_SUCCESS;
@@ -904,10 +906,9 @@ hipblasStatus_t hipblasLtSetFixedPointEmulationMaxMantissaBitCount(hipblasLtHand
 try
 {
     if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    /* -1 = revert to process-wide env var default.
-     * Any non-negative value is valid; the library maps it to the minimum
-     * number of moduli whose CRT capacity meets or exceeds maxBits. */
-    if(maxBits < -1)
+    /* -1 = revert to process-wide env var default. Non-negative values must
+     * be representable by the supported CRT capacity. */
+    if(!fp64EmulationIsValidMantissaBitCount(maxBits))
         return HIPBLAS_STATUS_INVALID_VALUE;
     auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
     h->emulation.max_mantissa_bits = maxBits;
@@ -941,11 +942,12 @@ size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t  handle,
                                            unsigned           num_moduli)
 try
 {
-    /* Clamp num_moduli to the valid range [2, 20] used by the emulation. */
+    if(m < 0 || n < 0 || k < 0) return 0;
+    /* Clamp num_moduli to the valid range [2, 18] used by the emulation. */
     if(num_moduli < 2u)  num_moduli = 2u;
-    if(num_moduli > 20u) num_moduli = 20u;
+    if(num_moduli > 18u) num_moduli = 18u;
     return fp64EmulationWorkspaceSize(reinterpret_cast<const _rocblaslt_handle*>(handle),
-                                     opA, opB, m, n, k, num_moduli);
+                                      opA, opB, m, n, k, num_moduli);
 }
 catch(...)
 {

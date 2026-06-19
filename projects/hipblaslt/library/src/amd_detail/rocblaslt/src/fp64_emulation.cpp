@@ -709,6 +709,118 @@ bool fp64EmulationWouldApply(const _rocblaslt_handle* h, hipDataType type_a,
     return eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, s);
 }
 
+/* =========================================================================
+ * Environment variable parsers (declared in fp64_emulation.hpp)
+ * ========================================================================= */
+Fp64EmulationEnvValue fp64EmulationParseEnabledEnv(const char* value)
+{
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0u};
+    if(std::strcmp(value, "1") == 0) return {FP64_EMULATION_ENV_VALID, 1u};
+    if(std::strcmp(value, "0") == 0) return {FP64_EMULATION_ENV_VALID, 0u};
+    return {FP64_EMULATION_ENV_INVALID, 0u};
+}
+
+Fp64EmulationEnvValue fp64EmulationParseStrategyEnv(const char* value)
+{
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0u};
+    if(std::strcmp(value, "performant") == 0)
+        return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT)};
+    if(std::strcmp(value, "eager") == 0)
+        return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_EAGER)};
+    return {FP64_EMULATION_ENV_INVALID, 0u};
+}
+
+Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value)
+{
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0x3u};
+    char*         endp = nullptr;
+    const long    v    = std::strtol(value, &endp, 0);
+    if(endp == value || *endp != '\0' || v < 0)
+        return {FP64_EMULATION_ENV_INVALID, 0u};
+    return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
+}
+
+Fp64EmulationEnvValue fp64EmulationParseMantissaBitCountEnv(const char* value)
+{
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0u};
+    char*      endp = nullptr;
+    const long v    = std::strtol(value, &endp, 10);
+    if(endp == value || *endp != '\0' || v < 0 || v > 140)
+        return {FP64_EMULATION_ENV_INVALID, 0u};
+    return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
+}
+
+bool fp64EmulationIsValidMantissaBitCount(int value)
+{
+    return value >= -1 && value <= 140;
+}
+
+/* =========================================================================
+ * Status-returning emulation gate (replaces the bool fp64EmulationWouldApply
+ * for callers that need error propagation on bad env-var values).
+ * ========================================================================= */
+void fp64EmulationWarnDynamicTemporary()
+{
+    static bool warned = false;
+    if(!warned) {
+        warned = true;
+        std::fprintf(stderr,
+            "[hipblaslt] FP64 emulation: DYNAMIC mantissa control is not yet implemented; "
+            "falling back to the default 16-moduli path.\n");
+    }
+}
+
+Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
+                                            hipDataType              type_a,
+                                            hipblasOperation_t       opA,
+                                            hipblasOperation_t       opB,
+                                            int64_t                  m,
+                                            int64_t                  n,
+                                            int64_t                  k,
+                                            int                      batch_count)
+{
+    Fp64EmulationDecision result{};
+    result.status      = rocblaslt_status_success;
+    result.apply       = false;
+    result.num_moduli  = fp64EmulationNumModuli();
+    result.sv_mask     = fp64EmulationSpecialValuesMask();
+    result.dynamic_mode = false;
+
+    /* Type and batch-count pre-checks (no env-var validation needed). */
+    if(type_a != HIP_R_64F || batch_count != 1)
+        return result; /* apply=false, success */
+
+    /* Emulation enabled check. */
+    const bool emulEnabled = (h->emulation.enabled == 1)
+                           || (h->emulation.enabled != 0 && fp64EmulationIsEnabled());
+    if(!emulEnabled) return result;
+
+    /* Device must be in the supported table. */
+    const int dev = h->device;
+    if(!oz2_get_perf_model_params(dev)) return result;
+
+    /* Resolve num_moduli from handle settings. */
+    result.num_moduli = fp64EmulationEffectiveNumModuli(h);
+
+    /* Handle special_values_mask override. */
+    if(h->emulation.special_values_mask != ~0u)
+        result.sv_mask = h->emulation.special_values_mask;
+
+    /* dynamic_mode: DYNAMIC mantissa control — note real ADP is not yet
+     * implemented; we fall back to the 16-moduli default and warn once.   */
+    result.dynamic_mode = (h->emulation.mantissa_control != 1);
+    if(result.dynamic_mode)
+        fp64EmulationWarnDynamicTemporary();
+
+    /* Strategy (eager vs performant). */
+    const bool eager = (h->emulation.strategy == 2)
+                     || (h->emulation.strategy != 1 && fp64EmulationIsEager());
+    if(eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, result.num_moduli))
+        result.apply = true;
+
+    return result;
+}
+
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
 {
     if(h->emulation.mantissa_control == 1 && h->emulation.max_mantissa_bits >= 0) {
@@ -734,6 +846,7 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle* h,
                                   hipblasOperation_t opA, hipblasOperation_t opB,
                                   int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
+    assert(h != nullptr && "fp64EmulationWorkspaceSize requires a valid handle");
     const int  device = h->device;
     const bool tA     = (opA != HIPBLAS_OP_N);
     const bool tB     = (opB != HIPBLAS_OP_N);
