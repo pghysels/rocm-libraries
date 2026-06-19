@@ -468,24 +468,22 @@ bool fp64EmulationIsEnabled()
  * native DGEMM is used instead (avoids unvalidated perf predictions).
  * ========================================================================= */
 struct Oz2PerfModelParams {
-    double hbm_bw;    /* peak HBM bandwidth          (bytes/sec) */
-    double int8_peak; /* peak INT8 tensor throughput  (ops/sec)  */
-    double fp64_peak; /* peak FP64 DGEMM throughput   (ops/sec)  */
+    double ai;
+    double ratio;
+    double latency;
 };
 
 static const std::unordered_map<uint32_t, Oz2PerfModelParams>
 oz2_hw_params_by_pci_id = {
-    // /* gfx1201 Navi48 XTX */
-    // { 0x7551u, { 0., 0., 0. } },
-    // /* gfx1150 Strix Point */
-    // { 0x150e, { 0., 0., 0. } },
-    // /* gfx1151 Strix Halo */
-    // { 0x1586, { 0., 0., 0. } },
+    { 0x74a0u, { 2.63868, 168.411, 3.93e7 } },
+    { 0x74a1u, { 2.63868, 168.411, 3.93e7 } },
+    { 0x74a9u, { 2.63868, 168.411, 3.93e7 } },
 
-    /* MI300X (or MI300X_A1) (gfx942) */
-    { 0x74a0u, { 3.93e12, 1746.42e12, 10.37e12 } },
-    { 0x74a1u, { 3.93e12, 1746.42e12, 10.37e12 } },
-    { 0x74a9u, { 3.93e12, 1746.42e12, 10.37e12 } },
+    { 0x75a0u, { 11.2237, 46.4678, 6.08e7 } },
+    { 0x75b0u, { 11.2237, 46.4678, 6.08e7 } },
+
+    { 0x75a3u, { 11.3284, 42.7280, 6.82e7 } },
+    { 0x75b3u, { 11.3284, 42.7280, 6.82e7 } },
 };
 
 /* Per-device cache.   */
@@ -541,6 +539,10 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
     static constexpr double LATENCY_KERNEL = 5.0e-6;
     static constexpr double LATENCY_MATMUL = 10.0e-6;
     static constexpr double LATENCY_MEMSET = 2.0e-6;
+
+    const double c0 = hw.latency / LATENCY_MATMUL;
+    const double c1 = c0 * hw.ai;
+    const double c2 = c1 * hw.ratio;
     static constexpr double CHUNK_BYTES_D       = static_cast<double>(OZ2_CHUNK_TARGET_BYTES);
     static constexpr double SCALE_CHUNK_BYTES_D = static_cast<double>(OZ2_SCALE_CHUNK_TARGET_BYTES);
 
@@ -557,27 +559,18 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(int64_t m, int64_t n, int6
     const double scale_chunk_sz = std::min(s, std::max(chunk_sz, SCALE_CHUNK_BYTES_D / slice_bytes));
     const double n_scale_chunks = std::ceil(s / scale_chunk_sz);
 
-    const double t_int8_bw     = (mk + kn + 4.0 * mn) / hw.hbm_bw;
-    const double t_prelim_kern = (mk + kn) * 17.0 / hw.hbm_bw
-                               + 2.0 * LATENCY_KERNEL;
-    const double t_prelim_gemm = std::max(2.0 * mnk / hw.int8_peak, t_int8_bw)
-                               + LATENCY_MATMUL;
-    const double t_refine_kern = mn * 8.0 / hw.hbm_bw
-                               + 3.0 * LATENCY_KERNEL
-                               + LATENCY_MEMSET;
-    const double t_scale_kern  = (mk + kn) * (8.0 * n_scale_chunks + s) / hw.hbm_bw
-                               + 2.0 * n_scale_chunks * LATENCY_KERNEL;
-    const double t_int8_gemms  = s * std::max(2.0 * mnk / hw.int8_peak, t_int8_bw)
-                               + n_chunks * LATENCY_MATMUL;
-    const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / hw.hbm_bw
-                               + n_chunks * LATENCY_KERNEL;
+    const double t_int8_bw     = (mk + kn + 4.0 * mn) / c0;
+    const double t_prelim_kern = (mk + kn) * 17.0 / c0 + 2.0 * LATENCY_KERNEL;
+    const double t_prelim_gemm = std::max(2.0 * mnk / c2, t_int8_bw) + LATENCY_MATMUL;
+    const double t_refine_kern = mn * 8.0 / c0 + 3.0 * LATENCY_KERNEL + LATENCY_MEMSET;
+    const double t_scale_kern  = (mk + kn) * (8.0 * n_scale_chunks + s) / c0 + 2.0 * n_scale_chunks * LATENCY_KERNEL;
+    const double t_int8_gemms  = s * std::max(2.0 * mnk / c2, t_int8_bw) + n_chunks * LATENCY_MATMUL;
+    const double t_accum_kern  = mn * (4.0 * s + 32.0 * n_chunks - 16.0) / c0 + n_chunks * LATENCY_KERNEL;
     const double t_host        = OZ2_HOST_OVERHEAD_MS * 1e-3;
     const double t_launch      = 0.0;   /* all launch overhead distributed into components above */
     const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
-                               + t_scale_kern  + t_int8_gemms  + t_accum_kern
-                               + t_host;
-    const double t_native      = std::max(2.0 * mnk / hw.fp64_peak,
-                                          8.0 * (mk + kn + mn) / hw.hbm_bw) + LATENCY_MATMUL;
+                               + t_scale_kern  + t_int8_gemms  + t_accum_kern  + t_host;
+    const double t_native      = std::max(2.0 * mnk / c1, 8.0 * (mk + kn + mn) / c0) + LATENCY_MATMUL;
 
     constexpr double s2ms = 1000.0;
     return { t_prelim_kern * s2ms, t_prelim_gemm * s2ms, t_refine_kern * s2ms,
@@ -1703,23 +1696,16 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     const size_t strideA8i = lda8i * cola8i;
     const size_t strideB8i = ldb8i * static_cast<size_t>(n);
 
-    hipblasLtMatrixLayout_t layoutA_b  = nullptr;
-    hipblasLtMatrixLayout_t layoutB_b  = nullptr;
-    hipblasLtMatrixLayout_t layoutCD_b = nullptr;
-    hipblasLtMatrixLayoutCreate(&layoutA_b,  HIP_R_8I,  static_cast<uint64_t>(k), static_cast<uint64_t>(m), static_cast<int64_t>(lda8i));
-    hipblasLtMatrixLayoutCreate(&layoutB_b,  HIP_R_8I,  static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(ldb8i));
-    hipblasLtMatrixLayoutCreate(&layoutCD_b, HIP_R_32I, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(ldc32i));
-
     int32_t       batch_cur  = static_cast<int32_t>(chunk_size);
     const int64_t stride_A_b = static_cast<int64_t>(strideA8i);
     const int64_t stride_B_b = static_cast<int64_t>(strideB8i);
     const int64_t stride_C_b = static_cast<int64_t>(szC32i);
-    hipblasLtMatrixLayoutSetAttribute(layoutA_b,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
-    hipblasLtMatrixLayoutSetAttribute(layoutA_b,  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_A_b, sizeof(stride_A_b));
-    hipblasLtMatrixLayoutSetAttribute(layoutB_b,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
-    hipblasLtMatrixLayoutSetAttribute(layoutB_b,  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_B_b, sizeof(stride_B_b));
-    hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
-    hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_C_b, sizeof(stride_C_b));
+    hipblasLtMatrixLayoutSetAttribute(layoutA,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
+    hipblasLtMatrixLayoutSetAttribute(layoutA,  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_A_b, sizeof(stride_A_b));
+    hipblasLtMatrixLayoutSetAttribute(layoutB,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
+    hipblasLtMatrixLayoutSetAttribute(layoutB,  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_B_b, sizeof(stride_B_b));
+    hipblasLtMatrixLayoutSetAttribute(layoutCD, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,          &batch_cur,  sizeof(batch_cur));
+    hipblasLtMatrixLayoutSetAttribute(layoutCD, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_C_b, sizeof(stride_C_b));
 
     for(unsigned scale_start = 0; scale_start < num_moduli; scale_start += scale_chunk_size) {
         const unsigned actual_scale = (scale_start + scale_chunk_size <= num_moduli)
@@ -1773,16 +1759,16 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
                                          ? chunk_size : (actual_scale - gemm_local);
             if(static_cast<int32_t>(actual_gemm) != batch_cur) {
                 batch_cur = static_cast<int32_t>(actual_gemm);
-                hipblasLtMatrixLayoutSetAttribute(layoutA_b,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
-                hipblasLtMatrixLayoutSetAttribute(layoutB_b,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
-                hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
+                hipblasLtMatrixLayoutSetAttribute(layoutA,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
+                hipblasLtMatrixLayoutSetAttribute(layoutB,  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
+                hipblasLtMatrixLayoutSetAttribute(layoutCD, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_cur, sizeof(batch_cur));
             }
             const int8_t* const A8i_gemm = A8i + gemm_local * strideA8i;
             const int8_t* const B8i_gemm = B8i + gemm_local * strideB8i;
             _pstart();
             hipblasLtMatmul(settings.handle, matmulDesc,
-                            &one_i, A8i_gemm, layoutA_b, B8i_gemm, layoutB_b,
-                            &zero_i, C32i_batch, layoutCD_b, C32i_batch, layoutCD_b,
+                            &one_i, A8i_gemm, layoutA, B8i_gemm, layoutB,
+                            &zero_i, C32i_batch, layoutCD, C32i_batch, layoutCD,
                             nullptr, nullptr, 0, stream);
             _pstop(_t_int8);
 
@@ -1859,9 +1845,6 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
         }
     }
 
-    hipblasLtMatrixLayoutDestroy(layoutCD_b);
-    hipblasLtMatrixLayoutDestroy(layoutB_b);
-    hipblasLtMatrixLayoutDestroy(layoutA_b);
     hipblasLtMatmulDescDestroy(matmulDesc);
     hipblasLtMatrixLayoutDestroy(layoutCD);
     hipblasLtMatrixLayoutDestroy(layoutB);
