@@ -36,7 +36,7 @@ struct _rocblaslt_handle;
  * Uses a Roofline performance model calibrated for the target hardware.
  * The handle is used to obtain the target device for the performance model.
  * opA/opB select per-transpose efficiency factors in the BW-kernel model. */
-bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* handle,
+bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
                                    hipblasOperation_t       opA,
                                    hipblasOperation_t       opB,
                                    int64_t                  m,
@@ -66,7 +66,9 @@ unsigned fp64EmulationNumModuli();
 /* Returns the byte count of the emulation workspace for the given problem.
  * Use this to check whether a caller-provided workspace is sufficient.
  * The handle is used to obtain the target device for the performance model. */
-size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle* handle,
+size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle* h,
+                                  hipblasOperation_t       opA,
+                                  hipblasOperation_t       opB,
                                   int64_t                  m,
                                   int64_t                  n,
                                   int64_t                  k,

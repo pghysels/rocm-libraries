@@ -534,7 +534,8 @@ try
 
         if(fp64EmulationWouldApply(h, type_a, desc_ptr->op_A, desc_ptr->op_B, m, n, k, batch_count)) {
             const size_t emul_ws =
-                fp64EmulationWorkspaceSize(h, m, n, k, fp64EmulationEffectiveNumModuli(h));
+                fp64EmulationWorkspaceSize(h, desc_ptr->op_A, desc_ptr->op_B,
+                                          m, n, k, fp64EmulationEffectiveNumModuli(h));
             if(status == HIPBLAS_STATUS_SUCCESS && returnAlgoCount && *returnAlgoCount > 0) {
                 heuristicResultsArray[0].workspaceSize = emul_ws;
             } else if(requestedAlgoCount >= 1 && returnAlgoCount) {
@@ -931,18 +932,20 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
-size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t handle,
-                                           int64_t           m,
-                                           int64_t           n,
-                                           int64_t           k,
-                                           unsigned          num_moduli)
+size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t  handle,
+                                           hipblasOperation_t opA,
+                                           hipblasOperation_t opB,
+                                           int64_t            m,
+                                           int64_t            n,
+                                           int64_t            k,
+                                           unsigned           num_moduli)
 try
 {
     /* Clamp num_moduli to the valid range [2, 20] used by the emulation. */
     if(num_moduli < 2u)  num_moduli = 2u;
     if(num_moduli > 20u) num_moduli = 20u;
     return fp64EmulationWorkspaceSize(reinterpret_cast<const _rocblaslt_handle*>(handle),
-                                     m, n, k, num_moduli);
+                                     opA, opB, m, n, k, num_moduli);
 }
 catch(...)
 {
