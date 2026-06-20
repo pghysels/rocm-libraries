@@ -46,13 +46,15 @@
 #include "hipblaslt/hipblaslt.h"
 #include <hip/hip_runtime.h>
 
-#include <cstdlib>   // std::getenv
-#include <cstdio>    // std::fopen / std::fprintf / std::fclose / std::ftell
-#include <cstring>   // std::strcmp
-#include <cmath>     // std::log2, std::floor, etc.
+#include <cstdlib>      // std::getenv
+#include <cstdio>       // std::fopen / std::fprintf / std::fclose / std::ftell
+#include <cstring>      // std::strcmp
+#include <cmath>        // std::log2, std::floor, etc.
 #include <cerrno>
 #include <climits>
 #include <atomic>
+#include <optional>     // std::optional
+#include <unordered_map>// std::unordered_map
 
 /* =========================================================================
  * Tuning constants
@@ -545,13 +547,60 @@ bool fp64EmulationIsEnabled()
 
 bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
-    static constexpr double HBM_BW         = 6.4e12;
-    static constexpr double INT8_PEAK       = 3.05e15;
-    static constexpr double FP64_EFF        = 7.0e13;
-    static constexpr double LATENCY_KERNEL  = 5.0e-6;
-    static constexpr double LATENCY_MATMUL  = 10.0e-6;
-    static constexpr double LATENCY_MEMSET  = 2.0e-6;
-    static constexpr double CHUNK_BYTES_D   = static_cast<double>(OZ2_CHUNK_TARGET_BYTES);
+    if(device < 0 || device >= 64) return std::nullopt;
+    auto& entry = oz2_device_params_cache[device];
+    if(!entry) {
+        int chip_id = 0;
+        const hipError_t attr_err =
+            hipDeviceGetAttribute(&chip_id,
+                                  hipDeviceAttributePciChipId, device);
+        const uint32_t pci_device_id = static_cast<uint32_t>(chip_id) & 0xFFFFu;
+        auto it = oz2_hw_params_by_pci_id.find(pci_device_id);
+        entry = (it != oz2_hw_params_by_pci_id.end())
+              ? std::optional<Oz2PerfModelParams>{it->second}
+              : std::optional<Oz2PerfModelParams>{};
+    }
+    return *entry;
+}
+
+/* =========================================================================
+ * Performance-model predicted times
+ * Returns all sub-times in milliseconds.  Used both for the profiling CSV
+ * and (via comparison of t_total_ms vs t_native_ms) for the performance
+ * heuristic in fp64EmulationPerformanceCheck.
+ * ========================================================================= */
+struct Fp64PerfModelTimes {
+    double t_prelim_ms;      /* prelim kernel (shift + extraction)  */
+    double t_prelim_gemm_ms; /* preliminary INT8 GEMM               */
+    double t_refine_ms;      /* sft-refinement kernels              */
+    double t_scale_ms;       /* multi-modulus scaling kernels       */
+    double t_int8_gemms_ms;  /* all INT8 GEMMs                      */
+    double t_accum_ms;       /* CRT accumulation / finalize kernels */
+    double t_host_ms;        /* per-call host overhead              */
+    double t_launch_ms;      /* kernel-launch overhead              */
+    double t_fused_ms;       /* fused TN kernel (replaces scale+GEMM+accum when better) */
+    double t_total_ms;       /* total predicted emulation time      */
+    double t_native_ms;      /* predicted native FP64 DGEMM time    */
+};
+
+static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool tA, bool tB,
+                                                      int64_t m, int64_t n, int64_t k,
+                                                      unsigned num_moduli, int device)
+{
+    const auto hw_opt = oz2_get_perf_model_params(device);
+    assert(hw_opt.has_value() &&
+           "fp64EmulationPerfModelTimes called for a device not in oz2_hw_params_by_pci_id");
+    const Oz2PerfModelParams& hw = *hw_opt;
+
+    static constexpr double LATENCY_KERNEL = 5.0e-6;
+    static constexpr double LATENCY_MATMUL = 10.0e-6;
+    static constexpr double LATENCY_MEMSET = 2.0e-6;
+
+    const double c0 = hw.latency / LATENCY_MATMUL;
+    const double c1 = c0 * hw.ai;
+    const double c2 = c1 * hw.ratio;
+    static constexpr double CHUNK_BYTES_D       = static_cast<double>(OZ2_CHUNK_TARGET_BYTES);
+    static constexpr double SCALE_CHUNK_BYTES_D = static_cast<double>(OZ2_SCALE_CHUNK_TARGET_BYTES);
 
     const double s   = static_cast<double>(num_moduli);
     const double mn  = static_cast<double>(m) * static_cast<double>(n);
@@ -573,10 +622,136 @@ bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num
                           + (1.0 + n_chunks) * LATENCY_MATMUL
                           + LATENCY_MEMSET;
 
-    const double t_emul = t_prelim_gemm + t_prelim_kern + t_refine_kern
-                        + t_scale_kern  + t_int8_gemms  + t_accum_kern + t_launch;
-    const double t_native = std::max(2.0 * mnk / FP64_EFF,
-                                     8.0 * (mk + kn + mn) / HBM_BW) + LATENCY_MATMUL;
+    const double EFF_PRELIM_KERN = tA ? (tB ? 0.628 : 0.797) : (tB ? 0.550 : 0.622);
+    const double EFF_SCALE_KERN  = tA ? (tB ? 0.401 : 0.461) : (tB ? 0.354 : 0.405);
+    static constexpr double EFF_REFINE_KERN      = 0.511;
+    static constexpr double EFF_ACCUM_KERN       = 0.775;
+    static constexpr double OZ2_HOST_OVERHEAD_MS = 0.100;
+
+    const double t_int8_bw     = (mk + kn + 4.0 * mn) / c0;
+    const double t_prelim_kern = ((mk + kn) * 17.0 / c0 + 2.0 * LATENCY_KERNEL) / EFF_PRELIM_KERN;
+    const double t_prelim_gemm = std::max(2.0 * mnk / c2, t_int8_bw) + LATENCY_MATMUL;
+    const double t_refine_kern = (mn * 8.0 / c0 + 3.0 * LATENCY_KERNEL + LATENCY_MEMSET) / EFF_REFINE_KERN;
+    const double t_scale_kern  = ((mk + kn) * (8.0 * n_scale_chunks + s) / c0 + 2.0 * n_scale_chunks * LATENCY_KERNEL) / EFF_SCALE_KERN;
+    const double t_int8_gemms  = s * std::max(2.0 * mnk / c2, t_int8_bw) + n_chunks * LATENCY_MATMUL;
+    const double t_accum_kern  = (mn * (4.0 * s + 32.0 * n_chunks - 16.0) / c0 + n_chunks * LATENCY_KERNEL) / EFF_ACCUM_KERN;
+    const double t_host        = OZ2_HOST_OVERHEAD_MS * 1e-3;
+    const double t_launch      = 0.0;   /* all launch overhead distributed into components above */
+
+    /* Fused TN kernel (TRANS_A=T, TRANS_B=N): reads pre-computed INT8 A8i/B8i from the
+     * workspace, performs MFMA + CRT accumulation, and writes FP64 D directly.
+     * Scale still runs separately (scale is fast; it is not the bottleneck).
+     * The fused kernel replaces only the INT8 GEMM + CRT accumulation steps, thereby
+     * eliminating the S×mn INT32 intermediate C32i matrices (~8 GB for m=n=8192, S=16).
+     *
+     * HBM traffic: S×(mk+kn) bytes INT8 reads + 16×mn bytes FP64 (C read + D write).
+     * Compute: S×2×mnk MFMA ops + S×8×mn FP64 CRT ops (no FP64→INT8 conversion).
+     * EFF_FUSED = 0.46: measured on MI300X (gfx942), KBLK=32.
+     * gfx950 (KBLK=64): recalibrate after hardware measurement. */
+    static constexpr double EFF_FUSED = 0.46;
+    const double t_fused_bw   = (s * (mk + kn) + 16.0 * mn) / c0;  /* INT8 + FP64 C/D */
+    const double t_fused_int8 = s * 2.0 * mnk / c2;                  /* MFMA              */
+    const double t_fused_fp64 = s * 8.0 * mn / c1;                   /* CRT accum only    */
+    const double t_fused_cmp  = t_fused_int8 + t_fused_fp64;
+    /* Fused kernel works for all transpose combinations: scale kernels write A8i/B8i in
+     * canonical k-fast format regardless of opA/opB, so the fused path is always valid. */
+    const double t_fused = std::max(t_fused_bw, t_fused_cmp) / EFF_FUSED + LATENCY_KERNEL;
+
+    /* Scale always runs.  Fused kernel replaces only GEMM + CRT accum. */
+    const double t_gemm_accum  = std::min(t_int8_gemms + t_accum_kern, t_fused);
+    const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
+                               + t_scale_kern  + t_gemm_accum  + t_host;
+    const double t_native      = std::max(2.0 * mnk / c1, 8.0 * (mk + kn + mn) / c0) + LATENCY_MATMUL;
+
+    constexpr double s2ms = 1000.0;
+    const double t_fused_ret = t_fused * s2ms;
+    return { t_prelim_kern * s2ms, t_prelim_gemm * s2ms, t_refine_kern * s2ms,
+             t_scale_kern  * s2ms, t_int8_gemms  * s2ms, t_accum_kern  * s2ms,
+             t_host        * s2ms, t_launch      * s2ms,
+             t_fused_ret,
+             t_total       * s2ms, t_native      * s2ms };
+}
+
+/* Returns the minimum achievable emulation time in ms, accounting for the
+ * recursive binary-halving that fp64EmulatedGemm applies when n_chunks > 1.
+ * Both halves execute sequentially so the effective time is additive.
+ *
+ * The gate comparison uses the RECURSIVE effective times of each half
+ * (not the flat perf-model times).  This correctly handles the case where
+ * one split does not yet reduce n_chunks but further splitting would: the
+ * recursive sub-call for the half discovers and accounts for those deeper
+ * splits, returning the true best achievable time for that half.       */
+static double oz2_effective_time_ms(bool tA, bool tB,
+                                    int64_t m, int64_t n, int64_t k, unsigned s, int device)
+{
+    const double t_mono = fp64EmulationPerfModelTimes(tA, tB, m, n, k, s, device).t_total_ms;
+
+    const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
+    const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
+    if(n_chunks > 1u) {
+        const bool    split_m = (m >= n);
+        const int64_t half_m  = split_m ? m / 2 : m;
+        const int64_t half_n  = split_m ? n     : n / 2;
+
+        /* Both halves are nearly identical in size (differ by at most 1 when
+         * m or n is odd), so approximate t_split = 2 × t_half.             */
+        const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, s, device);
+        if(t_split <= t_mono * 1.01)
+            return t_split;
+    }
+    return t_mono;
+}
+
+/* Returns per-component predicted times summed across ALL leaf sub-GEMMs,
+ * mirroring the recursive binary-halving of oz2_effective_time_ms.
+ * t_native_ms is always set to the top-level (m,n,k) native DGEMM time
+ * because native DGEMM does not split.                                    */
+static Fp64PerfModelTimes oz2_effective_perf_model_times(bool tA, bool tB,
+                                                         int64_t m, int64_t n, int64_t k,
+                                                         unsigned s, int device)
+{
+    Fp64PerfModelTimes mono = fp64EmulationPerfModelTimes(tA, tB, m, n, k, s, device);
+
+    const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
+    const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
+    if(n_chunks > 1u) {
+        const bool    split_m = (m >= n);
+        const int64_t half_m  = split_m ? m / 2 : m;
+        const int64_t half_n  = split_m ? n     : n / 2;
+
+        const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, s, device);
+        if(t_split <= mono.t_total_ms * 1.01) {
+            /* Recurse on one half, then double all components.
+             * Both halves are ≈ equal in size so the approximation is exact
+             * when m (or n) is even and negligible otherwise.               */
+            Fp64PerfModelTimes half = oz2_effective_perf_model_times(tA, tB, half_m, half_n, k, s, device);
+            half.t_prelim_ms      *= 2.0;
+            half.t_prelim_gemm_ms *= 2.0;
+            half.t_refine_ms      *= 2.0;
+            half.t_scale_ms       *= 2.0;
+            half.t_int8_gemms_ms  *= 2.0;
+            half.t_accum_ms       *= 2.0;
+            half.t_host_ms        *= 2.0;
+            half.t_launch_ms      *= 2.0;
+            half.t_fused_ms       *= 2.0;
+            half.t_total_ms       *= 2.0;
+            /* Native DGEMM does not split: keep the top-level prediction. */
+            half.t_native_ms = mono.t_native_ms;
+            return half;
+        }
+    }
+    return mono;
+}
+
+bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
+                                   hipblasOperation_t opA, hipblasOperation_t opB,
+                                   int64_t m, int64_t n, int64_t k, unsigned num_moduli)
+{
+    const int  device = h->device;
+    const bool tA     = (opA != HIPBLAS_OP_N);
+    const bool tB     = (opB != HIPBLAS_OP_N);
+    const double t_emul   = oz2_effective_time_ms(tA, tB, m, n, k, num_moduli, device);
+    const double t_native = fp64EmulationPerfModelTimes(tA, tB, m, n, k, num_moduli, device).t_native_ms;
     return t_emul <= t_native;
 }
 
@@ -1452,6 +1627,320 @@ oz2_accum_finalize_kernel(const int32_t* __restrict__ C32i_batch,
     D[d_idx] = alpha * ldexp(X, inv_sft) + beta * C[c_idx];
 }
 
+/* =========================================================================
+ * Fused Ozaki kernel for bandwidth-bound shapes (TRANS_A=T, TRANS_B=N)
+ *
+ * Eliminates ALL intermediate HBM buffers (A8i, B8i, C32i, Zhi, Zlo).
+ * Only reads FP64 A, B, C and writes FP64 D — ideal for small-k shapes.
+ *
+ * Pre-requisite: sftA[i] and sftB[j] must already be computed by the
+ * existing prelim + refine kernels (those remain separate).
+ *
+ * MFMA instruction: v_mfma_i32_16x16x32_i8  (available on CDNA3 devices:
+ * gfx940, gfx941, gfx942, gfx950).
+ *
+ * Thread layout for v_mfma_i32_16x16x32_i8 (TILE_M=TILE_N=16, K_BLOCK=32):
+ *   One wavefront (64 threads) computes the full 16×16 output tile.
+ *   SRCA (A^T, 16×32 INT8): thread t contributes 8 INT8 values (1 int64) for
+ *     A^T[t%16][8*(t/16) .. 8*(t/16)+7], i.e., column (t%16) of A8i_lds,
+ *     k-rows 8*(t/16)..8*(t/16)+7.  k_a_base ∈ {0,8,16,24}.
+ *   SRCB (B,   32×16 INT8): thread t contributes 8 INT8 values (1 int64) for
+ *     B[8*(t/16) .. 8*(t/16)+7][t%16], i.e., same k-range as SRCA, fixed j = t%16.
+ *   VDST (C,  16×16 INT32): thread t holds 4 INT32 values at
+ *     row = 4*(t/16) + e,  col = t%16.   (e = 0..3)
+ *     (D[i][j] in item i%4 of lane j+16*(i/4))
+ *
+ * NOTE: The MFMA thread layout above is based on the AMD CDNA3 ISA and
+ * should be validated on hardware before production use.
+ * ========================================================================= */
+static constexpr unsigned OZ2_FUSED_TILE = 16;   /* MFMA tile = 16×16 per wavefront          */
+/* MFMA K-block: 32 on gfx94x (v_mfma_i32_16x16x32_i8),
+ *               64 on gfx95x (v_mfma_i32_16x16x64_i8).
+ * Selected at device-compile time by the target architecture macro.             */
+#if defined(__gfx950__)
+static constexpr unsigned OZ2_FUSED_KBLK = 64;
+#else
+static constexpr unsigned OZ2_FUSED_KBLK = 32;   /* default: gfx94x */
+#endif
+static constexpr unsigned OZ2_FUSED_NREG = 4;    /* INT32/FP64 output elements per wavefront  */
+static constexpr unsigned OZ2_FUSED_WM   = 4;    /* wavefronts in M direction per block       */
+static constexpr unsigned OZ2_FUSED_WN   = 4;    /* wavefronts in N direction per block       */
+/* macrotile = (WM×TILE) × (WN×TILE) = 64×64 per block; blockDim = WM×WN×64 = 1024          */
+
+/* Thread layout for v_mfma_i32_16x16x32_i8 (16×16 tile, 4 elements/thread):
+ * Derived from AMD CDNA3 ISA §7.1.4 with M=16, N=16, K=32, B=1, H=4:
+ *   K_L = K/(64/(M*B)) = 32/(64/16) = 8
+ *   B_I = ceil(64/(N*M/H)) = ceil(64/64) = 1
+ *   M_I = (64/B_I)/N = 64/16 = 4,  G = M/(H*M_I) = 16/16 = 1
+ *
+ * SRCA (A: 16×32 INT8): thread t → A[t%16][8*(t/16)..8*(t/16)+7]
+ *   (k_a_base = 8*(t/16) ∈ {0,8,16,24}; each lane carries 8 contiguous k-bytes)
+ * SRCB (B: 32×16 INT8): thread t → B[8*(t/16)..8*(t/16)+7][t%16]
+ *   (same k-range as SRCA, fixed j = t%16 — SAME indexing structure as SRCA)
+ * VDST (C: 16×16 INT32): thread t, element e (e=0..3):
+ *   row = 4*(t/16) + e
+ *   col = t%16
+ * (D[i][j] in item i%4 of lane j+16*(i/4)) */
+static __device__ __forceinline__ int oz2_fused_row(int t, int e)
+{
+    return 4 * (t / static_cast<int>(OZ2_FUSED_TILE)) + e;
+}
+static __device__ __forceinline__ int oz2_fused_col(int t, int e)
+{
+    (void)e;
+    return t % static_cast<int>(OZ2_FUSED_TILE);
+}
+
+/* ── oz2_fused_TN_kernel ─────────────────────────────────────────────────── */
+/* HAS_LO: true when num_moduli > 7 (double-double accumulation needed).
+ *
+ * New design: reads pre-computed INT8 A8i/B8i arrays from the workspace
+ * (scale step already ran), performs MFMA + CRT accumulation across all S
+ * moduli, and writes FP64 D directly.  Eliminates the S×mn INT32 intermediate
+ * C32i matrices (~8 GB for m=n=8192, S=16) that the non-fused path writes.
+ *
+ * LDS: int8_t A8i_lds[K_BLOCK][TILE_M] + B8i_lds[K_BLOCK][TILE_N]
+ *      = 16×32 + 16×32 = 1 KB per block → 64 blocks/CU occupancy.
+ * No FP64→INT8 conversion inside the kernel; INT8 data already in workspace.
+ *
+ * A8i workspace layout: A8i[s × lda8i × cola8i + m_row × lda8i + k_idx]
+ * B8i workspace layout: B8i[s × ldb8i × n_val  + n_col × ldb8i + k_idx]     */
+template <unsigned S, bool HAS_LO>
+__global__ static void
+oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT8 A */
+                    size_t         stride_A_s,           /* = lda8i × cola8i        */
+                    size_t         lda8i,                /* padded k for A8i        */
+                    const int8_t*  __restrict__ B8i,   /* [S×ldb8i×n]   INT8 B    */
+                    size_t         stride_B_s,           /* = ldb8i × n             */
+                    size_t         ldb8i,                /* padded k for B8i        */
+                    const double*  __restrict__ C,
+                    double*        __restrict__ D,
+                    int64_t m, int64_t n, int64_t k,
+                    int64_t ldc, int64_t ldd,
+                    double alpha, double beta,
+                    const int16_t* __restrict__ sftA,
+                    const int16_t* __restrict__ sftB)
+{
+    /* Static LDS: WM A-slices + WN B-slices — 4 KB per block.
+     * Layout [WM][TILE][KBLK]: k is stride-1, enabling 64-bit LDS reads.
+     * A8i_lds[WM][TILE][KBLK] = 4×16×32 = 2048 bytes (one slice per M-wavefront row)
+     * B8i_lds[WN][TILE][KBLK] = 4×16×32 = 2048 bytes (one slice per N-wavefront col) */
+    __shared__ int8_t A8i_lds[OZ2_FUSED_WM][OZ2_FUSED_TILE][OZ2_FUSED_KBLK];
+    __shared__ int8_t B8i_lds[OZ2_FUSED_WN][OZ2_FUSED_TILE][OZ2_FUSED_KBLK];
+
+    /* Wavefront decomposition: blockDim = WM×WN×64 = 1024 threads.
+     * wid = wavefront id (0..WM*WN-1), wm = M-index (0..WM-1), wn = N-index (0..WN-1)
+     * lane = lane within wavefront (0..63)                                              */
+    const int wid  = static_cast<int>(threadIdx.x) / 64;
+    const int wm   = wid / static_cast<int>(OZ2_FUSED_WN);
+    const int wn   = wid % static_cast<int>(OZ2_FUSED_WN);
+    const int lane = static_cast<int>(threadIdx.x) % 64;
+    const int k_int = static_cast<int>(k);
+
+    /* Block covers WM×TILE rows × WN×TILE cols; each wavefront gets one 32×32 sub-tile. */
+    const int block_m_base = static_cast<int>(blockIdx.x)
+                           * static_cast<int>(OZ2_FUSED_WM * OZ2_FUSED_TILE);
+    const int block_n_base = static_cast<int>(blockIdx.y)
+                           * static_cast<int>(OZ2_FUSED_WN * OZ2_FUSED_TILE);
+    const int m_base = block_m_base + wm * static_cast<int>(OZ2_FUSED_TILE);
+    const int n_base = block_n_base + wn * static_cast<int>(OZ2_FUSED_TILE);
+
+    /* Precompute per-lane output coordinates (optimization #3: eliminates 32 VGPR live-range).
+     * col is INDEPENDENT of e: oz2_fused_col(lane,e) = lane%32 for all e.
+     * row depends on e as: m_base + 4*(lane/32) + 8*(e/4) + (e%4).
+     * Storing lane_row_base = m_base + 4*(lane/32) lets us compute ri inline cheaply.
+     * Removing row[NREG] + col[NREG] frees 32 VGPRs from the entire S×k-block loop,
+     * potentially improving occupancy from 3→4 wavefronts/SIMD on CDNA3. */
+    const int col_val       = n_base + (lane % static_cast<int>(OZ2_FUSED_TILE));
+    const int lane_row_base = m_base + 4 * (lane / static_cast<int>(OZ2_FUSED_TILE));
+
+    double Zhi[OZ2_FUSED_NREG] = {};
+    double Zlo[OZ2_FUSED_NREG] = {};
+
+    /* ── Loop over S moduli ────────────────────────────────────────────────── */
+    for (unsigned s = 0; s < S; ++s) {
+        const int8_t* A8i_s = A8i + s * stride_A_s;
+        const int8_t* B8i_s = B8i + s * stride_B_s;
+
+        /* INT32 accumulator for this modulus (4 elements per thread). */
+        int32_t C32[OZ2_FUSED_NREG] = {};
+
+        /* K-block loop — loads INT8 A/B tiles from workspace HBM → LDS. */
+        for (int k_off = 0; k_off < k_int; k_off += static_cast<int>(OZ2_FUSED_KBLK)) {
+
+            /* ── Cooperative loading: all WM×WN×64 = 1024 threads load all slices ──────
+             * A8i: WM×KBLK×TILE = 4×16×32 = 2048 elements / 1024 threads = 2 loads each.
+             * B8i: WN×KBLK×TILE = 4×16×32 = 2048 elements / 1024 threads = 2 loads each.
+             * After __syncthreads(), each wavefront (wm,wn) reads its own slice.         */
+            constexpr int BLOCK_THREADS = static_cast<int>(OZ2_FUSED_WM * OZ2_FUSED_WN * 64);
+            constexpr int A_STEPS = (OZ2_FUSED_WM * OZ2_FUSED_KBLK * OZ2_FUSED_TILE) / BLOCK_THREADS;
+            constexpr int B_STEPS = (OZ2_FUSED_WN * OZ2_FUSED_KBLK * OZ2_FUSED_TILE) / BLOCK_THREADS;
+
+            /* A-loading: k varies fast across warp → coalesced global reads.
+             * LDS layout [WM][TILE][KBLK]: write A8i_lds[wm_ld][m_loc][k_loc].
+             * Thread group writes consecutive bytes (m_loc slow, k_loc fast) →
+             * 2-way LDS bank conflict (optimal for 1-byte stores). */
+            for (int step = 0; step < A_STEPS; ++step) {
+                const int flat  = static_cast<int>(threadIdx.x) + step * BLOCK_THREADS;
+                const int wm_ld = flat / static_cast<int>(OZ2_FUSED_KBLK * OZ2_FUSED_TILE);
+                const int inner = flat % static_cast<int>(OZ2_FUSED_KBLK * OZ2_FUSED_TILE);
+                const int m_loc = inner / static_cast<int>(OZ2_FUSED_KBLK);  /* m-slow */
+                const int k_loc = inner % static_cast<int>(OZ2_FUSED_KBLK);  /* k-fast → coalesced */
+                const int ki    = k_off + k_loc;
+                const int mi    = block_m_base + wm_ld * static_cast<int>(OZ2_FUSED_TILE) + m_loc;
+                A8i_lds[wm_ld][m_loc][k_loc] = (ki < k_int && mi < static_cast<int>(m))
+                    ? A8i_s[static_cast<size_t>(mi) * lda8i + ki] : 0;
+            }
+
+            /* B-loading: same — k-fast coalesced global reads, [TILE][KBLK] LDS layout. */
+            for (int step = 0; step < B_STEPS; ++step) {
+                const int flat  = static_cast<int>(threadIdx.x) + step * BLOCK_THREADS;
+                const int wn_ld = flat / static_cast<int>(OZ2_FUSED_KBLK * OZ2_FUSED_TILE);
+                const int inner = flat % static_cast<int>(OZ2_FUSED_KBLK * OZ2_FUSED_TILE);
+                const int n_loc = inner / static_cast<int>(OZ2_FUSED_KBLK);  /* n-slow */
+                const int k_loc = inner % static_cast<int>(OZ2_FUSED_KBLK);  /* k-fast → coalesced */
+                const int ki    = k_off + k_loc;
+                const int ni    = block_n_base + wn_ld * static_cast<int>(OZ2_FUSED_TILE) + n_loc;
+                B8i_lds[wn_ld][n_loc][k_loc] = (ki < k_int && ni < static_cast<int>(n))
+                    ? B8i_s[static_cast<size_t>(ni) * ldb8i + ki] : 0;
+            }
+            __syncthreads();
+
+            /* Pack SRCA/SRCB from LDS: each lane reads OZ2_FUSED_KBLK/4 contiguous k-bytes.
+             *   gfx94x (KBLK=32): k_a_base = 8*(lane/16) ∈ {0,8,16,24} → DS_READ_B64
+             *   gfx95x (KBLK=64): k_a_base = 16*(lane/16) ∈ {0,16,32,48} → DS_READ_B128
+             * All offsets are naturally aligned for their respective read widths. */
+            constexpr int K_A_BYTES = static_cast<int>(OZ2_FUSED_KBLK) / 4;
+            const int k_a_base = K_A_BYTES * (lane / static_cast<int>(OZ2_FUSED_TILE));
+            const int m_col    = lane % static_cast<int>(OZ2_FUSED_TILE);
+            __syncthreads();
+
+            /* MFMA: C32 += A^T × B  (INT8 × INT8 → INT32).
+             * Instruction and SRCA/SRCB type are determined at compile time by the
+             * target architecture (OZ2_FUSED_KBLK is target-dependent). */
+            typedef int v4i32 __attribute__((ext_vector_type(4)));
+            v4i32 vdst;
+            #pragma unroll
+            for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) vdst[e] = C32[e];
+#if defined(__gfx950__)
+            /* gfx950: v_mfma_i32_16x16x64_i8 — 128-bit SRCA/SRCB (16 INT8 per lane). */
+            typedef long long2_t __attribute__((ext_vector_type(2)));
+            long2_t srca = *reinterpret_cast<const long2_t*>(&A8i_lds[wm][m_col][k_a_base]);
+            long2_t srcb = *reinterpret_cast<const long2_t*>(&B8i_lds[wn][m_col][k_a_base]);
+            vdst = __builtin_amdgcn_mfma_i32_16x16x64_i8(srca, srcb, vdst, 0, 0, 0);
+#else
+            /* gfx94x: v_mfma_i32_16x16x32_i8 — 64-bit SRCA/SRCB (8 INT8 per lane). */
+            int64_t srca = *reinterpret_cast<const int64_t*>(&A8i_lds[wm][m_col][k_a_base]);
+            int64_t srcb = *reinterpret_cast<const int64_t*>(&B8i_lds[wn][m_col][k_a_base]);
+            vdst = __builtin_amdgcn_mfma_i32_16x16x32_i8(srca, srcb, vdst, 0, 0, 0);
+#endif
+            #pragma unroll
+            for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32[e] = vdst[e];
+
+        } /* end k_block loop */
+
+        /* CRT accumulation: C32 → Zhi/Zlo (double-double).
+         * No #pragma unroll: unrolling 4 FP64-chain copies would add ~40 VGPRs of temporaries,
+         * crippling occupancy.  The scalar loop keeps VGPR pressure minimal. */
+        const double neg_mod = cNegMod[s];
+        const double inv_mod = cInvMod[s];
+        for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) {
+            const double dc_raw = static_cast<double>(C32[e]);
+            const double dc     = fma(neg_mod, rint(dc_raw * inv_mod), dc_raw);
+            const double hi     = dc * cQpiHi[s];
+            const double new_hi = Zhi[e] + hi;
+            const double err    = hi - (new_hi - Zhi[e]);
+            Zhi[e] = new_hi;
+            if constexpr (HAS_LO) Zlo[e] = fma(dc, cQpiLo[s], Zlo[e] + err);
+            else                   Zlo[e] += err;
+        }
+    } /* end modulus loop */
+
+    /* Finalize: range reduction + inverse scale + write D.
+     * ri computed inline from lane_row_base (precomputed above) to keep VGPRs free
+     * during the hot S-loop. ci = col_val (constant for all e, precomputed above). */
+    #pragma unroll
+    for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) {
+        const int ri = lane_row_base + 8 * (e / 4) + (e % 4);
+        const int ci = col_val;
+        if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
+        const double q = rint((Zhi[e] + Zlo[e]) * cInvP);
+        const double X = fma(cP_lo, q, fma(cP_hi, q, Zhi[e]) + Zlo[e]);
+        const int inv_sft = -(static_cast<int>(sftA[ri]) + static_cast<int>(sftB[ci]));
+        const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
+        const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
+        D[d_idx] = alpha * ldexp(X, inv_sft) + beta * C[c_idx];
+    }
+}
+
+/* ── Host-side launcher for the fused TN kernel ─────────────────────────── */
+/* Reads pre-computed INT8 A8i/B8i from workspace; replaces INT8 GEMM + accum. */
+static rocblaslt_status
+oz2_launch_fused_TN(const int8_t*  A8i,    /* workspace INT8 A (all S moduli stacked) */
+                    const int8_t*  B8i,    /* workspace INT8 B (all S moduli stacked) */
+                    size_t         lda8i,  /* padded k, leading dim of A8i per modulus */
+                    size_t         cola8i, /* padded m                                 */
+                    size_t         ldb8i,  /* padded k, leading dim of B8i per modulus */
+                    const double*  C,
+                    double*        D,
+                    int64_t m, int64_t n, int64_t k,
+                    int64_t ldc, int64_t ldd,
+                    double alpha, double beta,
+                    const int16_t* sftA, const int16_t* sftB,
+                    unsigned num_moduli, hipStream_t stream)
+{
+    if (oz2_init_constants(num_moduli) != hipSuccess)
+        return rocblaslt_status_internal_error;
+
+    const size_t stride_A_s = lda8i * cola8i;             /* bytes between moduli in A8i */
+    const size_t stride_B_s = ldb8i * static_cast<size_t>(n); /* bytes between moduli in B8i */
+
+    /* Grid: each block covers WM×TILE × WN×TILE = 128×128 output.
+     * Block: WM×WN×64 = 1024 threads (16 wavefronts sharing LDS). */
+    const dim3 grid(
+        static_cast<unsigned>((m + OZ2_FUSED_WM * OZ2_FUSED_TILE - 1)
+                             / (OZ2_FUSED_WM * OZ2_FUSED_TILE)),
+        static_cast<unsigned>((n + OZ2_FUSED_WN * OZ2_FUSED_TILE - 1)
+                             / (OZ2_FUSED_WN * OZ2_FUSED_TILE)));
+    const dim3 block(OZ2_FUSED_WM * OZ2_FUSED_WN * 64);  /* 1024 threads = 16 wavefronts */
+    const bool has_lo = (num_moduli > 7u);
+
+/* Static LDS (4 KB per block) — no dynamic shm needed. */
+#define OZ2_FUSED_LAUNCH(S, HL) \
+    hipLaunchKernelGGL((oz2_fused_TN_kernel<(S),(HL)>), grid, block, 0, stream, \
+                       A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i, \
+                       C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB)
+
+#define OZ2_FUSED_DISPATCH(S) \
+    do { if (has_lo) OZ2_FUSED_LAUNCH((S), true); \
+         else        OZ2_FUSED_LAUNCH((S), false); } while(0)
+
+    switch (num_moduli) {
+        case  2: OZ2_FUSED_DISPATCH( 2); break;
+        case  3: OZ2_FUSED_DISPATCH( 3); break;
+        case  4: OZ2_FUSED_DISPATCH( 4); break;
+        case  5: OZ2_FUSED_DISPATCH( 5); break;
+        case  6: OZ2_FUSED_DISPATCH( 6); break;
+        case  7: OZ2_FUSED_DISPATCH( 7); break;
+        case  8: OZ2_FUSED_DISPATCH( 8); break;
+        case  9: OZ2_FUSED_DISPATCH( 9); break;
+        case 10: OZ2_FUSED_DISPATCH(10); break;
+        case 11: OZ2_FUSED_DISPATCH(11); break;
+        case 12: OZ2_FUSED_DISPATCH(12); break;
+        case 13: OZ2_FUSED_DISPATCH(13); break;
+        case 14: OZ2_FUSED_DISPATCH(14); break;
+        case 15: OZ2_FUSED_DISPATCH(15); break;
+        case 16: OZ2_FUSED_DISPATCH(16); break;
+        case 17: OZ2_FUSED_DISPATCH(17); break;
+        case 18: OZ2_FUSED_DISPATCH(18); break;
+        default: return rocblaslt_status_invalid_value;
+    }
+#undef OZ2_FUSED_DISPATCH
+#undef OZ2_FUSED_LAUNCH
+
+    return rocblaslt_status_success;
+}
+
 static const char* oz2_profile_file()
 {
     static const char* const fn = std::getenv("HIPBLASLT_EMULATION_PROFILE");
@@ -1461,23 +1950,44 @@ static const char* oz2_profile_file()
 /* =========================================================================
  * fp64EmulatedGemm
  * ========================================================================= */
-rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
-                                  hipblasOperation_t           opB,
-                                  int64_t                      m,
-                                  int64_t                      n,
-                                  int64_t                      k,
-                                  const double*                alpha,
-                                  const double*                A,
-                                  int64_t                      lda,
-                                  const double*                B,
-                                  int64_t                      ldb,
-                                  const double*                beta,
-                                  const double*                C,
-                                  int64_t                      ldc,
-                                  double*                      D,
-                                  int64_t                      ldd,
-                                  hipStream_t                  stream,
-                                  const Fp64EmulationSettings& settings)
+
+/* Aggregates per-component GPU times across all leaf sub-GEMMs and counts
+ * how many leaf (monolithic) sub-GEMMs were executed.  Owned by the public
+ * fp64EmulatedGemm wrapper; passed by pointer through recursive calls.     */
+struct Fp64ProfileAccum {
+    float    t_prelim      = 0.f;
+    float    t_prelim_gemm = 0.f;
+    float    t_extract     = 0.f;
+    float    t_refine      = 0.f;
+    float    t_fused       = 0.f;   /* fused TN kernel (non-zero when fused path taken) */
+    float    t_scale       = 0.f;
+    float    t_int8        = 0.f;
+    float    t_accum       = 0.f;
+    float    t_finalize    = 0.f;
+    unsigned n_sub_gemms   = 0u;
+};
+
+/* Internal implementation — called recursively during binary-halving.
+ * prof != nullptr enables per-component accumulation across all leaves.   */
+static rocblaslt_status
+fp64EmulatedGemmImpl(hipblasOperation_t           opA,
+                     hipblasOperation_t           opB,
+                     int64_t                      m,
+                     int64_t                      n,
+                     int64_t                      k,
+                     const double*                alpha,
+                     const double*                A,
+                     int64_t                      lda,
+                     const double*                B,
+                     int64_t                      ldb,
+                     const double*                beta,
+                     const double*                C,
+                     int64_t                      ldc,
+                     double*                      D,
+                     int64_t                      ldd,
+                     hipStream_t                  stream,
+                     const Fp64EmulationSettings& settings,
+                     Fp64ProfileAccum*            prof)
 {
     if(settings.num_moduli == 0u
        && cached_mantissa_bit_count_env().state == FP64_EMULATION_ENV_INVALID)
@@ -1493,8 +2003,8 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     const bool        _prof = (_pf != nullptr);
     hipEvent_t _ev0{}, _ev1{}, _ev_tot{};
     float _t_prelim = 0, _t_prelim_gemm = 0, _t_extract = 0, _t_refine = 0,
-          _t_scale  = 0, _t_int8 = 0, _t_accum = 0, _t_finalize = 0, _t_total = 0;
-    if(_prof) { (void)hipEventCreate(&_ev0); (void)hipEventCreate(&_ev1); (void)hipEventCreate(&_ev_tot); }
+          _t_fused  = 0, _t_scale = 0, _t_int8 = 0, _t_accum = 0, _t_finalize = 0;
+    if(_prof) { (void)hipEventCreate(&_ev0); (void)hipEventCreate(&_ev1); }
     auto _pstart = [&]() noexcept { if(_prof) (void)hipEventRecord(_ev0, stream); };
     auto _pstop  = [&](float& t) noexcept {
         if(_prof) {
@@ -1683,22 +2193,103 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                        C32i, m, n, ldc32i, sftB, accu_log2P);
     _pstop(_t_refine);
 
-    const dim3 blk_scale(OZ2_SCALE_TILE_K * OZ2_SCALE_TILE_M);   /* dim3(256) */
-    const unsigned m_y_blks = static_cast<unsigned>((m + OZ2_SCALE_TILE_M - 1) / OZ2_SCALE_TILE_M);
-    const unsigned n_y_blks = static_cast<unsigned>((n + OZ2_SCALE_TILE_M - 1) / OZ2_SCALE_TILE_M);
-    const dim3 gAB_scale(static_cast<unsigned>((k + OZ2_SCALE_TILE_K - 1) / OZ2_SCALE_TILE_K),
-                         m_y_blks + n_y_blks);
-    const dim3 blk_acc(64, 8);
-    const dim3 grid_acc((m + 63) / 64, (n + 7) / 8);
+    /* ── Scale + Fused/non-fused dispatch ────────────────────────────────────
+     * Scale grid/block configuration shared by both fused and non-fused paths.
+     * Gate: fused kernel is used when pm.t_fused_ms < pm.t_int8_gemms_ms + pm.t_accum_ms.
+     * (Scale always runs — its time is excluded from the gate comparison.)
+     *
+     * Fused path:  scale → oz2_fused_TN_kernel (reads INT8 A8i/B8i → writes FP64 D)
+     * Non-fused:   scale → hipblasLtMatmul (INT8 GEMM) → accum/finalize kernels        */
+    const dim3 blk_scale_T(OZ2_SCALE_TILE_K * OZ2_SCALE_COALESC_TILE_M);  /* 512  */
+    const dim3 blk_scale_N(OZ2_SCALE_TILE_K * OZ2_SCALE_SHMEM_TILE_M);    /* 1024 */
+    const unsigned k_x_blks   = static_cast<unsigned>((k + OZ2_SCALE_TILE_K - 1) / OZ2_SCALE_TILE_K);
+    const unsigned k_x_blks_c = static_cast<unsigned>((k + 2u * OZ2_SCALE_TILE_K - 1u) / (2u * OZ2_SCALE_TILE_K));
+    const dim3 g_scale_A_T(k_x_blks_c, static_cast<unsigned>((m + OZ2_SCALE_COALESC_TILE_M - 1) / OZ2_SCALE_COALESC_TILE_M));
+    const dim3 g_scale_A_N(k_x_blks,   static_cast<unsigned>((m + OZ2_SCALE_SHMEM_TILE_M    - 1) / OZ2_SCALE_SHMEM_TILE_M));
+    const dim3 g_scale_B_N(k_x_blks_c, static_cast<unsigned>((n + OZ2_SCALE_COALESC_TILE_M - 1) / OZ2_SCALE_COALESC_TILE_M));
+    const dim3 g_scale_B_T(k_x_blks,   static_cast<unsigned>((n + OZ2_SCALE_SHMEM_TILE_M    - 1) / OZ2_SCALE_SHMEM_TILE_M));
     const size_t strideA8i = lda8i * cola8i;
     const size_t strideB8i = ldb8i * static_cast<size_t>(n);
 
-    if(hipblasLtMatrixLayoutCreate(&layoutA_b, HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(m), static_cast<int64_t>(lda8i)) != HIPBLAS_STATUS_SUCCESS)
-        return fail_internal();
-    if(hipblasLtMatrixLayoutCreate(&layoutB_b, HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(ldb8i)) != HIPBLAS_STATUS_SUCCESS)
-        return fail_internal();
-    if(hipblasLtMatrixLayoutCreate(&layoutCD_b, HIP_R_32I, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(ldc32i)) != HIPBLAS_STATUS_SUCCESS)
-        return fail_internal();
+#define OZ2_SCALE_LAUNCH_A(TC, SS) \
+    do { if(tA) \
+        hipLaunchKernelGGL((oz2_scale_A_T_kernel<(TC)>), g_scale_A_T, blk_scale_T, 0, stream, \
+                           A, m, lda, A8i, lda8i, cola8i, sftA, k, (SS)); \
+    else \
+        hipLaunchKernelGGL((oz2_scale_A_N_kernel<(TC)>), g_scale_A_N, blk_scale_N, 0, stream, \
+                           A, m, lda, A8i, lda8i, cola8i, sftA, k, (SS)); \
+    } while(0)
+#define OZ2_SCALE_LAUNCH_B(TC, SS) \
+    do { if(!tB) \
+        hipLaunchKernelGGL((oz2_scale_B_N_kernel<(TC)>), g_scale_B_N, blk_scale_T, 0, stream, \
+                           B, n, ldb, B8i, ldb8i, sftB, k, (SS)); \
+    else \
+        hipLaunchKernelGGL((oz2_scale_B_T_kernel<(TC)>), g_scale_B_T, blk_scale_N, 0, stream, \
+                           B, n, ldb, B8i, ldb8i, sftB, k, (SS)); \
+    } while(0)
+    /* ── Scale dispatch lambda ─────────────────────────────────────────────── */
+    /* Shared by both fused and non-fused paths to avoid duplicating the
+     * 18-case switch.  Launches A and B scale kernels for one chunk and
+     * accumulates elapsed time into _t_scale.                                   */
+    auto launch_scale_chunk = [&](unsigned sc_start, unsigned sc_count) {
+        _pstart();
+        switch(sc_count) {
+            case  1: OZ2_SCALE_LAUNCH_A( 1, sc_start); OZ2_SCALE_LAUNCH_B( 1, sc_start); break;
+            case  2: OZ2_SCALE_LAUNCH_A( 2, sc_start); OZ2_SCALE_LAUNCH_B( 2, sc_start); break;
+            case  3: OZ2_SCALE_LAUNCH_A( 3, sc_start); OZ2_SCALE_LAUNCH_B( 3, sc_start); break;
+            case  4: OZ2_SCALE_LAUNCH_A( 4, sc_start); OZ2_SCALE_LAUNCH_B( 4, sc_start); break;
+            case  5: OZ2_SCALE_LAUNCH_A( 5, sc_start); OZ2_SCALE_LAUNCH_B( 5, sc_start); break;
+            case  6: OZ2_SCALE_LAUNCH_A( 6, sc_start); OZ2_SCALE_LAUNCH_B( 6, sc_start); break;
+            case  7: OZ2_SCALE_LAUNCH_A( 7, sc_start); OZ2_SCALE_LAUNCH_B( 7, sc_start); break;
+            case  8: OZ2_SCALE_LAUNCH_A( 8, sc_start); OZ2_SCALE_LAUNCH_B( 8, sc_start); break;
+            case  9: OZ2_SCALE_LAUNCH_A( 9, sc_start); OZ2_SCALE_LAUNCH_B( 9, sc_start); break;
+            case 10: OZ2_SCALE_LAUNCH_A(10, sc_start); OZ2_SCALE_LAUNCH_B(10, sc_start); break;
+            case 11: OZ2_SCALE_LAUNCH_A(11, sc_start); OZ2_SCALE_LAUNCH_B(11, sc_start); break;
+            case 12: OZ2_SCALE_LAUNCH_A(12, sc_start); OZ2_SCALE_LAUNCH_B(12, sc_start); break;
+            case 13: OZ2_SCALE_LAUNCH_A(13, sc_start); OZ2_SCALE_LAUNCH_B(13, sc_start); break;
+            case 14: OZ2_SCALE_LAUNCH_A(14, sc_start); OZ2_SCALE_LAUNCH_B(14, sc_start); break;
+            case 15: OZ2_SCALE_LAUNCH_A(15, sc_start); OZ2_SCALE_LAUNCH_B(15, sc_start); break;
+            case 16: OZ2_SCALE_LAUNCH_A(16, sc_start); OZ2_SCALE_LAUNCH_B(16, sc_start); break;
+            case 17: OZ2_SCALE_LAUNCH_A(17, sc_start); OZ2_SCALE_LAUNCH_B(17, sc_start); break;
+            case 18: OZ2_SCALE_LAUNCH_A(18, sc_start); OZ2_SCALE_LAUNCH_B(18, sc_start); break;
+            default: break;
+        }
+        _pstop(_t_scale);
+    };
+
+    bool took_fused_path = false;
+    rocblaslt_status fused_st = rocblaslt_status_success;
+
+    {
+        const int dev = reinterpret_cast<const _rocblaslt_handle*>(settings.handle)->device;
+        if (oz2_get_perf_model_params(dev).has_value()) {
+            const Fp64PerfModelTimes pm =
+                fp64EmulationPerfModelTimes(tA, tB, m, n, k, num_moduli, dev);
+            /* Gate: fused replaces only INT8 GEMM + accum; scale always runs.
+             * Works for all transpose combinations (A8i/B8i always in canonical format). */
+            if (pm.t_fused_ms > 0.0 &&
+                pm.t_fused_ms < pm.t_int8_gemms_ms + pm.t_accum_ms) {
+                /* Fused path: run scale first, then MFMA+CRT fused kernel. */
+                for (unsigned scale_start = 0; scale_start < num_moduli; scale_start += scale_chunk_size) {
+                    const unsigned scale_start_as = (scale_start + scale_chunk_size <= num_moduli)
+                                                    ? scale_chunk_size : (num_moduli - scale_start);
+                    launch_scale_chunk(scale_start, scale_start_as);
+                }
+                /* Fused MFMA+CRT kernel: reads A8i/B8i, writes D directly. */
+                _pstart();
+                fused_st = oz2_launch_fused_TN(A8i, B8i, lda8i, cola8i, ldb8i,
+                                               C, D, m, n, k, ldc, ldd,
+                                               *alpha, *beta, sftA, sftB, num_moduli, stream);
+                _pstop(_t_fused);
+                took_fused_path = true;
+            }
+        }
+    }
+
+    if (!took_fused_path) {
+    /* Non-fused path: scale + hipblasLtMatmul (INT8 GEMM) + accum/finalize. */
+    const dim3 blk_acc(64, 8);
+    const dim3 grid_acc((m + 63) / 64, (n + 7) / 8);
 
     int32_t       batch_cur  = static_cast<int32_t>(chunk_size);
     const int64_t stride_A_b = static_cast<int64_t>(strideA8i);
@@ -1720,43 +2311,8 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     for(unsigned scale_start = 0; scale_start < num_moduli; scale_start += scale_chunk_size) {
         const unsigned actual_scale = (scale_start + scale_chunk_size <= num_moduli)
                                       ? scale_chunk_size : (num_moduli - scale_start);
-        _pstart();
-        /* Scale kernel: OZ2_S_MAX=18, so actual_scale <= 18 always.
-         * TRANS_A/TRANS_B are compile-time template params for branch-free
-         * coalesced vs SHMEM-transposed paths.  No runtime fallback needed. */
-#define OZ2_SCALE_LAUNCH(TC, TA, TB) \
-        hipLaunchKernelGGL((oz2_scaleAB_kernel<(TC),(TA),(TB)>), gAB_scale, blk_scale, 0, stream, \
-                           A, m, lda, A8i, lda8i, cola8i, sftA, \
-                           B, n, ldb, B8i, ldb8i, sftB, k, scale_start, m_y_blks)
-#define OZ2_SCALE_DISPATCH(TA, TB) \
-        switch(actual_scale) { \
-            case  1: OZ2_SCALE_LAUNCH( 1,(TA),(TB)); break; \
-            case  2: OZ2_SCALE_LAUNCH( 2,(TA),(TB)); break; \
-            case  3: OZ2_SCALE_LAUNCH( 3,(TA),(TB)); break; \
-            case  4: OZ2_SCALE_LAUNCH( 4,(TA),(TB)); break; \
-            case  5: OZ2_SCALE_LAUNCH( 5,(TA),(TB)); break; \
-            case  6: OZ2_SCALE_LAUNCH( 6,(TA),(TB)); break; \
-            case  7: OZ2_SCALE_LAUNCH( 7,(TA),(TB)); break; \
-            case  8: OZ2_SCALE_LAUNCH( 8,(TA),(TB)); break; \
-            case  9: OZ2_SCALE_LAUNCH( 9,(TA),(TB)); break; \
-            case 10: OZ2_SCALE_LAUNCH(10,(TA),(TB)); break; \
-            case 11: OZ2_SCALE_LAUNCH(11,(TA),(TB)); break; \
-            case 12: OZ2_SCALE_LAUNCH(12,(TA),(TB)); break; \
-            case 13: OZ2_SCALE_LAUNCH(13,(TA),(TB)); break; \
-            case 14: OZ2_SCALE_LAUNCH(14,(TA),(TB)); break; \
-            case 15: OZ2_SCALE_LAUNCH(15,(TA),(TB)); break; \
-            case 16: OZ2_SCALE_LAUNCH(16,(TA),(TB)); break; \
-            case 17: OZ2_SCALE_LAUNCH(17,(TA),(TB)); break; \
-            case 18: OZ2_SCALE_LAUNCH(18,(TA),(TB)); break; \
-            default: break; /* unreachable with OZ2_S_MAX=18 */ \
-        }
-        if(tA && !tB)       { OZ2_SCALE_DISPATCH(true,  false) }
-        else if(!tA && !tB) { OZ2_SCALE_DISPATCH(false, false) }
-        else if(!tA && tB)  { OZ2_SCALE_DISPATCH(false, true)  }
-        else                { OZ2_SCALE_DISPATCH(true,  true)  }
-#undef OZ2_SCALE_DISPATCH
-#undef OZ2_SCALE_LAUNCH
-        _pstop(_t_scale);
+        /* Scale: one call dispatches all 18 cases via the shared lambda. */
+        launch_scale_chunk(scale_start, actual_scale);
 
         for(unsigned gemm_local = 0; gemm_local < actual_scale; gemm_local += chunk_size) {
             const unsigned actual_gemm = (gemm_local + chunk_size <= actual_scale)
@@ -1864,35 +2420,154 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         }
     }
 
-    if(!cleanup())
-        return rocblaslt_status_internal_error;
+    } /* end if (!took_fused_path) */
+
+#undef OZ2_SCALE_LAUNCH_B
+#undef OZ2_SCALE_LAUNCH_A
+
+    hipblasLtMatmulDescDestroy(matmulDesc);
+    hipblasLtMatrixLayoutDestroy(layoutCD);
+    hipblasLtMatrixLayoutDestroy(layoutB);
+    hipblasLtMatrixLayoutDestroy(layoutA);
 
     if(_prof) {
-        (void)hipEventRecord(_ev1, stream); (void)hipStreamSynchronize(stream);
-        (void)hipEventElapsedTime(&_t_total, _ev_tot, _ev1);
+        /* Accumulate component times into the caller's accumulator. */
+        prof->t_prelim      += _t_prelim;
+        prof->t_prelim_gemm += _t_prelim_gemm;
+        prof->t_extract     += _t_extract;
+        prof->t_refine      += _t_refine;
+        prof->t_fused       += _t_fused;
+        prof->t_scale       += _t_scale;
+        prof->t_int8        += _t_int8;
+        prof->t_accum       += _t_accum;
+        prof->t_finalize    += _t_finalize;
+        prof->n_sub_gemms   += 1u;
+        (void)hipEventDestroy(_ev1);
+        (void)hipEventDestroy(_ev0);
+    }
+    return took_fused_path ? fused_st : rocblaslt_status_success;
+}
+
+/* =========================================================================
+ * fp64EmulatedGemm — public wrapper
+ *
+ * Owns the profiling accumulator.  Records a single HIP event pair around
+ * the entire call (including all recursive sub-GEMMs) to measure the true
+ * GPU wall-clock time, then writes one summary CSV row with:
+ *   – summed component times across all leaf sub-GEMMs
+ *   – the measured t_total_ms for the full call
+ *   – num_sub_gemms (number of monolithic leaf calls executed)
+ * ========================================================================= */
+rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
+                                  hipblasOperation_t           opB,
+                                  int64_t                      m,
+                                  int64_t                      n,
+                                  int64_t                      k,
+                                  const double*                alpha,
+                                  const double*                A,
+                                  int64_t                      lda,
+                                  const double*                B,
+                                  int64_t                      ldb,
+                                  const double*                beta,
+                                  const double*                C,
+                                  int64_t                      ldc,
+                                  double*                      D,
+                                  int64_t                      ldd,
+                                  hipStream_t                  stream,
+                                  const Fp64EmulationSettings& settings)
+{
+    /* ── Pre-allocate a single workspace for the entire call ──────────────────
+     * fp64EmulatedGemmImpl recurses for split shapes; without a pre-allocated
+     * buffer each leaf sub-GEMM would do its own hipMallocAsync/hipFreeAsync.
+     * Allocating once here and passing it through settings eliminates that
+     * overhead (e.g. 16 redundant alloc/free pairs for the 65K square case).
+     * If the caller already provided a sufficient workspace we use it as-is.  */
+    const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
+                                    ? settings.num_moduli : fp64EmulationNumModuli();
+    const int device = reinterpret_cast<const _rocblaslt_handle*>(settings.handle)->device;
+    const size_t wsNeeded = fp64EmulationWorkspaceSize(
+                                reinterpret_cast<const _rocblaslt_handle*>(settings.handle),
+                                opA, opB, m, n, k, num_moduli);
+
+    Fp64EmulationSettings effectiveSettings = settings;
+    void* ws_toplevel = nullptr;
+
+    if(wsNeeded > 0 &&
+       (effectiveSettings.workspace == nullptr ||
+        effectiveSettings.workspace_bytes < wsNeeded))
+    {
+        if(hipMallocAsync(&ws_toplevel, wsNeeded, stream) != hipSuccess)
+            return rocblaslt_status_memory_error;
+        effectiveSettings.workspace       = ws_toplevel;
+        effectiveSettings.workspace_bytes = wsNeeded;
+    }
+    /* ────────────────────────────────────────────────────────────────────── */
+
+    const char* const _pf   = oz2_profile_file();
+    const bool        _prof = (_pf != nullptr);
+
+    Fp64ProfileAccum accum{};
+    hipEvent_t ev_start{}, ev_end{};
+    if(_prof) {
+        (void)hipEventCreate(&ev_start);
+        (void)hipEventCreate(&ev_end);
+        (void)hipEventRecord(ev_start, stream);
+    }
+
+    const rocblaslt_status st =
+        fp64EmulatedGemmImpl(opA, opB, m, n, k, alpha, A, lda, B, ldb,
+                             beta, C, ldc, D, ldd, stream, effectiveSettings,
+                             _prof ? &accum : nullptr);
+
+    /* Release the top-level workspace now that all leaves have finished.    */
+    if(ws_toplevel != nullptr)
+        (void)hipFreeAsync(ws_toplevel, stream);
+
+    if(_prof) {
+        (void)hipEventRecord(ev_end, stream);
+        (void)hipStreamSynchronize(stream);
+        float t_total = 0.f;
+        (void)hipEventElapsedTime(&t_total, ev_start, ev_end);
+
+        const unsigned chunk_size = oz2_compute_chunk_size(m, n, num_moduli);
+        const unsigned scale_chunk_size =
+            oz2_compute_scale_chunk_size(m, n, k, num_moduli, chunk_size);
+        const bool tA = (opA != HIPBLAS_OP_N);
+        const bool tB = (opB != HIPBLAS_OP_N);
+        /* Use the split-aware model: each component is the sum across all leaves.
+         * t_native_ms remains for the original (m,n,k) problem.           */
+        const Fp64PerfModelTimes pm = oz2_effective_perf_model_times(tA, tB, m, n, k, num_moduli, device);
+
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f) {
             if(std::ftell(_f) == 0)
                 std::fprintf(_f,
-                    "m,n,k,num_moduli,scale_chunk_size,gemm_chunk_size,"
-                    "workspace_bytes,"
+                    "m,n,k,transA,transB,num_moduli,scale_chunk_size,gemm_chunk_size,"
+                    "workspace_bytes,num_sub_gemms,"
                     "t_prelim_ms,t_prelim_gemm_ms,t_extract_ms,t_refine_ms,"
-                    "t_scale_ms,t_int8_gemm_ms,t_accum_ms,"
-                    "t_finalize_ms,t_total_ms\n");
+                    "t_fused_ms,t_scale_ms,t_int8_gemm_ms,t_accum_ms,"
+                    "t_finalize_ms,t_total_ms,"
+                    "pred_prelim_ms,pred_prelim_gemm_ms,pred_refine_ms,"
+                    "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
+                    "pred_host_ms,pred_launch_ms,pred_fused_ms,pred_total_ms,pred_native_dgemm_ms\n");
             std::fprintf(_f,
-                "%lld,%lld,%lld,%u,%u,%u,"
-                "%llu,"
-                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+                "%lld,%lld,%lld,%c,%c,%u,%u,%u,"
+                "%llu,%u,"
+                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                 (long long)m, (long long)n, (long long)k,
+                tA ? 'T' : 'N', tB ? 'T' : 'N',
                 num_moduli, scale_chunk_size, chunk_size,
-                (unsigned long long)wsBytes,
-                _t_prelim, _t_prelim_gemm, _t_extract, _t_refine,
-                _t_scale, _t_int8, _t_accum, _t_finalize, _t_total);
+                (unsigned long long)wsNeeded, accum.n_sub_gemms,
+                accum.t_prelim, accum.t_prelim_gemm, accum.t_extract, accum.t_refine,
+                accum.t_fused, accum.t_scale, accum.t_int8, accum.t_accum, accum.t_finalize, t_total,
+                pm.t_prelim_ms, pm.t_prelim_gemm_ms, pm.t_refine_ms,
+                pm.t_scale_ms, pm.t_int8_gemms_ms, pm.t_accum_ms,
+                pm.t_host_ms, pm.t_launch_ms, pm.t_fused_ms, pm.t_total_ms, pm.t_native_ms);
             std::fclose(_f);
         }
-        (void)hipEventDestroy(_ev_tot);
-        (void)hipEventDestroy(_ev1);
-        (void)hipEventDestroy(_ev0);
+        (void)hipEventDestroy(ev_end);
+        (void)hipEventDestroy(ev_start);
     }
-    return rocblaslt_status_success;
+    return st;
 }
