@@ -1674,6 +1674,21 @@ static constexpr unsigned OZ2_FUSED_K_UNROLL   = OZ2_FUSED_KBLK_LOAD / OZ2_FUSED
  *   row = 4*(t/16) + e
  *   col = t%16
  * (D[i][j] in item i%4 of lane j+16*(i/4)) */
+/* Architecture-specific MFMA source type and instruction wrapper.
+ * Eliminates repeated #if defined(__gfx950__) guards inside the hot k-loop. */
+typedef int v4i32 __attribute__((ext_vector_type(4)));
+#if defined(__gfx950__)
+typedef long oz2_mfma_src_t __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ v4i32
+oz2_do_mfma(oz2_mfma_src_t a, oz2_mfma_src_t b, v4i32 c) noexcept
+{ return __builtin_amdgcn_mfma_i32_16x16x64_i8(a, b, c, 0, 0, 0); }
+#else
+typedef int64_t oz2_mfma_src_t;
+__device__ __forceinline__ v4i32
+oz2_do_mfma(int64_t a, int64_t b, v4i32 c) noexcept
+{ return __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, c, 0, 0, 0); }
+#endif
+
 static __device__ __forceinline__ int oz2_fused_row(int t, int e)
 {
     return 4 * (t / static_cast<int>(OZ2_FUSED_TILE)) + e;
@@ -1767,48 +1782,78 @@ oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT
     constexpr int K_A_BYTES = static_cast<int>(OZ2_FUSED_KBLK) / 4;
     const int m_col = lane % static_cast<int>(OZ2_FUSED_TILE);
 
-    int wm_ld_v[AB_STEPS], m_loc_v[AB_STEPS], k4_loc_av[AB_STEPS], mi_v[AB_STEPS];
-    int wn_ld_v[AB_STEPS], n_loc_v[AB_STEPS], k4_loc_bv[AB_STEPS], ni_v[AB_STEPS];
+    /* Each thread's cooperative-load position (same decomposition for A and B). */
+    int wm_ld_v[AB_STEPS], m_loc_v[AB_STEPS], k4_loc_v[AB_STEPS];
+    int mi_v[AB_STEPS], ni_v[AB_STEPS];
     #pragma unroll
     for (int ls = 0; ls < AB_STEPS; ++ls) {
-        const int flat   = static_cast<int>(threadIdx.x) + ls * BLK_THR;
-        wm_ld_v[ls]      = flat / (static_cast<int>(OZ2_FUSED_TILE) * K4DIM);
-        m_loc_v[ls]      = (flat % (static_cast<int>(OZ2_FUSED_TILE) * K4DIM)) / K4DIM;
-        k4_loc_av[ls]    = (flat % (static_cast<int>(OZ2_FUSED_TILE) * K4DIM)) % K4DIM;
-        mi_v[ls]         = block_m_base + wm_ld_v[ls] * static_cast<int>(OZ2_FUSED_TILE) + m_loc_v[ls];
-        wn_ld_v[ls]      = flat / (static_cast<int>(OZ2_FUSED_TILE) * K4DIM);
-        n_loc_v[ls]      = (flat % (static_cast<int>(OZ2_FUSED_TILE) * K4DIM)) / K4DIM;
-        k4_loc_bv[ls]    = (flat % (static_cast<int>(OZ2_FUSED_TILE) * K4DIM)) % K4DIM;
-        ni_v[ls]         = block_n_base + wn_ld_v[ls] * static_cast<int>(OZ2_FUSED_TILE) + n_loc_v[ls];
+        const int flat = static_cast<int>(threadIdx.x) + ls * BLK_THR;
+        const int tile_dim = static_cast<int>(OZ2_FUSED_TILE) * K4DIM;
+        wm_ld_v[ls]  = flat / tile_dim;
+        m_loc_v[ls]  = (flat % tile_dim) / K4DIM;
+        k4_loc_v[ls] = (flat % tile_dim) % K4DIM;
+        mi_v[ls]     = block_m_base + wm_ld_v[ls] * static_cast<int>(OZ2_FUSED_TILE) + m_loc_v[ls];
+        ni_v[ls]     = block_n_base + wm_ld_v[ls] * static_cast<int>(OZ2_FUSED_TILE) + m_loc_v[ls];
     }
 
-    auto cond_load_a_fn = [&](const int8_t* As, int ls, int ki) -> int32_t {
+    /* Boundary-safe 4-byte load helpers for the LDS prologue. */
+    auto cond_load_a = [&](const int8_t* As, int ls, int ki) -> int32_t {
         int32_t v = 0;
         const int mi = mi_v[ls];
         if (mi < static_cast<int>(m) && ki + 3 < k_int)
             v = *reinterpret_cast<const int32_t*>(As + static_cast<size_t>(mi) * lda8i + ki);
         else if (mi < static_cast<int>(m) && ki < k_int) {
             const int8_t* p = As + static_cast<size_t>(mi) * lda8i + ki;
-            for (int b = 0; b < 4 && ki + b < k_int; ++b) reinterpret_cast<int8_t*>(&v)[b] = p[b];
+            for (int b = 0; b < 4 && ki + b < k_int; ++b)
+                reinterpret_cast<int8_t*>(&v)[b] = p[b];
         }
         return v;
     };
-    auto cond_load_b_fn = [&](const int8_t* Bs, int ls, int ki) -> int32_t {
+    auto cond_load_b = [&](const int8_t* Bs, int ls, int ki) -> int32_t {
         int32_t v = 0;
         const int ni = ni_v[ls];
         if (ni < static_cast<int>(n) && ki + 3 < k_int)
             v = *reinterpret_cast<const int32_t*>(Bs + static_cast<size_t>(ni) * ldb8i + ki);
         else if (ni < static_cast<int>(n) && ki < k_int) {
             const int8_t* p = Bs + static_cast<size_t>(ni) * ldb8i + ki;
-            for (int b = 0; b < 4 && ki + b < k_int; ++b) reinterpret_cast<int8_t*>(&v)[b] = p[b];
+            for (int b = 0; b < 4 && ki + b < k_int; ++b)
+                reinterpret_cast<int8_t*>(&v)[b] = p[b];
         }
         return v;
     };
 
-    typedef int v4i32 __attribute__((ext_vector_type(4)));
-#if defined(__gfx950__)
-    typedef long long2_t __attribute__((ext_vector_type(2)));
-#endif
+    /* Runs K_UNROLL MFMAs from one LDS ping-pong slot into C32.
+     * A_wm_slot / B_wn_slot point to A8i_lds[cur][si][wm][0][0] etc. */
+    auto apply_mfma = [&](const int8_t* A_wm_slot, const int8_t* B_wn_slot,
+                          int32_t (&C32)[OZ2_FUSED_NREG]) __attribute__((always_inline)) {
+        v4i32 vx;
+        for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) vx[e] = C32[e];
+        for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
+            const int kab = K_A_BYTES * (lane / static_cast<int>(OZ2_FUSED_TILE))
+                          + static_cast<int>(ku) * static_cast<int>(OZ2_FUSED_KBLK);
+            const auto sa = *reinterpret_cast<const oz2_mfma_src_t*>(
+                A_wm_slot + m_col * static_cast<int>(OZ2_FUSED_KBLK_LOAD) + kab);
+            const auto sb = *reinterpret_cast<const oz2_mfma_src_t*>(
+                B_wn_slot + m_col * static_cast<int>(OZ2_FUSED_KBLK_LOAD) + kab);
+            vx = oz2_do_mfma(sa, sb, vx);
+        }
+        for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32[e] = vx[e];
+    };
+
+    /* CRT accumulation: add one modulus's contribution to Zhi/Zlo. */
+    auto crt_update = [&](const int32_t* C32x, unsigned sidx) __attribute__((always_inline)) {
+        const double nm = cNegMod[sidx], im = cInvMod[sidx];
+        for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) {
+            const double dc_raw = static_cast<double>(C32x[e]);
+            const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
+            const double hi     = dc * cQpiHi[sidx];
+            const double new_hi = Zhi[e] + hi;
+            const double err    = hi - (new_hi - Zhi[e]);
+            Zhi[e] = new_hi;
+            if constexpr (HAS_LO) Zlo[e] = fma(dc, cQpiLo[sidx], Zlo[e] + err);
+            else                  Zlo[e] += err;
+        }
+    };
 
     for (unsigned s = 0; s + 1 < S; s += 2) {
         const int8_t* A8i_s0 = A8i + s * stride_A_s;
@@ -1820,25 +1865,25 @@ oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT
         if (k_int > 0) {
             #pragma unroll
             for (int ls = 0; ls < AB_STEPS; ++ls) {
-                const int ki0 = k4_loc_av[ls] * 4;
-                *reinterpret_cast<int32_t*>(&A8i_lds[0][0][wm_ld_v[ls]][m_loc_v[ls]][ki0]) = cond_load_a_fn(A8i_s0, ls, ki0);
-                *reinterpret_cast<int32_t*>(&A8i_lds[0][1][wm_ld_v[ls]][m_loc_v[ls]][ki0]) = cond_load_a_fn(A8i_s1, ls, ki0);
+                const int ki0 = k4_loc_v[ls] * 4;
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][0][wm_ld_v[ls]][m_loc_v[ls]][ki0]) = cond_load_a(A8i_s0, ls, ki0);
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][1][wm_ld_v[ls]][m_loc_v[ls]][ki0]) = cond_load_a(A8i_s1, ls, ki0);
             }
             #pragma unroll
             for (int ls = 0; ls < AB_STEPS; ++ls) {
-                const int ki0 = k4_loc_bv[ls] * 4;
-                *reinterpret_cast<int32_t*>(&B8i_lds[0][0][wn_ld_v[ls]][n_loc_v[ls]][ki0]) = cond_load_b_fn(B8i_s0, ls, ki0);
-                *reinterpret_cast<int32_t*>(&B8i_lds[0][1][wn_ld_v[ls]][n_loc_v[ls]][ki0]) = cond_load_b_fn(B8i_s1, ls, ki0);
+                const int ki0 = k4_loc_v[ls] * 4;
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][0][wm_ld_v[ls]][m_loc_v[ls]][ki0]) = cond_load_b(B8i_s0, ls, ki0);
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][1][wm_ld_v[ls]][m_loc_v[ls]][ki0]) = cond_load_b(B8i_s1, ls, ki0);
             }
             __syncthreads();
 
             const int8_t* A0_base[AB_STEPS], *A1_base[AB_STEPS], *B0_base[AB_STEPS], *B1_base[AB_STEPS];
             #pragma unroll
             for (int ls = 0; ls < AB_STEPS; ++ls) {
-                A0_base[ls] = A8i_s0 + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_av[ls] * 4;
-                A1_base[ls] = A8i_s1 + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_av[ls] * 4;
-                B0_base[ls] = B8i_s0 + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_bv[ls] * 4;
-                B1_base[ls] = B8i_s1 + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_bv[ls] * 4;
+                A0_base[ls] = A8i_s0 + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_v[ls] * 4;
+                A1_base[ls] = A8i_s1 + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_v[ls] * 4;
+                B0_base[ls] = B8i_s0 + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_v[ls] * 4;
+                B1_base[ls] = B8i_s1 + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_v[ls] * 4;
             }
             int32_t rA0[AB_STEPS], rA1[AB_STEPS], rB0[AB_STEPS], rB1[AB_STEPS];
             int cur = 0;
@@ -1854,90 +1899,25 @@ oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT
                     rB0[ls] = *reinterpret_cast<const int32_t*>(B0_base[ls] + nxt_k);
                     rB1[ls] = *reinterpret_cast<const int32_t*>(B1_base[ls] + nxt_k);
                 }
-                { v4i32 v0;
-                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) v0[e] = C32_0[e];
-                  for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
-                    const int kab = K_A_BYTES * (lane / static_cast<int>(OZ2_FUSED_TILE)) + static_cast<int>(ku) * static_cast<int>(OZ2_FUSED_KBLK);
-#if defined(__gfx950__)
-                    long2_t sa = *reinterpret_cast<const long2_t*>(&A8i_lds[cur][0][wm][m_col][kab]);
-                    long2_t sb = *reinterpret_cast<const long2_t*>(&B8i_lds[cur][0][wn][m_col][kab]);
-                    v0 = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa, sb, v0, 0, 0, 0);
-#else
-                    int64_t sa = *reinterpret_cast<const int64_t*>(&A8i_lds[cur][0][wm][m_col][kab]);
-                    int64_t sb = *reinterpret_cast<const int64_t*>(&B8i_lds[cur][0][wn][m_col][kab]);
-                    v0 = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa, sb, v0, 0, 0, 0);
-#endif
-                  } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_0[e] = v0[e]; }
-                { v4i32 v1;
-                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) v1[e] = C32_1[e];
-                  for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
-                    const int kab = K_A_BYTES * (lane / static_cast<int>(OZ2_FUSED_TILE)) + static_cast<int>(ku) * static_cast<int>(OZ2_FUSED_KBLK);
-#if defined(__gfx950__)
-                    long2_t sa = *reinterpret_cast<const long2_t*>(&A8i_lds[cur][1][wm][m_col][kab]);
-                    long2_t sb = *reinterpret_cast<const long2_t*>(&B8i_lds[cur][1][wn][m_col][kab]);
-                    v1 = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa, sb, v1, 0, 0, 0);
-#else
-                    int64_t sa = *reinterpret_cast<const int64_t*>(&A8i_lds[cur][1][wm][m_col][kab]);
-                    int64_t sb = *reinterpret_cast<const int64_t*>(&B8i_lds[cur][1][wn][m_col][kab]);
-                    v1 = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa, sb, v1, 0, 0, 0);
-#endif
-                  } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_1[e] = v1[e]; }
+                apply_mfma(&A8i_lds[cur][0][wm][0][0], &B8i_lds[cur][0][wn][0][0], C32_0);
+                apply_mfma(&A8i_lds[cur][1][wm][0][0], &B8i_lds[cur][1][wn][0][0], C32_1);
                 #pragma unroll
                 for (int ls = 0; ls < AB_STEPS; ++ls) {
-                    *reinterpret_cast<int32_t*>(&A8i_lds[nxt][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_av[ls]*4]) = rA0[ls];
-                    *reinterpret_cast<int32_t*>(&A8i_lds[nxt][1][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_av[ls]*4]) = rA1[ls];
-                    *reinterpret_cast<int32_t*>(&B8i_lds[nxt][0][wn_ld_v[ls]][n_loc_v[ls]][k4_loc_bv[ls]*4]) = rB0[ls];
-                    *reinterpret_cast<int32_t*>(&B8i_lds[nxt][1][wn_ld_v[ls]][n_loc_v[ls]][k4_loc_bv[ls]*4]) = rB1[ls];
+                    *reinterpret_cast<int32_t*>(&A8i_lds[nxt][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_v[ls]*4]) = rA0[ls];
+                    *reinterpret_cast<int32_t*>(&A8i_lds[nxt][1][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_v[ls]*4]) = rA1[ls];
+                    *reinterpret_cast<int32_t*>(&B8i_lds[nxt][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_v[ls]*4]) = rB0[ls];
+                    *reinterpret_cast<int32_t*>(&B8i_lds[nxt][1][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_v[ls]*4]) = rB1[ls];
                 }
                 __syncthreads();
                 cur = nxt;
             }
             /* Epilogue */
-            { v4i32 v0;
-                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) v0[e] = C32_0[e];
-              for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
-                const int kab = K_A_BYTES*(lane/static_cast<int>(OZ2_FUSED_TILE))+static_cast<int>(ku)*static_cast<int>(OZ2_FUSED_KBLK);
-#if defined(__gfx950__)
-                long2_t sa = *reinterpret_cast<const long2_t*>(&A8i_lds[cur][0][wm][m_col][kab]);
-                long2_t sb = *reinterpret_cast<const long2_t*>(&B8i_lds[cur][0][wn][m_col][kab]);
-                v0 = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa, sb, v0, 0, 0, 0);
-#else
-                int64_t sa = *reinterpret_cast<const int64_t*>(&A8i_lds[cur][0][wm][m_col][kab]);
-                int64_t sb = *reinterpret_cast<const int64_t*>(&B8i_lds[cur][0][wn][m_col][kab]);
-                v0 = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa, sb, v0, 0, 0, 0);
-#endif
-              } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_0[e] = v0[e]; }
-            { v4i32 v1;
-                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) v1[e] = C32_1[e];
-              for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
-                const int kab = K_A_BYTES*(lane/static_cast<int>(OZ2_FUSED_TILE))+static_cast<int>(ku)*static_cast<int>(OZ2_FUSED_KBLK);
-#if defined(__gfx950__)
-                long2_t sa = *reinterpret_cast<const long2_t*>(&A8i_lds[cur][1][wm][m_col][kab]);
-                long2_t sb = *reinterpret_cast<const long2_t*>(&B8i_lds[cur][1][wn][m_col][kab]);
-                v1 = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa, sb, v1, 0, 0, 0);
-#else
-                int64_t sa = *reinterpret_cast<const int64_t*>(&A8i_lds[cur][1][wm][m_col][kab]);
-                int64_t sb = *reinterpret_cast<const int64_t*>(&B8i_lds[cur][1][wn][m_col][kab]);
-                v1 = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa, sb, v1, 0, 0, 0);
-#endif
-              } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_1[e] = v1[e]; }
+            apply_mfma(&A8i_lds[cur][0][wm][0][0], &B8i_lds[cur][0][wn][0][0], C32_0);
+            apply_mfma(&A8i_lds[cur][1][wm][0][0], &B8i_lds[cur][1][wn][0][0], C32_1);
         }
-        /* CRT for s and s+1 */
-        for (unsigned si = 0; si < 2; ++si) {
-            const unsigned sidx = s + si;
-            const double nm = cNegMod[sidx], im = cInvMod[sidx];
-            int32_t* C32x = (si == 0) ? C32_0 : C32_1;
-            for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) {
-                const double dc_raw = static_cast<double>(C32x[e]);
-                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-                const double hi     = dc * cQpiHi[sidx];
-                const double new_hi = Zhi[e] + hi;
-                const double err    = hi - (new_hi - Zhi[e]);
-                Zhi[e] = new_hi;
-                if constexpr (HAS_LO) Zlo[e] = fma(dc, cQpiLo[sidx], Zlo[e] + err);
-                else                  Zlo[e] += err;
-            }
-        }
+        /* CRT accumulation for moduli s and s+1. */
+        crt_update(C32_0, s);
+        crt_update(C32_1, s + 1);
     } /* end paired-moduli loop */
     /* Handle last modulus if S is odd (dead code for S=16). */
     if constexpr (S % 2 == 1) {
@@ -1948,8 +1928,8 @@ oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT
         if (k_int > 0) {
             #pragma unroll
             for (int ls = 0; ls < AB_STEPS; ++ls) {
-                *reinterpret_cast<int32_t*>(&A8i_lds[0][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_av[ls]*4]) = cond_load_a_fn(A8i_sl, ls, k4_loc_av[ls]*4);
-                *reinterpret_cast<int32_t*>(&B8i_lds[0][0][wn_ld_v[ls]][n_loc_v[ls]][k4_loc_bv[ls]*4]) = cond_load_b_fn(B8i_sl, ls, k4_loc_bv[ls]*4);
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_v[ls]*4]) = cond_load_a(A8i_sl, ls, k4_loc_v[ls]*4);
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_v[ls]*4]) = cond_load_b(B8i_sl, ls, k4_loc_v[ls]*4);
             }
             __syncthreads();
             int cur_sl = 0;
@@ -1957,56 +1937,20 @@ oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT
             const int8_t* Asl_base[AB_STEPS], *Bsl_base[AB_STEPS];
             #pragma unroll
             for (int ls = 0; ls < AB_STEPS; ++ls) {
-                Asl_base[ls] = A8i_sl + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_av[ls] * 4;
-                Bsl_base[ls] = B8i_sl + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_bv[ls] * 4;
+                Asl_base[ls] = A8i_sl + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_v[ls] * 4;
+                Bsl_base[ls] = B8i_sl + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_v[ls] * 4;
             }
             for (int k_off = 0; k_off + static_cast<int>(OZ2_FUSED_KBLK_LOAD) < k_int; k_off += static_cast<int>(OZ2_FUSED_KBLK_LOAD)) {
                 const int nxt_sl = 1 - cur_sl;
                 const int nxt_k = k_off + static_cast<int>(OZ2_FUSED_KBLK_LOAD);
                 for (int ls = 0; ls < AB_STEPS; ++ls) { rAsl[ls] = *reinterpret_cast<const int32_t*>(Asl_base[ls]+nxt_k); rBsl[ls] = *reinterpret_cast<const int32_t*>(Bsl_base[ls]+nxt_k); }
-                { v4i32 vd;
-                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) vd[e] = C32_sl[e];
-                  for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
-                    const int kab = K_A_BYTES*(lane/static_cast<int>(OZ2_FUSED_TILE))+static_cast<int>(ku)*static_cast<int>(OZ2_FUSED_KBLK);
-#if defined(__gfx950__)
-                    long2_t sa2 = *reinterpret_cast<const long2_t*>(&A8i_lds[cur_sl][0][wm][m_col][kab]);
-                    long2_t sb2 = *reinterpret_cast<const long2_t*>(&B8i_lds[cur_sl][0][wn][m_col][kab]);
-                    vd = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa2, sb2, vd, 0, 0, 0);
-#else
-                    int64_t sa2 = *reinterpret_cast<const int64_t*>(&A8i_lds[cur_sl][0][wm][m_col][kab]);
-                    int64_t sb2 = *reinterpret_cast<const int64_t*>(&B8i_lds[cur_sl][0][wn][m_col][kab]);
-                    vd = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa2, sb2, vd, 0, 0, 0);
-#endif
-                  } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_sl[e] = vd[e]; }
-                for (int ls = 0; ls < AB_STEPS; ++ls) { *reinterpret_cast<int32_t*>(&A8i_lds[nxt_sl][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_av[ls]*4])=rAsl[ls]; *reinterpret_cast<int32_t*>(&B8i_lds[nxt_sl][0][wn_ld_v[ls]][n_loc_v[ls]][k4_loc_bv[ls]*4])=rBsl[ls]; }
+                apply_mfma(&A8i_lds[cur_sl][0][wm][0][0], &B8i_lds[cur_sl][0][wn][0][0], C32_sl);
+                for (int ls = 0; ls < AB_STEPS; ++ls) { *reinterpret_cast<int32_t*>(&A8i_lds[nxt_sl][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_v[ls]*4])=rAsl[ls]; *reinterpret_cast<int32_t*>(&B8i_lds[nxt_sl][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_v[ls]*4])=rBsl[ls]; }
                 __syncthreads(); cur_sl = nxt_sl;
             }
-            { v4i32 vd;
-                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) vd[e] = C32_sl[e];
-              for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
-                const int kab = K_A_BYTES*(lane/static_cast<int>(OZ2_FUSED_TILE))+static_cast<int>(ku)*static_cast<int>(OZ2_FUSED_KBLK);
-#if defined(__gfx950__)
-                long2_t sa2 = *reinterpret_cast<const long2_t*>(&A8i_lds[cur_sl][0][wm][m_col][kab]);
-                long2_t sb2 = *reinterpret_cast<const long2_t*>(&B8i_lds[cur_sl][0][wn][m_col][kab]);
-                vd = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa2, sb2, vd, 0, 0, 0);
-#else
-                int64_t sa2 = *reinterpret_cast<const int64_t*>(&A8i_lds[cur_sl][0][wm][m_col][kab]);
-                int64_t sb2 = *reinterpret_cast<const int64_t*>(&B8i_lds[cur_sl][0][wn][m_col][kab]);
-                vd = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa2, sb2, vd, 0, 0, 0);
-#endif
-              } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_sl[e] = vd[e]; }
+            apply_mfma(&A8i_lds[cur_sl][0][wm][0][0], &B8i_lds[cur_sl][0][wn][0][0], C32_sl);
         }
-        const double nm_sl = cNegMod[s_last], im_sl = cInvMod[s_last];
-        for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) {
-            const double dc_raw = static_cast<double>(C32_sl[e]);
-            const double dc = fma(nm_sl, rint(dc_raw * im_sl), dc_raw);
-            const double hi = dc * cQpiHi[s_last];
-            const double nh = Zhi[e] + hi;
-            const double err = hi - (nh - Zhi[e]);
-            Zhi[e] = nh;
-            if constexpr (HAS_LO) Zlo[e] = fma(dc, cQpiLo[s_last], Zlo[e] + err);
-            else                  Zlo[e] += err;
-        }
+        crt_update(C32_sl, s_last);
     } /* end odd-S */
 
 
