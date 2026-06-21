@@ -2369,6 +2369,12 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
              * Works for all transpose combinations (A8i/B8i always in canonical format). */
             if (pm.t_fused_ms > 0.0 &&
                 pm.t_fused_ms < pm.t_int8_gemms_ms + pm.t_accum_ms) {
+                /* Zero A8i/B8i workspace padding so the fused kernel's double-buffer
+                 * prefetch reads zeros beyond k_int. */
+                if (static_cast<int>(k) % static_cast<int>(OZ2_FUSED_KBLK_LOAD) != 0) {
+                    (void)hipMemsetAsync(A8i, 0, szA8i, stream);
+                    (void)hipMemsetAsync(B8i, 0, szB8i, stream);
+                }
                 /* Fused path: run scale first, then MFMA+CRT fused kernel. */
                 for (unsigned scale_start = 0; scale_start < num_moduli; scale_start += scale_chunk_size) {
                     const unsigned scale_start_as = (scale_start + scale_chunk_size <= num_moduli)
