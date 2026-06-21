@@ -638,23 +638,13 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool tA, bool tB,
     const double t_host        = OZ2_HOST_OVERHEAD_MS * 1e-3;
     const double t_launch      = 0.0;   /* all launch overhead distributed into components above */
 
-    /* Fused TN kernel (TRANS_A=T, TRANS_B=N): reads pre-computed INT8 A8i/B8i from the
-     * workspace, performs MFMA + CRT accumulation, and writes FP64 D directly.
-     * Scale still runs separately (scale is fast; it is not the bottleneck).
-     * The fused kernel replaces only the INT8 GEMM + CRT accumulation steps, thereby
-     * eliminating the S×mn INT32 intermediate C32i matrices (~8 GB for m=n=8192, S=16).
-     *
-     * HBM traffic: S×(mk+kn) bytes INT8 reads + 16×mn bytes FP64 (C read + D write).
-     * Compute: S×2×mnk MFMA ops + S×8×mn FP64 CRT ops (no FP64→INT8 conversion).
-     * EFF_FUSED = 0.46: measured on MI300X (gfx942), KBLK=32.
-     * gfx950 (KBLK=64): recalibrate after hardware measurement. */
-    static constexpr double EFF_FUSED = 0.46;
+    /* Fused TN kernel: reads pre-computed INT8 A8i/B8i from workspace, performs
+     * MFMA + CRT accumulation, writes FP64 D directly.  Scale runs separately.  */
+    static constexpr double EFF_FUSED = 0.57;
     const double t_fused_bw   = (s * (mk + kn) + 16.0 * mn) / c0;  /* INT8 + FP64 C/D */
     const double t_fused_int8 = s * 2.0 * mnk / c2;                  /* MFMA              */
     const double t_fused_fp64 = s * 8.0 * mn / c1;                   /* CRT accum only    */
     const double t_fused_cmp  = t_fused_int8 + t_fused_fp64;
-    /* Fused kernel works for all transpose combinations: scale kernels write A8i/B8i in
-     * canonical k-fast format regardless of opA/opB, so the fused path is always valid. */
     const double t_fused = std::max(t_fused_bw, t_fused_cmp) / EFF_FUSED + LATENCY_KERNEL;
 
     /* Scale always runs.  Fused kernel replaces only GEMM + CRT accum. */
@@ -1663,9 +1653,12 @@ static constexpr unsigned OZ2_FUSED_KBLK = 64;
 static constexpr unsigned OZ2_FUSED_KBLK = 32;   /* default: gfx94x */
 #endif
 static constexpr unsigned OZ2_FUSED_NREG = 4;    /* INT32/FP64 output elements per wavefront  */
-static constexpr unsigned OZ2_FUSED_WM   = 4;    /* wavefronts in M direction per block       */
-static constexpr unsigned OZ2_FUSED_WN   = 4;    /* wavefronts in N direction per block       */
-/* macrotile = (WM×TILE) × (WN×TILE) = 64×64 per block; blockDim = WM×WN×64 = 1024          */
+static constexpr unsigned OZ2_FUSED_WM      = 4; /* wavefronts in M direction per block       */
+static constexpr unsigned OZ2_FUSED_WN      = 4; /* wavefronts in N direction per block       */
+/* macrotile = (WM×TILE) × (WN×TILE) = 64×64 per block; blockDim = WM×WN×64 = 1024         */
+static constexpr unsigned OZ2_FUSED_SWIZZLE = 4; /* super-tile swizzle factor                 */
+static constexpr unsigned OZ2_FUSED_KBLK_LOAD = 64;
+static constexpr unsigned OZ2_FUSED_K_UNROLL   = OZ2_FUSED_KBLK_LOAD / OZ2_FUSED_KBLK;
 
 /* Thread layout for v_mfma_i32_16x16x32_i8 (16×16 tile, 4 elements/thread):
  * Derived from AMD CDNA3 ISA §7.1.4 with M=16, N=16, K=32, B=1, H=4:
@@ -1725,8 +1718,8 @@ oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT
      * Layout [WM][TILE][KBLK]: k is stride-1, enabling 64-bit LDS reads.
      * A8i_lds[WM][TILE][KBLK] = 4×16×32 = 2048 bytes (one slice per M-wavefront row)
      * B8i_lds[WN][TILE][KBLK] = 4×16×32 = 2048 bytes (one slice per N-wavefront col) */
-    __shared__ int8_t A8i_lds[OZ2_FUSED_WM][OZ2_FUSED_TILE][OZ2_FUSED_KBLK];
-    __shared__ int8_t B8i_lds[OZ2_FUSED_WN][OZ2_FUSED_TILE][OZ2_FUSED_KBLK];
+    __shared__ int8_t A8i_lds[2][2][OZ2_FUSED_WM][OZ2_FUSED_TILE][OZ2_FUSED_KBLK_LOAD];
+    __shared__ int8_t B8i_lds[2][2][OZ2_FUSED_WN][OZ2_FUSED_TILE][OZ2_FUSED_KBLK_LOAD];
 
     /* Wavefront decomposition: blockDim = WM×WN×64 = 1024 threads.
      * wid = wavefront id (0..WM*WN-1), wm = M-index (0..WM-1), wn = N-index (0..WN-1)
@@ -1737,11 +1730,17 @@ oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT
     const int lane = static_cast<int>(threadIdx.x) % 64;
     const int k_int = static_cast<int>(k);
 
-    /* Block covers WM×TILE rows × WN×TILE cols; each wavefront gets one 32×32 sub-tile. */
-    const int block_m_base = static_cast<int>(blockIdx.x)
-                           * static_cast<int>(OZ2_FUSED_WM * OZ2_FUSED_TILE);
-    const int block_n_base = static_cast<int>(blockIdx.y)
-                           * static_cast<int>(OZ2_FUSED_WN * OZ2_FUSED_TILE);
+    /* Swizzled grid: blockIdx.x encodes (n_tile * SW + m_local), blockIdx.y encodes m_super. */
+    const int m_tiles_total = (static_cast<int>(m) + static_cast<int>(OZ2_FUSED_WM * OZ2_FUSED_TILE) - 1)
+                              / static_cast<int>(OZ2_FUSED_WM * OZ2_FUSED_TILE);
+    const int n_tiles_total = (static_cast<int>(n) + static_cast<int>(OZ2_FUSED_WN * OZ2_FUSED_TILE) - 1)
+                              / static_cast<int>(OZ2_FUSED_WN * OZ2_FUSED_TILE);
+    const int n_tile  = static_cast<int>(blockIdx.x) / static_cast<int>(OZ2_FUSED_SWIZZLE);
+    const int m_local = static_cast<int>(blockIdx.x) % static_cast<int>(OZ2_FUSED_SWIZZLE);
+    const int m_tile  = static_cast<int>(blockIdx.y) * static_cast<int>(OZ2_FUSED_SWIZZLE) + m_local;
+    if (m_tile >= m_tiles_total || n_tile >= n_tiles_total) return;
+    const int block_m_base = m_tile * static_cast<int>(OZ2_FUSED_WM * OZ2_FUSED_TILE);
+    const int block_n_base = n_tile * static_cast<int>(OZ2_FUSED_WN * OZ2_FUSED_TILE);
     const int m_base = block_m_base + wm * static_cast<int>(OZ2_FUSED_TILE);
     const int n_base = block_n_base + wn * static_cast<int>(OZ2_FUSED_TILE);
 
@@ -1757,104 +1756,259 @@ oz2_fused_TN_kernel(const int8_t*  __restrict__ A8i,   /* [S×lda8i×cola8i] INT
     double Zhi[OZ2_FUSED_NREG] = {};
     double Zlo[OZ2_FUSED_NREG] = {};
 
-    /* ── Loop over S moduli ────────────────────────────────────────────────── */
-    for (unsigned s = 0; s < S; ++s) {
-        const int8_t* A8i_s = A8i + s * stride_A_s;
-        const int8_t* B8i_s = B8i + s * stride_B_s;
+    /* ── Paired-moduli pipeline: process S moduli in pairs (S_INNER=2) ────────────────────
+     * Double-buffer + paired moduli: 2×2×4×16×64 = 32KB LDS (2 blocks/CU).
+     * Barriers: S/2 × k/KBLK_LOAD = 8×128 = 1024 per block (vs 2048 single-moduli).
+     * Per-barrier work: 2 moduli × K_UNROLL=2 MFMAs = 4 MFMAs (hidden with other wavefronts).
+     * Pre-computed base pointers eliminate per-iteration multiply in the hot k-loop.       */
+    constexpr int K4DIM   = static_cast<int>(OZ2_FUSED_KBLK_LOAD) / 4;
+    constexpr int BLK_THR = static_cast<int>(OZ2_FUSED_WM * OZ2_FUSED_WN * 64);
+    constexpr int AB_STEPS = (static_cast<int>(OZ2_FUSED_WM) * static_cast<int>(OZ2_FUSED_TILE) * K4DIM) / BLK_THR;
+    constexpr int K_A_BYTES = static_cast<int>(OZ2_FUSED_KBLK) / 4;
+    const int m_col = lane % static_cast<int>(OZ2_FUSED_TILE);
 
-        /* INT32 accumulator for this modulus (4 elements per thread). */
-        int32_t C32[OZ2_FUSED_NREG] = {};
+    int wm_ld_v[AB_STEPS], m_loc_v[AB_STEPS], k4_loc_av[AB_STEPS], mi_v[AB_STEPS];
+    int wn_ld_v[AB_STEPS], n_loc_v[AB_STEPS], k4_loc_bv[AB_STEPS], ni_v[AB_STEPS];
+    #pragma unroll
+    for (int ls = 0; ls < AB_STEPS; ++ls) {
+        const int flat   = static_cast<int>(threadIdx.x) + ls * BLK_THR;
+        wm_ld_v[ls]      = flat / (static_cast<int>(OZ2_FUSED_TILE) * K4DIM);
+        m_loc_v[ls]      = (flat % (static_cast<int>(OZ2_FUSED_TILE) * K4DIM)) / K4DIM;
+        k4_loc_av[ls]    = (flat % (static_cast<int>(OZ2_FUSED_TILE) * K4DIM)) % K4DIM;
+        mi_v[ls]         = block_m_base + wm_ld_v[ls] * static_cast<int>(OZ2_FUSED_TILE) + m_loc_v[ls];
+        wn_ld_v[ls]      = flat / (static_cast<int>(OZ2_FUSED_TILE) * K4DIM);
+        n_loc_v[ls]      = (flat % (static_cast<int>(OZ2_FUSED_TILE) * K4DIM)) / K4DIM;
+        k4_loc_bv[ls]    = (flat % (static_cast<int>(OZ2_FUSED_TILE) * K4DIM)) % K4DIM;
+        ni_v[ls]         = block_n_base + wn_ld_v[ls] * static_cast<int>(OZ2_FUSED_TILE) + n_loc_v[ls];
+    }
 
-        /* K-block loop — loads INT8 A/B tiles from workspace HBM → LDS. */
-        for (int k_off = 0; k_off < k_int; k_off += static_cast<int>(OZ2_FUSED_KBLK)) {
-
-            /* ── Cooperative loading: all WM×WN×64 = 1024 threads load all slices ──────
-             * A8i: WM×KBLK×TILE = 4×16×32 = 2048 elements / 1024 threads = 2 loads each.
-             * B8i: WN×KBLK×TILE = 4×16×32 = 2048 elements / 1024 threads = 2 loads each.
-             * After __syncthreads(), each wavefront (wm,wn) reads its own slice.         */
-            constexpr int BLOCK_THREADS = static_cast<int>(OZ2_FUSED_WM * OZ2_FUSED_WN * 64);
-            constexpr int A_STEPS = (OZ2_FUSED_WM * OZ2_FUSED_KBLK * OZ2_FUSED_TILE) / BLOCK_THREADS;
-            constexpr int B_STEPS = (OZ2_FUSED_WN * OZ2_FUSED_KBLK * OZ2_FUSED_TILE) / BLOCK_THREADS;
-
-            /* A-loading: k varies fast across warp → coalesced global reads.
-             * LDS layout [WM][TILE][KBLK]: write A8i_lds[wm_ld][m_loc][k_loc].
-             * Thread group writes consecutive bytes (m_loc slow, k_loc fast) →
-             * 2-way LDS bank conflict (optimal for 1-byte stores). */
-            for (int step = 0; step < A_STEPS; ++step) {
-                const int flat  = static_cast<int>(threadIdx.x) + step * BLOCK_THREADS;
-                const int wm_ld = flat / static_cast<int>(OZ2_FUSED_KBLK * OZ2_FUSED_TILE);
-                const int inner = flat % static_cast<int>(OZ2_FUSED_KBLK * OZ2_FUSED_TILE);
-                const int m_loc = inner / static_cast<int>(OZ2_FUSED_KBLK);  /* m-slow */
-                const int k_loc = inner % static_cast<int>(OZ2_FUSED_KBLK);  /* k-fast → coalesced */
-                const int ki    = k_off + k_loc;
-                const int mi    = block_m_base + wm_ld * static_cast<int>(OZ2_FUSED_TILE) + m_loc;
-                A8i_lds[wm_ld][m_loc][k_loc] = (ki < k_int && mi < static_cast<int>(m))
-                    ? A8i_s[static_cast<size_t>(mi) * lda8i + ki] : 0;
-            }
-
-            /* B-loading: same — k-fast coalesced global reads, [TILE][KBLK] LDS layout. */
-            for (int step = 0; step < B_STEPS; ++step) {
-                const int flat  = static_cast<int>(threadIdx.x) + step * BLOCK_THREADS;
-                const int wn_ld = flat / static_cast<int>(OZ2_FUSED_KBLK * OZ2_FUSED_TILE);
-                const int inner = flat % static_cast<int>(OZ2_FUSED_KBLK * OZ2_FUSED_TILE);
-                const int n_loc = inner / static_cast<int>(OZ2_FUSED_KBLK);  /* n-slow */
-                const int k_loc = inner % static_cast<int>(OZ2_FUSED_KBLK);  /* k-fast → coalesced */
-                const int ki    = k_off + k_loc;
-                const int ni    = block_n_base + wn_ld * static_cast<int>(OZ2_FUSED_TILE) + n_loc;
-                B8i_lds[wn_ld][n_loc][k_loc] = (ki < k_int && ni < static_cast<int>(n))
-                    ? B8i_s[static_cast<size_t>(ni) * ldb8i + ki] : 0;
-            }
-            __syncthreads();
-
-            /* Pack SRCA/SRCB from LDS: each lane reads OZ2_FUSED_KBLK/4 contiguous k-bytes.
-             *   gfx94x (KBLK=32): k_a_base = 8*(lane/16) ∈ {0,8,16,24} → DS_READ_B64
-             *   gfx95x (KBLK=64): k_a_base = 16*(lane/16) ∈ {0,16,32,48} → DS_READ_B128
-             * All offsets are naturally aligned for their respective read widths. */
-            constexpr int K_A_BYTES = static_cast<int>(OZ2_FUSED_KBLK) / 4;
-            const int k_a_base = K_A_BYTES * (lane / static_cast<int>(OZ2_FUSED_TILE));
-            const int m_col    = lane % static_cast<int>(OZ2_FUSED_TILE);
-            __syncthreads();
-
-            /* MFMA: C32 += A^T × B  (INT8 × INT8 → INT32).
-             * Instruction and SRCA/SRCB type are determined at compile time by the
-             * target architecture (OZ2_FUSED_KBLK is target-dependent). */
-            typedef int v4i32 __attribute__((ext_vector_type(4)));
-            v4i32 vdst;
-            #pragma unroll
-            for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) vdst[e] = C32[e];
-#if defined(__gfx950__)
-            /* gfx950: v_mfma_i32_16x16x64_i8 — 128-bit SRCA/SRCB (16 INT8 per lane). */
-            typedef long long2_t __attribute__((ext_vector_type(2)));
-            long2_t srca = *reinterpret_cast<const long2_t*>(&A8i_lds[wm][m_col][k_a_base]);
-            long2_t srcb = *reinterpret_cast<const long2_t*>(&B8i_lds[wn][m_col][k_a_base]);
-            vdst = __builtin_amdgcn_mfma_i32_16x16x64_i8(srca, srcb, vdst, 0, 0, 0);
-#else
-            /* gfx94x: v_mfma_i32_16x16x32_i8 — 64-bit SRCA/SRCB (8 INT8 per lane). */
-            int64_t srca = *reinterpret_cast<const int64_t*>(&A8i_lds[wm][m_col][k_a_base]);
-            int64_t srcb = *reinterpret_cast<const int64_t*>(&B8i_lds[wn][m_col][k_a_base]);
-            vdst = __builtin_amdgcn_mfma_i32_16x16x32_i8(srca, srcb, vdst, 0, 0, 0);
-#endif
-            #pragma unroll
-            for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32[e] = vdst[e];
-
-        } /* end k_block loop */
-
-        /* CRT accumulation: C32 → Zhi/Zlo (double-double).
-         * No #pragma unroll: unrolling 4 FP64-chain copies would add ~40 VGPRs of temporaries,
-         * crippling occupancy.  The scalar loop keeps VGPR pressure minimal. */
-        const double neg_mod = cNegMod[s];
-        const double inv_mod = cInvMod[s];
-        for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) {
-            const double dc_raw = static_cast<double>(C32[e]);
-            const double dc     = fma(neg_mod, rint(dc_raw * inv_mod), dc_raw);
-            const double hi     = dc * cQpiHi[s];
-            const double new_hi = Zhi[e] + hi;
-            const double err    = hi - (new_hi - Zhi[e]);
-            Zhi[e] = new_hi;
-            if constexpr (HAS_LO) Zlo[e] = fma(dc, cQpiLo[s], Zlo[e] + err);
-            else                   Zlo[e] += err;
+    auto cond_load_a_fn = [&](const int8_t* As, int ls, int ki) -> int32_t {
+        int32_t v = 0;
+        const int mi = mi_v[ls];
+        if (mi < static_cast<int>(m) && ki + 3 < k_int)
+            v = *reinterpret_cast<const int32_t*>(As + static_cast<size_t>(mi) * lda8i + ki);
+        else if (mi < static_cast<int>(m) && ki < k_int) {
+            const int8_t* p = As + static_cast<size_t>(mi) * lda8i + ki;
+            for (int b = 0; b < 4 && ki + b < k_int; ++b) reinterpret_cast<int8_t*>(&v)[b] = p[b];
         }
-    } /* end modulus loop */
+        return v;
+    };
+    auto cond_load_b_fn = [&](const int8_t* Bs, int ls, int ki) -> int32_t {
+        int32_t v = 0;
+        const int ni = ni_v[ls];
+        if (ni < static_cast<int>(n) && ki + 3 < k_int)
+            v = *reinterpret_cast<const int32_t*>(Bs + static_cast<size_t>(ni) * ldb8i + ki);
+        else if (ni < static_cast<int>(n) && ki < k_int) {
+            const int8_t* p = Bs + static_cast<size_t>(ni) * ldb8i + ki;
+            for (int b = 0; b < 4 && ki + b < k_int; ++b) reinterpret_cast<int8_t*>(&v)[b] = p[b];
+        }
+        return v;
+    };
+
+    typedef int v4i32 __attribute__((ext_vector_type(4)));
+#if defined(__gfx950__)
+    typedef long long2_t __attribute__((ext_vector_type(2)));
+#endif
+
+    for (unsigned s = 0; s + 1 < S; s += 2) {
+        const int8_t* A8i_s0 = A8i + s * stride_A_s;
+        const int8_t* B8i_s0 = B8i + s * stride_B_s;
+        const int8_t* A8i_s1 = A8i + (s + 1) * stride_A_s;
+        const int8_t* B8i_s1 = B8i + (s + 1) * stride_B_s;
+        int32_t C32_0[OZ2_FUSED_NREG] = {}, C32_1[OZ2_FUSED_NREG] = {};
+
+        if (k_int > 0) {
+            #pragma unroll
+            for (int ls = 0; ls < AB_STEPS; ++ls) {
+                const int ki0 = k4_loc_av[ls] * 4;
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][0][wm_ld_v[ls]][m_loc_v[ls]][ki0]) = cond_load_a_fn(A8i_s0, ls, ki0);
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][1][wm_ld_v[ls]][m_loc_v[ls]][ki0]) = cond_load_a_fn(A8i_s1, ls, ki0);
+            }
+            #pragma unroll
+            for (int ls = 0; ls < AB_STEPS; ++ls) {
+                const int ki0 = k4_loc_bv[ls] * 4;
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][0][wn_ld_v[ls]][n_loc_v[ls]][ki0]) = cond_load_b_fn(B8i_s0, ls, ki0);
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][1][wn_ld_v[ls]][n_loc_v[ls]][ki0]) = cond_load_b_fn(B8i_s1, ls, ki0);
+            }
+            __syncthreads();
+
+            const int8_t* A0_base[AB_STEPS], *A1_base[AB_STEPS], *B0_base[AB_STEPS], *B1_base[AB_STEPS];
+            #pragma unroll
+            for (int ls = 0; ls < AB_STEPS; ++ls) {
+                A0_base[ls] = A8i_s0 + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_av[ls] * 4;
+                A1_base[ls] = A8i_s1 + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_av[ls] * 4;
+                B0_base[ls] = B8i_s0 + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_bv[ls] * 4;
+                B1_base[ls] = B8i_s1 + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_bv[ls] * 4;
+            }
+            int32_t rA0[AB_STEPS], rA1[AB_STEPS], rB0[AB_STEPS], rB1[AB_STEPS];
+            int cur = 0;
+
+            for (int k_off = 0; k_off + static_cast<int>(OZ2_FUSED_KBLK_LOAD) < k_int;
+                 k_off += static_cast<int>(OZ2_FUSED_KBLK_LOAD)) {
+                const int nxt = 1 - cur;
+                const int nxt_k = k_off + static_cast<int>(OZ2_FUSED_KBLK_LOAD);
+                #pragma unroll
+                for (int ls = 0; ls < AB_STEPS; ++ls) {
+                    rA0[ls] = *reinterpret_cast<const int32_t*>(A0_base[ls] + nxt_k);
+                    rA1[ls] = *reinterpret_cast<const int32_t*>(A1_base[ls] + nxt_k);
+                    rB0[ls] = *reinterpret_cast<const int32_t*>(B0_base[ls] + nxt_k);
+                    rB1[ls] = *reinterpret_cast<const int32_t*>(B1_base[ls] + nxt_k);
+                }
+                { v4i32 v0;
+                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) v0[e] = C32_0[e];
+                  for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
+                    const int kab = K_A_BYTES * (lane / static_cast<int>(OZ2_FUSED_TILE)) + static_cast<int>(ku) * static_cast<int>(OZ2_FUSED_KBLK);
+#if defined(__gfx950__)
+                    long2_t sa = *reinterpret_cast<const long2_t*>(&A8i_lds[cur][0][wm][m_col][kab]);
+                    long2_t sb = *reinterpret_cast<const long2_t*>(&B8i_lds[cur][0][wn][m_col][kab]);
+                    v0 = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa, sb, v0, 0, 0, 0);
+#else
+                    int64_t sa = *reinterpret_cast<const int64_t*>(&A8i_lds[cur][0][wm][m_col][kab]);
+                    int64_t sb = *reinterpret_cast<const int64_t*>(&B8i_lds[cur][0][wn][m_col][kab]);
+                    v0 = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa, sb, v0, 0, 0, 0);
+#endif
+                  } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_0[e] = v0[e]; }
+                { v4i32 v1;
+                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) v1[e] = C32_1[e];
+                  for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
+                    const int kab = K_A_BYTES * (lane / static_cast<int>(OZ2_FUSED_TILE)) + static_cast<int>(ku) * static_cast<int>(OZ2_FUSED_KBLK);
+#if defined(__gfx950__)
+                    long2_t sa = *reinterpret_cast<const long2_t*>(&A8i_lds[cur][1][wm][m_col][kab]);
+                    long2_t sb = *reinterpret_cast<const long2_t*>(&B8i_lds[cur][1][wn][m_col][kab]);
+                    v1 = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa, sb, v1, 0, 0, 0);
+#else
+                    int64_t sa = *reinterpret_cast<const int64_t*>(&A8i_lds[cur][1][wm][m_col][kab]);
+                    int64_t sb = *reinterpret_cast<const int64_t*>(&B8i_lds[cur][1][wn][m_col][kab]);
+                    v1 = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa, sb, v1, 0, 0, 0);
+#endif
+                  } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_1[e] = v1[e]; }
+                #pragma unroll
+                for (int ls = 0; ls < AB_STEPS; ++ls) {
+                    *reinterpret_cast<int32_t*>(&A8i_lds[nxt][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_av[ls]*4]) = rA0[ls];
+                    *reinterpret_cast<int32_t*>(&A8i_lds[nxt][1][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_av[ls]*4]) = rA1[ls];
+                    *reinterpret_cast<int32_t*>(&B8i_lds[nxt][0][wn_ld_v[ls]][n_loc_v[ls]][k4_loc_bv[ls]*4]) = rB0[ls];
+                    *reinterpret_cast<int32_t*>(&B8i_lds[nxt][1][wn_ld_v[ls]][n_loc_v[ls]][k4_loc_bv[ls]*4]) = rB1[ls];
+                }
+                __syncthreads();
+                cur = nxt;
+            }
+            /* Epilogue */
+            { v4i32 v0;
+                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) v0[e] = C32_0[e];
+              for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
+                const int kab = K_A_BYTES*(lane/static_cast<int>(OZ2_FUSED_TILE))+static_cast<int>(ku)*static_cast<int>(OZ2_FUSED_KBLK);
+#if defined(__gfx950__)
+                long2_t sa = *reinterpret_cast<const long2_t*>(&A8i_lds[cur][0][wm][m_col][kab]);
+                long2_t sb = *reinterpret_cast<const long2_t*>(&B8i_lds[cur][0][wn][m_col][kab]);
+                v0 = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa, sb, v0, 0, 0, 0);
+#else
+                int64_t sa = *reinterpret_cast<const int64_t*>(&A8i_lds[cur][0][wm][m_col][kab]);
+                int64_t sb = *reinterpret_cast<const int64_t*>(&B8i_lds[cur][0][wn][m_col][kab]);
+                v0 = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa, sb, v0, 0, 0, 0);
+#endif
+              } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_0[e] = v0[e]; }
+            { v4i32 v1;
+                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) v1[e] = C32_1[e];
+              for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
+                const int kab = K_A_BYTES*(lane/static_cast<int>(OZ2_FUSED_TILE))+static_cast<int>(ku)*static_cast<int>(OZ2_FUSED_KBLK);
+#if defined(__gfx950__)
+                long2_t sa = *reinterpret_cast<const long2_t*>(&A8i_lds[cur][1][wm][m_col][kab]);
+                long2_t sb = *reinterpret_cast<const long2_t*>(&B8i_lds[cur][1][wn][m_col][kab]);
+                v1 = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa, sb, v1, 0, 0, 0);
+#else
+                int64_t sa = *reinterpret_cast<const int64_t*>(&A8i_lds[cur][1][wm][m_col][kab]);
+                int64_t sb = *reinterpret_cast<const int64_t*>(&B8i_lds[cur][1][wn][m_col][kab]);
+                v1 = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa, sb, v1, 0, 0, 0);
+#endif
+              } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_1[e] = v1[e]; }
+        }
+        /* CRT for s and s+1 */
+        for (unsigned si = 0; si < 2; ++si) {
+            const unsigned sidx = s + si;
+            const double nm = cNegMod[sidx], im = cInvMod[sidx];
+            int32_t* C32x = (si == 0) ? C32_0 : C32_1;
+            for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) {
+                const double dc_raw = static_cast<double>(C32x[e]);
+                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
+                const double hi     = dc * cQpiHi[sidx];
+                const double new_hi = Zhi[e] + hi;
+                const double err    = hi - (new_hi - Zhi[e]);
+                Zhi[e] = new_hi;
+                if constexpr (HAS_LO) Zlo[e] = fma(dc, cQpiLo[sidx], Zlo[e] + err);
+                else                  Zlo[e] += err;
+            }
+        }
+    } /* end paired-moduli loop */
+    /* Handle last modulus if S is odd (dead code for S=16). */
+    if constexpr (S % 2 == 1) {
+        constexpr unsigned s_last = S - 1;
+        const int8_t* A8i_sl = A8i + s_last * stride_A_s;
+        const int8_t* B8i_sl = B8i + s_last * stride_B_s;
+        int32_t C32_sl[OZ2_FUSED_NREG] = {};
+        if (k_int > 0) {
+            #pragma unroll
+            for (int ls = 0; ls < AB_STEPS; ++ls) {
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_av[ls]*4]) = cond_load_a_fn(A8i_sl, ls, k4_loc_av[ls]*4);
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][0][wn_ld_v[ls]][n_loc_v[ls]][k4_loc_bv[ls]*4]) = cond_load_b_fn(B8i_sl, ls, k4_loc_bv[ls]*4);
+            }
+            __syncthreads();
+            int cur_sl = 0;
+            int32_t rAsl[AB_STEPS], rBsl[AB_STEPS];
+            const int8_t* Asl_base[AB_STEPS], *Bsl_base[AB_STEPS];
+            #pragma unroll
+            for (int ls = 0; ls < AB_STEPS; ++ls) {
+                Asl_base[ls] = A8i_sl + static_cast<size_t>(mi_v[ls]) * lda8i + k4_loc_av[ls] * 4;
+                Bsl_base[ls] = B8i_sl + static_cast<size_t>(ni_v[ls]) * ldb8i + k4_loc_bv[ls] * 4;
+            }
+            for (int k_off = 0; k_off + static_cast<int>(OZ2_FUSED_KBLK_LOAD) < k_int; k_off += static_cast<int>(OZ2_FUSED_KBLK_LOAD)) {
+                const int nxt_sl = 1 - cur_sl;
+                const int nxt_k = k_off + static_cast<int>(OZ2_FUSED_KBLK_LOAD);
+                for (int ls = 0; ls < AB_STEPS; ++ls) { rAsl[ls] = *reinterpret_cast<const int32_t*>(Asl_base[ls]+nxt_k); rBsl[ls] = *reinterpret_cast<const int32_t*>(Bsl_base[ls]+nxt_k); }
+                { v4i32 vd;
+                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) vd[e] = C32_sl[e];
+                  for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
+                    const int kab = K_A_BYTES*(lane/static_cast<int>(OZ2_FUSED_TILE))+static_cast<int>(ku)*static_cast<int>(OZ2_FUSED_KBLK);
+#if defined(__gfx950__)
+                    long2_t sa2 = *reinterpret_cast<const long2_t*>(&A8i_lds[cur_sl][0][wm][m_col][kab]);
+                    long2_t sb2 = *reinterpret_cast<const long2_t*>(&B8i_lds[cur_sl][0][wn][m_col][kab]);
+                    vd = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa2, sb2, vd, 0, 0, 0);
+#else
+                    int64_t sa2 = *reinterpret_cast<const int64_t*>(&A8i_lds[cur_sl][0][wm][m_col][kab]);
+                    int64_t sb2 = *reinterpret_cast<const int64_t*>(&B8i_lds[cur_sl][0][wn][m_col][kab]);
+                    vd = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa2, sb2, vd, 0, 0, 0);
+#endif
+                  } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_sl[e] = vd[e]; }
+                for (int ls = 0; ls < AB_STEPS; ++ls) { *reinterpret_cast<int32_t*>(&A8i_lds[nxt_sl][0][wm_ld_v[ls]][m_loc_v[ls]][k4_loc_av[ls]*4])=rAsl[ls]; *reinterpret_cast<int32_t*>(&B8i_lds[nxt_sl][0][wn_ld_v[ls]][n_loc_v[ls]][k4_loc_bv[ls]*4])=rBsl[ls]; }
+                __syncthreads(); cur_sl = nxt_sl;
+            }
+            { v4i32 vd;
+                  for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) vd[e] = C32_sl[e];
+              for (unsigned ku = 0; ku < OZ2_FUSED_K_UNROLL; ++ku) {
+                const int kab = K_A_BYTES*(lane/static_cast<int>(OZ2_FUSED_TILE))+static_cast<int>(ku)*static_cast<int>(OZ2_FUSED_KBLK);
+#if defined(__gfx950__)
+                long2_t sa2 = *reinterpret_cast<const long2_t*>(&A8i_lds[cur_sl][0][wm][m_col][kab]);
+                long2_t sb2 = *reinterpret_cast<const long2_t*>(&B8i_lds[cur_sl][0][wn][m_col][kab]);
+                vd = __builtin_amdgcn_mfma_i32_16x16x64_i8(sa2, sb2, vd, 0, 0, 0);
+#else
+                int64_t sa2 = *reinterpret_cast<const int64_t*>(&A8i_lds[cur_sl][0][wm][m_col][kab]);
+                int64_t sb2 = *reinterpret_cast<const int64_t*>(&B8i_lds[cur_sl][0][wn][m_col][kab]);
+                vd = __builtin_amdgcn_mfma_i32_16x16x32_i8(sa2, sb2, vd, 0, 0, 0);
+#endif
+              } for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) C32_sl[e] = vd[e]; }
+        }
+        const double nm_sl = cNegMod[s_last], im_sl = cInvMod[s_last];
+        for (int e = 0; e < static_cast<int>(OZ2_FUSED_NREG); ++e) {
+            const double dc_raw = static_cast<double>(C32_sl[e]);
+            const double dc = fma(nm_sl, rint(dc_raw * im_sl), dc_raw);
+            const double hi = dc * cQpiHi[s_last];
+            const double nh = Zhi[e] + hi;
+            const double err = hi - (nh - Zhi[e]);
+            Zhi[e] = nh;
+            if constexpr (HAS_LO) Zlo[e] = fma(dc, cQpiLo[s_last], Zlo[e] + err);
+            else                  Zlo[e] += err;
+        }
+    } /* end odd-S */
+
 
     /* Finalize: range reduction + inverse scale + write D.
      * ri computed inline from lane_row_base (precomputed above) to keep VGPRs free
@@ -1897,11 +2051,13 @@ oz2_launch_fused_TN(const int8_t*  A8i,    /* workspace INT8 A (all S moduli sta
 
     /* Grid: each block covers WM×TILE × WN×TILE = 128×128 output.
      * Block: WM×WN×64 = 1024 threads (16 wavefronts sharing LDS). */
+    const unsigned m_tiles = static_cast<unsigned>((m + OZ2_FUSED_WM * OZ2_FUSED_TILE - 1)
+                                                   / (OZ2_FUSED_WM * OZ2_FUSED_TILE));
+    const unsigned n_tiles = static_cast<unsigned>((n + OZ2_FUSED_WN * OZ2_FUSED_TILE - 1)
+                                                   / (OZ2_FUSED_WN * OZ2_FUSED_TILE));
     const dim3 grid(
-        static_cast<unsigned>((m + OZ2_FUSED_WM * OZ2_FUSED_TILE - 1)
-                             / (OZ2_FUSED_WM * OZ2_FUSED_TILE)),
-        static_cast<unsigned>((n + OZ2_FUSED_WN * OZ2_FUSED_TILE - 1)
-                             / (OZ2_FUSED_WN * OZ2_FUSED_TILE)));
+        OZ2_FUSED_SWIZZLE * n_tiles,
+        (m_tiles + OZ2_FUSED_SWIZZLE - 1) / OZ2_FUSED_SWIZZLE);
     const dim3 block(OZ2_FUSED_WM * OZ2_FUSED_WN * 64);  /* 1024 threads = 16 wavefronts */
     const bool has_lo = (num_moduli > 7u);
 
