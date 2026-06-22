@@ -2173,14 +2173,21 @@ static const char* oz2_profile_file()
     return fn;
 }
 
-/* If HIPBLASLT_EMULATION_FUSED=force, always take the fused kernel path
- * regardless of what the performance model predicts.  Useful for benchmarking
- * and tuning the fused kernel in isolation.                                   */
-static bool oz2_force_fused()
+/* HIPBLASLT_EMULATION_FUSED controls whether the fused MFMA+CRT kernel is used:
+ *   "on"  / "force"      → always use fused (bypasses performance model)
+ *   "off" / "never"      → never  use fused (forces non-fused path)
+ *   "auto"/ "performant" → performance model decides (default)               */
+enum class Oz2FusedMode { AUTO, ON, OFF };
+static Oz2FusedMode oz2_fused_mode()
 {
-    static const bool v = []() -> bool {
+    static const Oz2FusedMode v = []() -> Oz2FusedMode {
         const char* e = std::getenv("HIPBLASLT_EMULATION_FUSED");
-        return e != nullptr && std::strcmp(e, "force") == 0;
+        if (e == nullptr) return Oz2FusedMode::AUTO;
+        if (std::strcmp(e, "on") == 0 || std::strcmp(e, "force") == 0)
+            return Oz2FusedMode::ON;
+        if (std::strcmp(e, "off") == 0 || std::strcmp(e, "never") == 0)
+            return Oz2FusedMode::OFF;
+        return Oz2FusedMode::AUTO;   /* "auto", "performant", or unrecognized */
     }();
     return v;
 }
@@ -2504,10 +2511,14 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
             const Fp64PerfModelTimes pm =
                 fp64EmulationPerfModelTimes(tA, tB, m, n, k, num_moduli, dev);
             /* Gate: fused replaces only INT8 GEMM + accum; scale always runs.
-             * Works for all transpose combinations (A8i/B8i always in canonical format). */
-            if (oz2_force_fused() ||
-                (pm.t_fused_ms > 0.0 &&
-                 pm.t_fused_ms < pm.t_int8_gemms_ms + pm.t_accum_ms)) {
+             * Works for all transpose combinations (A8i/B8i always in canonical format).
+             * HIPBLASLT_EMULATION_FUSED=off disables the fused path entirely;
+             * HIPBLASLT_EMULATION_FUSED=on/force forces it regardless of perf model. */
+            const Oz2FusedMode fused_mode = oz2_fused_mode();
+            if (fused_mode != Oz2FusedMode::OFF &&
+                (fused_mode == Oz2FusedMode::ON ||
+                 (pm.t_fused_ms > 0.0 &&
+                  pm.t_fused_ms < pm.t_int8_gemms_ms + pm.t_accum_ms))) {
                 /* Zero A8i/B8i workspace padding so the fused kernel's double-buffer
                  * prefetch reads zeros beyond k_int. */
                 /* Zero workspace padding so the fused kernel's double-buffer prefetch
