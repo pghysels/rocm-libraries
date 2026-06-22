@@ -1660,8 +1660,9 @@ static constexpr unsigned OZ2_KBLK_32 = 32u;
 static constexpr unsigned OZ2_KBLK_16 = 32u;
 static constexpr unsigned OZ2_KBLK_32 = 16u;
 #endif
-/* Maximum KBLK_LOAD across all kernel variants — used for workspace-zero guard */
-static constexpr unsigned OZ2_FUSED_KBLK_LOAD_MAX = OZ2_KBLK_16 * 2u;
+/* Maximum KBLK_LOAD across all kernel variants — used for workspace-zero guard.
+ * With K_UNROLL up to 4, the largest KBLK_LOAD is OZ2_KBLK_16 * 4.         */
+static constexpr unsigned OZ2_FUSED_KBLK_LOAD_MAX = OZ2_KBLK_16 * 4u;
 
 /* MFMA output vector types */
 typedef int v4i32  __attribute__((ext_vector_type(4)));
@@ -1730,7 +1731,20 @@ oz2_fused_TN_kernel(
     /* ── Derived compile-time constants ────────────────────────────────────── */
     static constexpr unsigned NREG      = TILE * TILE / 64u;    /* 4 (TILE=16) or 16 (TILE=32) */
     static constexpr unsigned KBLK      = (TILE == 16u) ? OZ2_KBLK_16 : OZ2_KBLK_32;
-    static constexpr unsigned KBLK_LOAD = KBLK * 2u;            /* K_UNROLL = 2  */
+    /* K-loop unroll factor (analogous to DepthU in TensisLite):
+     * K_UNROLL=4 doubles KBLK_LOAD, halves k-loop __syncthreads count, and
+     * provides 4 back-to-back MFMAs per barrier interval (vs 2) for better
+     * instruction-level parallelism.  Suppressed when LDS budget (including
+     * sftA/B caches) would exceed 63 KB.
+     *   TILE=32, WM=4/2, gfx94x: LDS(K4)≈25KB → K_UNROLL=4 ✓
+     *   TILE=16, WM=WN=4, gfx94x: LDS(K4)≈33KB → K_UNROLL=4 ✓
+     *   TILE=32, WM=4/2, gfx95x: LDS(K4)≈50KB → K_UNROLL=4 ✓
+     *   TILE=16, WM=WN=4, gfx95x: LDS(K4)>64KB → K_UNROLL=2 (fallback)   */
+    static constexpr size_t   LDS_MFMA_K4 = 2u * (WM * TILE * (KBLK * 4u)
+                                                  + WN * TILE * (KBLK * 4u));
+    static constexpr size_t   LDS_SFT     = static_cast<size_t>((WM + WN) * TILE * 2u);
+    static constexpr unsigned K_UNROLL    = (LDS_MFMA_K4 + LDS_SFT <= 63u * 1024u) ? 4u : 2u;
+    static constexpr unsigned KBLK_LOAD   = KBLK * K_UNROLL;
     /* Source register size (bytes): KBLK × TILE / 64.
      * Equals sizeof(oz2_mfma_src16_t) on each architecture.
      *   gfx94x: TILE=16 → 32×16/64=8, TILE=32 → 16×32/64=8  (int64_t)
@@ -1760,8 +1774,9 @@ oz2_fused_TN_kernel(
     static_assert(A_STEPS >= 1u && B_STEPS >= 1u, "cooperative load steps must be positive");
 
     /* ── Static LDS (double-buffered, no paired-moduli dimension) ─────────────
-     * TILE=16, WM=WN=4, gfx94x (K_A_BYTES=8): A=[2][4][16][72]=9KB  B=9KB  → 18KB total
-     * TILE=32, WM=4,WN=2, gfx94x (K_A_BYTES=8): A=[2][4][32][40]=10KB  B=5KB → 15KB total
+     * K_UNROLL=4 examples (gfx94x, KBLK_PAD=K_A_BYTES=8):
+     *   TILE=16, WM=WN=4: A=[2][4][16][136]=17KB  B=17KB  → 34KB + sft ≈ 34.3KB
+     *   TILE=32, WM=4,WN=2: A=[2][4][32][72]=18KB  B=[2][2][32][72]=9KB → 27KB + sft ≈ 27.4KB
      * (KBLK_PAD=K_A_BYTES per row restores alignment and eliminates bank conflicts) */
     __shared__ int8_t  A8i_lds[2][WM][TILE][KBLK_STRIDE];
     __shared__ int8_t  B8i_lds[2][WN][TILE][KBLK_STRIDE];
@@ -1905,10 +1920,10 @@ oz2_fused_TN_kernel(
         if constexpr (TILE == 16u) {
             v4i32 vx;
             for (unsigned e = 0; e < NREG; ++e) vx[static_cast<int>(e)] = C32[e];
-            for (unsigned ku = 0; ku < 2u; ++ku) {
+            for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
                 const int kab = k_base + static_cast<int>(ku * KBLK);
                 /* Use KBLK_STRIDE (not KBLK_LOAD) as the LDS row stride so that
-                 * the 4-byte padding per row (KBLK_PAD) is accounted for.       */
+                 * the K_A_BYTES padding per row (KBLK_PAD) is accounted for.    */
                 const auto sa = *reinterpret_cast<const oz2_mfma_src16_t*>(
                     A_wm_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
                 const auto sb = *reinterpret_cast<const oz2_mfma_src16_t*>(
@@ -1919,7 +1934,7 @@ oz2_fused_TN_kernel(
         } else {
             v16i32 vx;
             for (unsigned e = 0; e < NREG; ++e) vx[static_cast<int>(e)] = C32[e];
-            for (unsigned ku = 0; ku < 2u; ++ku) {
+            for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
                 const int kab = k_base + static_cast<int>(ku * KBLK);
                 const auto sa = *reinterpret_cast<const oz2_mfma_src32_t*>(
                     A_wm_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
