@@ -1736,6 +1736,22 @@ oz2_fused_TN_kernel(
      *   gfx94x: TILE=16 → 32×16/64=8, TILE=32 → 16×32/64=8  (int64_t)
      *   gfx95x: TILE=16 → 64×16/64=16, TILE=32 → 32×32/64=16 (long2)  */
     static constexpr unsigned K_A_BYTES = KBLK * TILE / 64u;
+    /* KBLK_PAD must be a multiple of K_A_BYTES (= the MFMA source read width in
+     * bytes) to keep every LDS row naturally aligned for ds_read_b64 / ds_read_b128.
+     * Using exactly K_A_BYTES is the minimum aligned padding that also breaks the
+     * power-of-two row stride and eliminates LDS bank conflicts:
+     *
+     *   TILE=32 gfx94x: stride 32→40, GCD(10,64)=2, period 32 = wavefront half → 0 conflicts
+     *   TILE=16 gfx94x: stride 64→72, GCD(18,64)=2, period 32 ≥ TILE=16       → 0 conflicts
+     *   TILE=32 gfx95x: stride 64→80, GCD(20,64)=4, period 16 → 2-way (acceptable)
+     *   TILE=16 gfx95x: skip (LDS budget, see guard below)
+     *
+     * The padding is suppressed when it would push the block's LDS usage above 63 KB. */
+    static constexpr size_t   LDS_BYTES_OLD = 2u * (WM * TILE * KBLK_LOAD
+                                                   + WN * TILE * KBLK_LOAD);
+    static constexpr unsigned KBLK_PAD    = (LDS_BYTES_OLD + K_A_BYTES * TILE * (WM + WN) * 2u
+                                             <= 63u * 1024u) ? K_A_BYTES : 0u;
+    static constexpr unsigned KBLK_STRIDE = KBLK_LOAD + KBLK_PAD;
     static constexpr unsigned BLK_THR   = WM * WN * 64u;
     static constexpr unsigned K4DIM     = KBLK_LOAD / 4u;
     /* Cooperative-load steps per thread (A and B differ for asymmetric WM≠WN) */
@@ -1744,10 +1760,11 @@ oz2_fused_TN_kernel(
     static_assert(A_STEPS >= 1u && B_STEPS >= 1u, "cooperative load steps must be positive");
 
     /* ── Static LDS (double-buffered, no paired-moduli dimension) ─────────────
-     * TILE=16, WM=WN=4: A=[2][4][16][64]=8KB  B=[2][4][16][64]=8KB  → 16KB total
-     * TILE=32, WM=4,WN=2: A=[2][4][32][32]=8KB  B=[2][2][32][32]=4KB  → 12KB total */
-    __shared__ int8_t A8i_lds[2][WM][TILE][KBLK_LOAD];
-    __shared__ int8_t B8i_lds[2][WN][TILE][KBLK_LOAD];
+     * TILE=16, WM=WN=4, gfx94x (K_A_BYTES=8): A=[2][4][16][72]=9KB  B=9KB  → 18KB total
+     * TILE=32, WM=4,WN=2, gfx94x (K_A_BYTES=8): A=[2][4][32][40]=10KB  B=5KB → 15KB total
+     * (KBLK_PAD=K_A_BYTES per row restores alignment and eliminates bank conflicts) */
+    __shared__ int8_t A8i_lds[2][WM][TILE][KBLK_STRIDE];
+    __shared__ int8_t B8i_lds[2][WN][TILE][KBLK_STRIDE];
 
     /* ── Thread decomposition ───────────────────────────────────────────────── */
     const int wid  = static_cast<int>(threadIdx.x) / 64;
@@ -1855,10 +1872,12 @@ oz2_fused_TN_kernel(
             for (unsigned e = 0; e < NREG; ++e) vx[static_cast<int>(e)] = C32[e];
             for (unsigned ku = 0; ku < 2u; ++ku) {
                 const int kab = k_base + static_cast<int>(ku * KBLK);
+                /* Use KBLK_STRIDE (not KBLK_LOAD) as the LDS row stride so that
+                 * the 4-byte padding per row (KBLK_PAD) is accounted for.       */
                 const auto sa = *reinterpret_cast<const oz2_mfma_src16_t*>(
-                    A_wm_slot + m_col * static_cast<int>(KBLK_LOAD) + kab);
+                    A_wm_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
                 const auto sb = *reinterpret_cast<const oz2_mfma_src16_t*>(
-                    B_wn_slot + m_col * static_cast<int>(KBLK_LOAD) + kab);
+                    B_wn_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
                 vx = oz2_do_mfma_16(sa, sb, vx);
             }
             for (unsigned e = 0; e < NREG; ++e) C32[e] = vx[static_cast<int>(e)];
@@ -1868,9 +1887,9 @@ oz2_fused_TN_kernel(
             for (unsigned ku = 0; ku < 2u; ++ku) {
                 const int kab = k_base + static_cast<int>(ku * KBLK);
                 const auto sa = *reinterpret_cast<const oz2_mfma_src32_t*>(
-                    A_wm_slot + m_col * static_cast<int>(KBLK_LOAD) + kab);
+                    A_wm_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
                 const auto sb = *reinterpret_cast<const oz2_mfma_src32_t*>(
-                    B_wn_slot + m_col * static_cast<int>(KBLK_LOAD) + kab);
+                    B_wn_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
                 vx = oz2_do_mfma_32(sa, sb, vx);
             }
             for (unsigned e = 0; e < NREG; ++e) C32[e] = vx[static_cast<int>(e)];
