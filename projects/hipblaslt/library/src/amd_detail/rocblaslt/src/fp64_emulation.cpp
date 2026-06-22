@@ -1739,10 +1739,13 @@ oz2_fused_TN_kernel(
      *   TILE=32, WM=4/2, gfx94x: LDS(K4)≈25KB → K_UNROLL=4 ✓
      *   TILE=16, WM=WN=4, gfx94x: LDS(K4)≈33KB → K_UNROLL=4 ✓
      *   TILE=32, WM=4/2, gfx95x: LDS(K4)≈50KB → K_UNROLL=4 ✓
-     *   TILE=16, WM=WN=4, gfx95x: LDS(K4)>64KB → K_UNROLL=2 (fallback)   */
+     *   TILE=16, WM=WN=4, gfx95x: LDS(K4)>64KB → K_UNROLL=2 (fallback)    */
     static constexpr size_t   LDS_MFMA_K4 = 2u * (WM * TILE * (KBLK * 4u)
                                                   + WN * TILE * (KBLK * 4u));
     static constexpr size_t   LDS_SFT     = static_cast<size_t>((WM + WN) * TILE * 2u);
+    /* K_UNROLL=8 was tested but causes VGPR regression (A_STEPS doubles 4→8,
+     * total VGPRs ~120→196, SIMD occupancy drops ~4→2 wavefronts).  K_UNROLL=4
+     * is the sweet spot: halves syncs vs K_UNROLL=2 without VGPR explosion.   */
     static constexpr unsigned K_UNROLL    = (LDS_MFMA_K4 + LDS_SFT <= 63u * 1024u) ? 4u : 2u;
     static constexpr unsigned KBLK_LOAD   = KBLK * K_UNROLL;
     /* Source register size (bytes): KBLK × TILE / 64.
@@ -1774,9 +1777,9 @@ oz2_fused_TN_kernel(
     static_assert(A_STEPS >= 1u && B_STEPS >= 1u, "cooperative load steps must be positive");
 
     /* ── Static LDS (double-buffered, no paired-moduli dimension) ─────────────
-     * K_UNROLL=4 examples (gfx94x, KBLK_PAD=K_A_BYTES=8):
-     *   TILE=16, WM=WN=4: A=[2][4][16][136]=17KB  B=17KB  → 34KB + sft ≈ 34.3KB
-     *   TILE=32, WM=4,WN=2: A=[2][4][32][72]=18KB  B=[2][2][32][72]=9KB → 27KB + sft ≈ 27.4KB
+     * LDS sizes with K_UNROLL (gfx94x, KBLK_PAD=K_A_BYTES=8):
+     *   TILE=32, WM=4,WN=2, K_UNROLL=8: A=[2][4][32][136]=34KB  B=[2][2][32][136]=17KB → 51KB
+     *   TILE=16, WM=WN=4,   K_UNROLL=4: A=[2][4][16][136]=17KB  B=17KB               → 34KB
      * (KBLK_PAD=K_A_BYTES per row restores alignment and eliminates bank conflicts) */
     __shared__ int8_t  A8i_lds[2][WM][TILE][KBLK_STRIDE];
     __shared__ int8_t  B8i_lds[2][WN][TILE][KBLK_STRIDE];
