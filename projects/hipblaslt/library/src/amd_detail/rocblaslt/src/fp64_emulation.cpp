@@ -1763,8 +1763,13 @@ oz2_fused_TN_kernel(
      * TILE=16, WM=WN=4, gfx94x (K_A_BYTES=8): A=[2][4][16][72]=9KB  B=9KB  → 18KB total
      * TILE=32, WM=4,WN=2, gfx94x (K_A_BYTES=8): A=[2][4][32][40]=10KB  B=5KB → 15KB total
      * (KBLK_PAD=K_A_BYTES per row restores alignment and eliminates bank conflicts) */
-    __shared__ int8_t A8i_lds[2][WM][TILE][KBLK_STRIDE];
-    __shared__ int8_t B8i_lds[2][WN][TILE][KBLK_STRIDE];
+    __shared__ int8_t  A8i_lds[2][WM][TILE][KBLK_STRIDE];
+    __shared__ int8_t  B8i_lds[2][WN][TILE][KBLK_STRIDE];
+    /* Per-block scale shifts cached in LDS — loaded cooperatively at kernel start
+     * to eliminate global memory reads from the latency-critical finalize step.
+     * Size: (WM+WN)*TILE int16_t ≤ 384 bytes (TILE=32 case), negligible.       */
+    __shared__ int16_t sftA_lds[WM * TILE];
+    __shared__ int16_t sftB_lds[WN * TILE];
 
     /* ── Thread decomposition ───────────────────────────────────────────────── */
     const int wid  = static_cast<int>(threadIdx.x) / 64;
@@ -1859,6 +1864,36 @@ oz2_fused_TN_kernel(
         return v;
     };
 
+    /* ── Cooperative load of sftA/sftB into LDS ────────────────────────────────
+     * Thread t < WM*TILE loads sftA_lds[t]; WM*TILE ≤ t < (WM+WN)*TILE loads sftB.
+     * Remaining threads are idle.  These reads are small (≤192 int16_t values)
+     * and are in flight here; they complete before the __syncthreads below.     */
+    if (threadIdx.x < WM * TILE) {
+        const int mi = block_m_base + static_cast<int>(threadIdx.x);
+        sftA_lds[threadIdx.x] = (mi < static_cast<int>(m)) ? sftA[mi] : 0;
+    } else if (threadIdx.x < (WM + WN) * TILE) {
+        const int ni = block_n_base + static_cast<int>(threadIdx.x - WM * TILE);
+        sftB_lds[threadIdx.x - WM * TILE] = (ni < static_cast<int>(n)) ? sftB[ni] : 0;
+    }
+
+    /* ── Pre-fetch modulus s=0 prologue into registers ─────────────────────────
+     * Issuing these global loads BEFORE the __syncthreads below hides their
+     * ~100-cycle HBM latency behind the barrier wait.                           */
+    int32_t rA_pro[A_STEPS] = {};
+    int32_t rB_pro[B_STEPS] = {};
+    if (k_int > 0) {
+        #pragma unroll
+        for (unsigned ls = 0; ls < A_STEPS; ++ls)
+            rA_pro[ls] = cond_load_a(A8i, ls, k4_A[ls] * 4);
+        #pragma unroll
+        for (unsigned ls = 0; ls < B_STEPS; ++ls)
+            rB_pro[ls] = cond_load_b(B8i, ls, k4_B[ls] * 4);
+    }
+    /* Barrier: (1) ensures sftA/B LDS writes above are visible to all threads;
+     *          (2) acts as the first per-modulus sync for s=0 (no previous
+     *              epilogue MFMA exists, so it is correct to merge them).       */
+    __syncthreads();
+
     /* ── MFMA helper: K_UNROLL=2 MFMAs from one LDS ping-pong slot ────────────
      * A_wm_slot = &A8i_lds[cur][wm][0][0], B_wn_slot = &B8i_lds[cur][wn][0][0].
      * LDS layout: [TILE][KBLK_LOAD] → stride KBLK_LOAD per row, 1 byte per k.
@@ -1923,20 +1958,29 @@ oz2_fused_TN_kernel(
         if (k_int > 0) {
             __syncthreads(); /* separate from previous modulus's LDS usage */
 
-            /* Prologue: load first k-block into slot 0 */
+            /* Prologue: write pre-fetched first k-block (rA_pro/rB_pro) to LDS slot 0.
+             * These registers were loaded from global memory BEFORE the __syncthreads
+             * above, so their ~100-cycle HBM latency is fully hidden.            */
             #pragma unroll
-            for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-                const int ki = k4_A[ls] * 4;
-                *reinterpret_cast<int32_t*>(&A8i_lds[0][wm_A[ls]][ml_A[ls]][ki]) =
-                    cond_load_a(A8i_s, ls, ki);
-            }
+            for (unsigned ls = 0; ls < A_STEPS; ++ls)
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA_pro[ls];
             #pragma unroll
-            for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-                const int ki = k4_B[ls] * 4;
-                *reinterpret_cast<int32_t*>(&B8i_lds[0][wn_B[ls]][nl_B[ls]][ki]) =
-                    cond_load_b(B8i_s, ls, ki);
+            for (unsigned ls = 0; ls < B_STEPS; ++ls)
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB_pro[ls];
+
+            /* Pre-fetch modulus (s+1)'s first k-block into registers NOW, while the
+             * LDS writes above are completing.  The ~100-cycle HBM latency will be
+             * hidden behind __syncthreads [2] below and the start of the k-loop.  */
+            if (s + 1 < S) {
+                #pragma unroll
+                for (unsigned ls = 0; ls < A_STEPS; ++ls)
+                    rA_pro[ls] = cond_load_a(A8i + static_cast<size_t>(s + 1) * stride_A_s, ls, k4_A[ls] * 4);
+                #pragma unroll
+                for (unsigned ls = 0; ls < B_STEPS; ++ls)
+                    rB_pro[ls] = cond_load_b(B8i + static_cast<size_t>(s + 1) * stride_B_s, ls, k4_B[ls] * 4);
             }
-            __syncthreads(); /* wait for prologue */
+
+            __syncthreads(); /* [2] wait for prologue LDS writes to complete */
 
             /* Precompute per-modulus base pointers for the ping-pong prefetch */
             const int8_t* A_base[A_STEPS];
@@ -2001,7 +2045,12 @@ oz2_fused_TN_kernel(
         if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
         const double q = rint((Zhi[e] + Zlo[e]) * cInvP);
         const double X = fma(cP_lo, q, fma(cP_hi, q, Zhi[e]) + Zlo[e]);
-        const int inv_sft = -(static_cast<int>(sftA[ri]) + static_cast<int>(sftB[ci]));
+        /* Read scale shifts from LDS (loaded at kernel start) — avoids global reads
+         * after the s-loop has likely evicted sftA/sftB from L1.
+         * ri - block_m_base ∈ [0, WM*TILE) and ci - block_n_base ∈ [0, WN*TILE)
+         * are guaranteed for all non-skipped (ri, ci) pairs.                    */
+        const int inv_sft = -(static_cast<int>(sftA_lds[ri - block_m_base])
+                             + static_cast<int>(sftB_lds[ci - block_n_base]));
         const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
         const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
         D[d_idx] = alpha * ldexp(X, inv_sft) + beta * C[c_idx];
