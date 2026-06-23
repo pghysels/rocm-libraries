@@ -1697,6 +1697,30 @@ oz2_do_mfma_32(oz2_mfma_src32_t a, oz2_mfma_src32_t b, v16i32 c) noexcept
 { return __builtin_amdgcn_mfma_i32_32x32x16_i8(a, b, c, 0, 0, 0); }
 #endif
 
+/* ── Architecture-specific MFMA source load helper ─────────────────────────
+ * On gfx95x (K_A_BYTES=16, KBLK_STRIDE=136): two 8-byte loads give 2-way LDS
+ * bank conflicts instead of 4-way from a single 16-byte load.
+ * On gfx94x (K_A_BYTES=8): single 8-byte load is always conflict-free.       */
+#if defined(__gfx950__)
+__device__ __forceinline__ oz2_mfma_src16_t
+oz2_load_mfma_src16(const int8_t* __restrict__ ptr) noexcept {
+    oz2_mfma_src16_t v;
+    v[0] = *reinterpret_cast<const long*>(ptr);
+    v[1] = *reinterpret_cast<const long*>(ptr + 8);
+    return v;
+}
+#else
+__device__ __forceinline__ oz2_mfma_src16_t
+oz2_load_mfma_src16(const int8_t* __restrict__ ptr) noexcept {
+    return *reinterpret_cast<const oz2_mfma_src16_t*>(ptr);
+}
+#endif
+/* Same helper for TILE=32 source (oz2_mfma_src32_t == oz2_mfma_src16_t). */
+__device__ __forceinline__ oz2_mfma_src32_t
+oz2_load_mfma_src32(const int8_t* __restrict__ ptr) noexcept {
+    return oz2_load_mfma_src16(ptr);
+}
+
 /* ── oz2_fused_TN_kernel ─────────────────────────────────────────────────── */
 /*
  * Template parameters:
@@ -1740,13 +1764,21 @@ oz2_fused_TN_kernel(
      *   TILE=16, WM=WN=4, gfx94x: LDS(K4)≈33KB → K_UNROLL=4 ✓
      *   TILE=32, WM=4/2, gfx95x: LDS(K4)≈50KB → K_UNROLL=4 ✓
      *   TILE=16, WM=WN=4, gfx95x: LDS(K4)>64KB → K_UNROLL=2 (fallback)    */
+    /* Architecture-specific LDS budget per CU:
+     *   gfx95x (MI350): 160 KB — allows larger macrotiles and looser padding
+     *   gfx94x (MI300): 64 KB                                                 */
+#if defined(__gfx950__)
+    static constexpr size_t   LDS_BUDGET  = 159u * 1024u;
+#else
+    static constexpr size_t   LDS_BUDGET  = 63u * 1024u;
+#endif
     static constexpr size_t   LDS_MFMA_K4 = 2u * (WM * TILE * (KBLK * 4u)
                                                   + WN * TILE * (KBLK * 4u));
     static constexpr size_t   LDS_SFT     = static_cast<size_t>((WM + WN) * TILE * 2u);
     /* K_UNROLL=8 was tested but causes VGPR regression (A_STEPS doubles 4→8,
      * total VGPRs ~120→196, SIMD occupancy drops ~4→2 wavefronts).  K_UNROLL=4
      * is the sweet spot: halves syncs vs K_UNROLL=2 without VGPR explosion.   */
-    static constexpr unsigned K_UNROLL    = (LDS_MFMA_K4 + LDS_SFT <= 63u * 1024u) ? 4u : 2u;
+    static constexpr unsigned K_UNROLL    = (LDS_MFMA_K4 + LDS_SFT <= LDS_BUDGET) ? 4u : 2u;
     static constexpr unsigned KBLK_LOAD   = KBLK * K_UNROLL;
     /* Source register size (bytes): KBLK × TILE / 64.
      * Equals sizeof(oz2_mfma_src16_t) on each architecture.
@@ -1764,10 +1796,15 @@ oz2_fused_TN_kernel(
      *   TILE=16 gfx95x: skip (LDS budget, see guard below)
      *
      * The padding is suppressed when it would push the block's LDS usage above 63 KB. */
+    /* On gfx95x (K_A_BYTES=16), use 8-byte LDS padding unit instead of 16.
+     * KBLK_STRIDE=KBLK_LOAD+8 gives bank-stride/4=34, GCD(34,64)=2 → 2-way
+     * conflicts for ds_read_b64, vs 4-way for ds_read_b128 with PAD=16.
+     * MFMA source reads are split into two int64_t loads (see apply_mfma).   */
+    static constexpr unsigned KBLK_PAD_UNIT = (K_A_BYTES == 16u) ? 8u : K_A_BYTES;
     static constexpr size_t   LDS_BYTES_OLD = 2u * (WM * TILE * KBLK_LOAD
                                                    + WN * TILE * KBLK_LOAD);
-    static constexpr unsigned KBLK_PAD    = (LDS_BYTES_OLD + K_A_BYTES * TILE * (WM + WN) * 2u
-                                             <= 63u * 1024u) ? K_A_BYTES : 0u;
+    static constexpr unsigned KBLK_PAD    = (LDS_BYTES_OLD + KBLK_PAD_UNIT * TILE * (WM + WN) * 2u
+                                             <= LDS_BUDGET) ? KBLK_PAD_UNIT : 0u;
     static constexpr unsigned KBLK_STRIDE = KBLK_LOAD + KBLK_PAD;
     static constexpr unsigned BLK_THR   = WM * WN * 64u;
     static constexpr unsigned K4DIM     = KBLK_LOAD / 4u;
@@ -1925,12 +1962,15 @@ oz2_fused_TN_kernel(
             for (unsigned e = 0; e < NREG; ++e) vx[static_cast<int>(e)] = C32[e];
             for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
                 const int kab = k_base + static_cast<int>(ku * KBLK);
-                /* Use KBLK_STRIDE (not KBLK_LOAD) as the LDS row stride so that
-                 * the K_A_BYTES padding per row (KBLK_PAD) is accounted for.    */
-                const auto sa = *reinterpret_cast<const oz2_mfma_src16_t*>(
-                    A_wm_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
-                const auto sb = *reinterpret_cast<const oz2_mfma_src16_t*>(
-                    B_wn_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
+                const int off_A = m_col * static_cast<int>(KBLK_STRIDE) + kab;
+                const int off_B = m_col * static_cast<int>(KBLK_STRIDE) + kab;
+                /* Use KBLK_STRIDE as the LDS row stride (accounts for KBLK_PAD).
+                 * On gfx95x (K_A_BYTES=16): two 64-bit loads → 2-way LDS conflicts
+                 * instead of 4-way from a single 128-bit load.                  */
+                /* oz2_load_mfma_src16: on gfx95x uses two 64-bit loads (2-way
+                 * LDS conflicts); on gfx94x uses one 64-bit load (0 conflicts). */
+                const auto sa = oz2_load_mfma_src16(A_wm_slot + off_A);
+                const auto sb = oz2_load_mfma_src16(B_wn_slot + off_B);
                 vx = oz2_do_mfma_16(sa, sb, vx);
             }
             for (unsigned e = 0; e < NREG; ++e) C32[e] = vx[static_cast<int>(e)];
@@ -1939,10 +1979,10 @@ oz2_fused_TN_kernel(
             for (unsigned e = 0; e < NREG; ++e) vx[static_cast<int>(e)] = C32[e];
             for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
                 const int kab = k_base + static_cast<int>(ku * KBLK);
-                const auto sa = *reinterpret_cast<const oz2_mfma_src32_t*>(
-                    A_wm_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
-                const auto sb = *reinterpret_cast<const oz2_mfma_src32_t*>(
-                    B_wn_slot + m_col * static_cast<int>(KBLK_STRIDE) + kab);
+                const int off_A = m_col * static_cast<int>(KBLK_STRIDE) + kab;
+                const int off_B = m_col * static_cast<int>(KBLK_STRIDE) + kab;
+                const auto sa = oz2_load_mfma_src32(A_wm_slot + off_A);
+                const auto sb = oz2_load_mfma_src32(B_wn_slot + off_B);
                 vx = oz2_do_mfma_32(sa, sb, vx);
             }
             for (unsigned e = 0; e < NREG; ++e) C32[e] = vx[static_cast<int>(e)];
@@ -2102,9 +2142,14 @@ oz2_launch_fused_TN(const int8_t*  A8i,    /* workspace INT8 A (all S moduli sta
     const size_t stride_B_s = ldb8i * static_cast<size_t>(n);
     const bool   has_lo     = (num_moduli > 7u);
 
-    /* Select macrotile variant based on output shape */
+    /* Select macrotile variant based on output shape.
+     * VGPR occupancy check for WM=4,WN=4,TILE=32 (blockDim=1024, 16 wf/block):
+     *   SIMD needs 4 wf → max VGPRs = 512/4 = 128
+     *   Estimated kernel VGPRs ≈ 208 (Zhi[16]+Zlo[16]=64, C32[16]=16, tables+misc)
+     *   4×208 = 832 > 512 → block cannot be scheduled on any CU (CDNA4 ISA §3.6.4)
+     * WM=4,WN=2 and WM=2,WN=4 use blockDim=512 (8 wf, 2 wf/SIMD): 2×192=384≤512 ✓ */
     const bool use_tile32  = (m >= 64 && n >= 64) && (m >= 128 || n >= 128);
-    const bool use_128x64  = use_tile32 && (m >= n);   /* else 64×128 */
+    const bool use_128x64  = use_tile32 && (m >= n);
 
     /* Compute grid for a given (wm_v, wn_v, tile_v) macrotile */
     auto make_grid = [&](unsigned wm_v, unsigned wn_v, unsigned tile_v) -> dim3 {
