@@ -1762,15 +1762,14 @@ oz2_fused_TN_kernel(
     /* ── Derived compile-time constants ────────────────────────────────────── */
     static constexpr unsigned NREG      = TILE * TILE / 64u;    /* 4 (TILE=16) or 16 (TILE=32) */
     static constexpr unsigned KBLK      = (TILE == 16u) ? OZ2_KBLK_16 : OZ2_KBLK_32;
-    /* K-loop unroll factor (analogous to DepthU in TensisLite):
+    /* K-loop unroll factor (analogous to DepthU in TensiteLite):
      * K_UNROLL=4 doubles KBLK_LOAD, halves k-loop __syncthreads count, and
-     * provides 4 back-to-back MFMAs per barrier interval (vs 2) for better
-     * instruction-level parallelism.  Suppressed when LDS budget (including
-     * sftA/B caches) would exceed 63 KB.
-     *   TILE=32, WM=4/2, gfx94x: LDS(K4)≈25KB → K_UNROLL=4 ✓
-     *   TILE=16, WM=WN=4, gfx94x: LDS(K4)≈33KB → K_UNROLL=4 ✓
-     *   TILE=32, WM=4/2, gfx95x: LDS(K4)≈50KB → K_UNROLL=4 ✓
-     *   TILE=16, WM=WN=4, gfx95x: LDS(K4)>64KB → K_UNROLL=2 (fallback)    */
+     * provides 4 back-to-back MFMAs per barrier interval for better ILP.
+     *   gfx94x (MI300): K_UNROLL=4 — measured scratch=108B ✓
+     *   gfx95x (MI350): K_UNROLL=2 — KBLK is doubled vs gfx94x, so K_UNROLL=4
+     *     would double A_STEPS/B_STEPS giving the same register pressure as
+     *     gfx94x K_UNROLL=8 (scratch=388B, 2.5× slower). Confirmed on hardware:
+     *     K_UNROLL=4 → scratch=424B ✗  K_UNROLL=2 → scratch=104B ✓          */
     /* Architecture-specific LDS budget per CU:
      *   gfx95x (MI350): 160 KB — allows larger macrotiles and looser padding
      *   gfx94x (MI300): 64 KB                                                 */
@@ -1782,17 +1781,11 @@ oz2_fused_TN_kernel(
     static constexpr size_t   LDS_MFMA_K4 = 2u * (WM * TILE * (KBLK * 4u)
                                                   + WN * TILE * (KBLK * 4u));
     static constexpr size_t   LDS_SFT     = static_cast<size_t>((WM + WN) * TILE * 2u);
-    /* K_UNROLL selection: prefer the largest value that fits within the LDS budget.
-     * K_UNROLL=4 is the sweet spot confirmed by hardware profiling on MI300X (gfx942):
-     *   - K_UNROLL=4: arch_vgpr=128, scr=108, lds=32KB → 29.4 ms
-     *   - K_UNROLL=8: TESTED AND REJECTED — causes register spilling (scr 108→388,
-     *     lds 32KB→65KB), compiler uses LDS+HBM as spill buffers because the doubled
-     *     A_STEPS/B_STEPS/rA/rB arrays no longer fit in 128 VGPRs → 73.4 ms (2.5× SLOWER)
-     * K_UNROLL=8 LDS fits within 63 KB budget but the VGPR pressure from cooperative-
-     * load index arrays (mi_A[8], k4_A[8], A_base[8], rA[8], etc.) causes spilling
-     * even though arch_vgpr stays at 128 (compiler achieves this via spilling, not savings).
-     * K_UNROLL=4 is the maximum viable value for this kernel on gfx942/gfx950.       */
-    static constexpr unsigned K_UNROLL    = (LDS_MFMA_K4 + LDS_SFT <= LDS_BUDGET) ? 4u : 2u;
+#if defined(__gfx950__)
+    static constexpr unsigned K_UNROLL = 2u;
+#else
+    static constexpr unsigned K_UNROLL = (LDS_MFMA_K4 + LDS_SFT <= LDS_BUDGET) ? 4u : 2u;
+#endif
     static constexpr unsigned KBLK_LOAD   = KBLK * K_UNROLL;
     /* Source register size (bytes): KBLK × TILE / 64.
      * Equals sizeof(oz2_mfma_src16_t) on each architecture.
