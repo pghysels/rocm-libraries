@@ -1664,11 +1664,13 @@ static constexpr unsigned OZ2_KBLK_32 = 32u;
 static constexpr unsigned OZ2_KBLK_16 = 32u;
 static constexpr unsigned OZ2_KBLK_32 = 16u;
 #endif
-/* Maximum KBLK_LOAD across all kernel variants — used for workspace-zero guard.
- * TILE=32 with K_UNROLL=8:  KBLK_LOAD = OZ2_KBLK_32 × 8 = 16 × 8 = 128
- * TILE=16 with K_UNROLL=4:  KBLK_LOAD = OZ2_KBLK_16 × 4 = 32 × 4 = 128
- * Both evaluate to 128, so OZ2_KBLK_16 × 4 remains correct as the constant.  */
-static constexpr unsigned OZ2_FUSED_KBLK_LOAD_MAX = OZ2_KBLK_16 * 4u;
+/* Maximum KBLK_LOAD across all kernel variants AND all supported architectures —
+ * used for the workspace-zero guard in fp64EmulatedGemmImpl (HOST-side).
+ * gfx942: TILE=16, K_UNROLL=4, KBLK_16=32 → KBLK_LOAD = 128
+ * gfx950: TILE=16, K_UNROLL=4, KBLK_16=64 → KBLK_LOAD = 256
+ * Must be the architecture-independent maximum (256) to ensure the workspace is
+ * correctly zeroed on gfx950, where host code does not see __gfx950__.           */
+static constexpr unsigned OZ2_FUSED_KBLK_LOAD_MAX = 256u;
 
 /* MFMA output vector types */
 typedef int v4i32  __attribute__((ext_vector_type(4)));
@@ -1782,7 +1784,11 @@ oz2_fused_TN_kernel(
                                                   + WN * TILE * (KBLK * 4u));
     static constexpr size_t   LDS_SFT     = static_cast<size_t>((WM + WN) * TILE * 2u);
 #if defined(__gfx950__)
-    static constexpr unsigned K_UNROLL = 2u;
+    /* TILE=32: K_UNROLL=2 — KBLK=32 doubled; A_STEPS≤4 validated (scratch=104B).
+     * TILE=16: K_UNROLL=4 — KBLK=64; A_STEPS=4 at boundary (scratch=8B, acceptable).
+     * Note: the launcher dispatches TILE=16 for ALL sizes on gfx950, so the TILE=32
+     * branch is a compile-time fallback retained for correctness if ever dispatched.  */
+    static constexpr unsigned K_UNROLL = (TILE == 32u) ? 2u : 4u;
 #else
     static constexpr unsigned K_UNROLL = (LDS_MFMA_K4 + LDS_SFT <= LDS_BUDGET) ? 4u : 2u;
 #endif
@@ -2201,17 +2207,33 @@ oz2_launch_fused_TN(const int8_t*  A8i,    /* workspace INT8 A (all S moduli sta
      *   SIMD needs 4 wf → max VGPRs = 512/4 = 128
      *   Estimated kernel VGPRs ≈ 208 (Zhi[16]+Zlo[16]=64, C32[16]=16, tables+misc)
      *   4×208 = 832 > 512 → block cannot be scheduled on any CU (CDNA4 ISA §3.6.4)
-     * WM=4,WN=2 and WM=2,WN=4 use blockDim=512 (8 wf, 2 wf/SIMD): 2×192=384≤512 ✓ */
-    const bool use_tile32  = (m >= 64 && n >= 64) && (m >= 128 || n >= 128);
-    const bool use_128x64  = use_tile32 && (m >= n);
+     * WM=4,WN=2 and WM=2,WN=4 use blockDim=512 (8 wf, 2 wf/SIMD): 2×192=384≤512 ✓
+     *
+     * gfx950 override: always use TILE=16 (64×64 macrotile) with K_UNROLL=4.
+     * On gfx950, TILE=16/K_UNROLL=4 and TILE=32/K_UNROLL=2 do equal compute per
+     * barrier, but TILE=16/K_UNROLL=4 has 1.7× fewer total barriers (4× fewer k-loop
+     * iterations per block, 2× more blocks → net 1.7× reduction). Measured 2.5× fused
+     * slowdown on MI355 with TILE=32/K_UNROLL=2 makes TILE=16 the better default.     */
+    /* Query current device once; used for both XCC count and gfx950 detection. */
+    int cur_dev = 0;
+    (void)hipGetDevice(&cur_dev);
+
+    /* On gfx950, use TILE=16 (K_UNROLL=4) for all sizes — fewer total barriers. */
+    int is_gfx950 = 0;
+    {
+        int gfx950_chip_id = 0;
+        (void)hipDeviceGetAttribute(&gfx950_chip_id, hipDeviceAttributePciChipId, cur_dev);
+        const uint32_t pci_id = static_cast<uint32_t>(gfx950_chip_id) & 0xFFFFu;
+        is_gfx950 = (pci_id == 0x75a3u || pci_id == 0x75b3u) ? 1 : 0;
+    }
+    const bool use_tile32 = !is_gfx950 && (m >= 64 && n >= 64) && (m >= 128 || n >= 128);
+    const bool use_128x64 = use_tile32 && (m >= n);
 
     /* Query number of XCCs (Graphics Compute Dies) on the current device.
      * MI300X and MI350X both have 8 XCCs.  The XCC mapping partitions m_tiles
      * across XCCs to ensure A8i L2 reuse per-XCC (up to 8× HBM traffic reduction).  */
     int num_xccs = 1;
     {
-        int cur_dev = 0;
-        (void)hipGetDevice(&cur_dev);
         (void)hipDeviceGetAttribute(&num_xccs, hipDeviceAttributeNumberOfXccs, cur_dev);
         if (num_xccs <= 0) num_xccs = 1;
     }
