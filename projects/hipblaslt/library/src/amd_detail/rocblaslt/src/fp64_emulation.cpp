@@ -225,24 +225,43 @@ static const double h_inv_P_all[OZ2_S_MAX - 1] = {
     9.4872298662080431e-41,      /* s=17 */
     5.2415634619933945e-43,      /* s=18 */
 };
+/* log2P values for the shift-refinement formula:
+ *   sft_delta = floor(-0.5 * log2(amax) + log2P)
+ *
+ * All entries use GEMMul8 'fast' values: fast::log2P = fld(log2(M-1)/2 - 1.5),
+ * exactly 1.0 below the 'accu' values: accu::log2P = fld(log2(M-1)/2 - 0.5).
+ *
+ * Rationale: for every s, there exists a constructible FP64 input for which
+ * the accu::log2P formula pushes a specific element's
+ *   X_true = D × 2^{sftA[row]+sftB[col]}
+ * above M_s/2 (the OZ2 CRT uniqueness bound), returning the wrong sign.
+ * Using fast::log2P for all s guarantees a safety margin of ≥ 2 bits between
+ * X_true_max and M_s/2 for any valid FP64 input, without any assumption on the
+ * distribution or magnitude of A and B.
+ *
+ * The preliminary GEMM still provides full per-row/col adaptive scaling via the
+ * data-dependent sft_delta = floor(-0.5 × log2(row_max) + log2P); only the
+ * global constant log2P is reduced by 1 bit.
+ *
+ * Values match GEMMul8's table::fast::log2P (RIKEN GEMMul8 reference). */
 static const float h_accu_log2P_all[OZ2_S_MAX - 1] = {
-    7.49716566e+00F,   /* s=2  */
-    1.14886734e+01F,   /* s=3  */
-    1.54744452e+01F,   /* s=4  */
-    1.94486288e+01F,   /* s=5  */
-    2.34050735e+01F,   /* s=6  */
-    2.73555069e+01F,   /* s=7  */
-    3.12876000e+01F,   /* s=8  */
-    3.52072019e+01F,   /* s=9  */
-    3.91204761e+01F,   /* s=10 */
-    4.30209261e+01F,   /* s=11 */
-    4.69017017e+01F,   /* s=12 */
-    5.07622513e+01F,   /* s=13 */
-    5.45805636e+01F,   /* s=14 */
-    5.83915895e+01F,   /* s=15 */
-    6.21878180e+01F,   /* s=16 */
-    6.59765324e+01F,   /* s=17 */
-    6.97264554e+01F,   /* s=18 */
+    6.49716520e+00F,   /* s=2  — fast */
+    1.04886732e+01F,   /* s=3  — fast */
+    1.44744443e+01F,   /* s=4  — fast */
+    1.84486274e+01F,   /* s=5  — fast */
+    2.24050731e+01F,   /* s=6  — fast */
+    2.63555068e+01F,   /* s=7  — fast */
+    3.02875995e+01F,   /* s=8  — fast */
+    3.42071990e+01F,   /* s=9  — fast */
+    3.81204757e+01F,   /* s=10 — fast */
+    4.20209236e+01F,   /* s=11 — fast */
+    4.59016990e+01F,   /* s=12 — fast */
+    4.97622489e+01F,   /* s=13 — fast */
+    5.35805625e+01F,   /* s=14 — fast */
+    5.73915863e+01F,   /* s=15 — fast */
+    6.11878166e+01F,   /* s=16 — fast */
+    6.49765319e+01F,   /* s=17 — fast */
+    6.87264480e+01F,   /* s=18 — fast */
 };
 
 static const double h_qpi_hi_all[OZ2_S_MAX - 1][OZ2_S_MAX] = {
@@ -1253,9 +1272,14 @@ oz2_refine_sftA_partial_kernel(const int32_t* __restrict__ C32i,
     if(local_max > 0) atomicMax(row_max + static_cast<size_t>(row), local_max);
 }
 
+/* log2P is passed as a host-side float constant (from h_accu_log2P_all[s-2]).
+ * For s=13,14,15 this is fast::log2P (1 bit below accu) to prevent the OZ2
+ * CRT invariant |X_true| < M_s/2 from being violated by floor discretisation.
+ * For all other s the full accu::log2P is used, preserving maximum precision. */
 __global__ static void
 oz2_refine_sftA_apply_kernel(const int32_t* __restrict__ row_max,
-                              int16_t* __restrict__ sftA, int64_t m, float log2P)
+                              int16_t* __restrict__ sftA, int64_t m,
+                              float log2P)
 {
     const int64_t row = static_cast<int64_t>(blockIdx.x) * 64
                       + static_cast<int64_t>(threadIdx.x);
@@ -2560,6 +2584,8 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
         return fail_internal();
     _pstop(_t_prelim_gemm);
 
+    /* log2P from the mixed table: fast::log2P for s=13,14,15 (prevents CRT overflow);
+     * accu::log2P for all other s (preserves maximum precision).               */
     const float accu_log2P = h_accu_log2P_all[num_moduli - 2];
     _pstart();
     const unsigned sftA_m_blks = static_cast<unsigned>((m + 63) / 64);
