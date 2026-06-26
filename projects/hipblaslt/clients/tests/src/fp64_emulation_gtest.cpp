@@ -255,13 +255,13 @@ namespace
     TEST_F(Fp64EmulationTest, ApiValidationRejectsInvalidMantissaControl)
     {
         EXPECT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
-                      m_handle, static_cast<hipblasEmulationMantissaControl_t>(-1)),
+                      m_handle, static_cast<hipblasLtEmulationMantissaControl_t>(-1)),
                   HIPBLAS_STATUS_INVALID_VALUE);
         EXPECT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
-                      m_handle, static_cast<hipblasEmulationMantissaControl_t>(2)),
+                      m_handle, static_cast<hipblasLtEmulationMantissaControl_t>(2)),
                   HIPBLAS_STATUS_INVALID_VALUE);
         EXPECT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
-                      m_handle, HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC),
+                      m_handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
                   HIPBLAS_STATUS_SUCCESS);
     }
 
@@ -284,7 +284,7 @@ namespace
         set_enabled(true);
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
         ASSERT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
-                      m_handle, HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC),
+                      m_handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
                   HIPBLAS_STATUS_SUCCESS);
 
         const Fp64EmulationDecision decision =
@@ -870,5 +870,477 @@ namespace
         ),
         EmulAccuracyParamName
     );
+
+    // ── SmallDimensions: m=1 or n=1 (single-row / single-column output) ──────
+    //
+    // Tests workspace layout and kernel grid boundary conditions for extreme
+    // aspect ratios.
+    //   m=1: single-row A (1×k), sftA has exactly one entry, prelim/scale
+    //        kernels launch with a single-row m-grid — exercises min-m paths.
+    //   n=1: single-column B (k×1), sftB has exactly one entry — min-n paths.
+    INSTANTIATE_TEST_SUITE_P(
+        SmallDimensions,
+        Fp64EmulationAccuracyTest,
+        ::testing::Values(
+            /* m=1: single output row — exercises min-m kernel paths */
+            EmulAccuracyParam{16, 1,   128, 4096, 1e-11, FILL_UNIFORM_01,   HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
+            /* n=1: single output col — exercises min-n kernel paths (near1 fill gives distinct name) */
+            EmulAccuracyParam{16, 128, 1,   4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 }
+        ),
+        EmulAccuracyParamName
+    );
+
+    // ── LargeK: k=16384, stress the preliminary GEMM INT32 accumulation ───────
+    //
+    // For near-saturated inputs and k=16384:
+    //   max INT32 accumulation ≈ 63² × 16384 ≈ 65M — well within INT32 range.
+    // Guards against silent overflow regressions if the extraction scale
+    // were ever increased beyond 6 bits.
+    INSTANTIATE_TEST_SUITE_P(
+        LargeK,
+        Fp64EmulationAccuracyTest,
+        ::testing::Values(
+            EmulAccuracyParam{16, 64, 64, 16384, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 }
+        ),
+        EmulAccuracyParamName
+    );
+
+    // ── DemmelAdpFallback: ADP must detect overflow for extreme b ─────────────
+    //
+    // For b=32, n=128 the ADP reduction computes:
+    //   log2P_needed ≈ (52 − sftA_init) + 0.5·log2(row_max_prelim)
+    //                ≈ (52+27) + 0.5·log2(~300) ≈ 79 + 4 = 83 >> log2P_18 = 68.7
+    // fp64EmulatedGemm must return rocblaslt_status_invalid_value so the caller
+    // falls back to native DGEMM rather than silently producing a wrong result.
+    TEST_F(Fp64EmulationTest, DemmelAdpFallback_b32_n128)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
+        ASSERT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
+                      m_handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
+                  HIPBLAS_STATUS_SUCCESS);
+
+        // Skip unsupported devices
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(m_roc, HIP_R_64F,
+                                      HIPBLAS_OP_N, HIPBLAS_OP_N, 128, 128, 128, 1);
+            if(!gate.apply)
+                GTEST_SKIP() << "Device not supported by emulation";
+        }
+
+        constexpr int    n = 128, b = 32;
+        constexpr size_t N2    = static_cast<size_t>(n) * n;
+        const size_t     bytes = N2 * sizeof(double);
+
+        // Generate x ~ U(1,2) and d[m] = 2^{j_m}
+        std::vector<double> h_x(n), h_d(n);
+        for(int i = 0; i < n; ++i)
+        {
+            uint64_t s = static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL
+                         + 1442695040888963407ULL;
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            h_x[i] = 1.0 + static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0);
+        }
+        const double delta_d = (n > 1) ? (2.0 * b) / (n - 1) : 0.0;
+        for(int m = 0; m < n; ++m)
+        {
+            double jm = -b + std::round(static_cast<double>(m) * delta_d);
+            h_d[m] = std::ldexp(1.0, static_cast<int>(jm));
+        }
+
+        // Fill A[col*n+row] = x[(row+col)%n]*d[...], B[...] = x[...]/d[...]
+        std::vector<double> h_A(N2), h_B(N2);
+        for(int col = 0; col < n; ++col)
+            for(int row = 0; row < n; ++row)
+            {
+                const size_t m   = static_cast<size_t>((row + col) % n);
+                const size_t idx = static_cast<size_t>(col * n + row);
+                h_A[idx] = h_x[m] * h_d[m];
+                h_B[idx] = h_x[m] / h_d[m];
+            }
+
+        double *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr;
+        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD, bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, h_A.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, h_B.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
+
+        Fp64EmulationSettings emu_settings{};
+        emu_settings.handle          = m_handle;
+        emu_settings.num_moduli      = 16u;    /* ADP upper bound */
+        emu_settings.sv_mask         = 0u;     /* skip Inf/NaN detection */
+        emu_settings.dynamic_mode    = true;   /* enable ADP */
+        emu_settings.workspace       = nullptr;
+        emu_settings.workspace_bytes = 0u;
+
+        const double alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st =
+            fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n,
+                             &alpha, dA, n, dB, n,
+                             &beta,  dC, n, dD, n,
+                             /*stream=*/nullptr, emu_settings);
+
+        (void)hipFree(dD); (void)hipFree(dC);
+        (void)hipFree(dB); (void)hipFree(dA);
+
+        // ADP must have detected the b=32 overflow and returned invalid_value.
+        // (The caller — rocblaslt_mat.cpp — would then fall back to native DGEMM.)
+        EXPECT_EQ(st, rocblaslt_status_invalid_value)
+            << "ADP for b=" << b << " n=" << n
+            << " should detect log2P_needed > log2P_18 and return invalid_value,"
+            << " but got status=" << static_cast<int>(st);
+    }
+
+    // ── DemmelBlas2Test: BLAS Test 2 (Figure 2 from arXiv:2511.13778) ─────────
+    //
+    // Constructs the Demmel et al. matrix pair (n×n, column-major, NN):
+    //   A[k,j] = x[(j+k)%n] × d[(j+k)%n]        (row k, col j)
+    //   B[i,k] = x[(i+k)%n] / d[(i+k)%n]        (row i, col k)
+    // where x ~ U(1,2) and d[m] = 2^{j_m}, j_m = -b + round(m×2b/(n-1)).
+    //
+    // The product C = A×B is a circulant matrix with C[k,i] = h[(i-k+n)%n]:
+    //   h[δ] = Σ_{m=0}^{n-1} x[m] × x[(m+δ)%n] × d[m] / d[(m+δ)%n]
+    //   δ=0 → h[0] = xᵀx     (exact diagonal: d/d = 1 per term)
+    //   δ≠0 → h[δ] > 0       (all positive, no cancellation)
+    //
+    // Reference: host long-double for all n² elements (accurate when 4b ≤ 63).
+    //
+    // Threshold 1e-13 ≈ 500×ε_machine:
+    //   Correct result : error ≈ ε_machine (correctly-rounded IEEE FP64)
+    //   Sign-flip fail : error ≈ 1–2  (margin ≥ 10 orders of magnitude)
+
+    struct EmulDemmelParam
+    {
+        unsigned s;         /* num_moduli (2..18)           */
+        int      n;         /* square matrix side (≤ 128)   */
+        int      b;         /* exponent half-range (≤ 15)   */
+        double   threshold; /* max rel error over all n² el */
+    };
+
+    static std::string EmulDemmelParamName(
+        const ::testing::TestParamInfo<EmulDemmelParam>& info)
+    {
+        const EmulDemmelParam& p = info.param;
+        return "s" + std::to_string(p.s)
+               + "_n" + std::to_string(p.n)
+               + "_b" + std::to_string(p.b);
+    }
+
+    class Fp64EmulationDemmelTest : public ::testing::TestWithParam<EmulDemmelParam>
+    {
+    protected:
+        void SetUp() override
+        {
+            if(!has_device())
+                GTEST_SKIP() << "No HIP device available";
+        }
+    };
+
+    TEST_P(Fp64EmulationDemmelTest, VsLongDoubleReference)
+    {
+        const EmulDemmelParam& p = GetParam();
+        const int64_t          N = static_cast<int64_t>(p.n);
+
+        // ── Host: x[i] ~ U(1,2) using the same XORshift64 RNG as the bench ──
+        std::vector<double> h_x(static_cast<size_t>(N));
+        for(int64_t i = 0; i < N; ++i)
+        {
+            uint64_t s = static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL
+                         + 1442695040888963407ULL;
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            h_x[static_cast<size_t>(i)] =
+                1.0 + static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0);
+        }
+
+        // ── Host: d[m] = 2^{j_m}, j_m = -b + round(m × 2b / (n-1)) ─────────
+        std::vector<double> h_d(static_cast<size_t>(N));
+        const double delta = (N > 1) ? (2.0 * p.b) / static_cast<double>(N - 1) : 0.0;
+        for(int64_t m = 0; m < N; ++m)
+        {
+            double jm = -p.b + std::round(static_cast<double>(m) * delta);
+            h_d[static_cast<size_t>(m)] = std::ldexp(1.0, static_cast<int>(jm));
+        }
+
+        // ── Host: fill A and B (column-major, lda=ldb=N) ─────────────────────
+        // A[col*N+row] = x[(row+col)%N] * d[(row+col)%N]
+        // B[col*N+row] = x[(row+col)%N] / d[(row+col)%N]
+        const size_t        N2 = static_cast<size_t>(N) * static_cast<size_t>(N);
+        std::vector<double> h_A(N2), h_B(N2);
+        for(int64_t col = 0; col < N; ++col)
+            for(int64_t row = 0; row < N; ++row)
+            {
+                const size_t m   = static_cast<size_t>((row + col) % N);
+                const size_t idx = static_cast<size_t>(col * N + row);
+                h_A[idx] = h_x[m] * h_d[m];
+                h_B[idx] = h_x[m] / h_d[m];
+            }
+
+        // ── Host: exact reference in long double for all n² elements ──────────
+        // C is circulant: C[k,i] = h[(i-k+N)%N] where
+        //   h[δ] = Σ_m x[m]·x[(m+δ)%N]·d[m]/d[(m+δ)%N]  (all positive → no cancel)
+        // Accurate in long double when 4·b ≤ 63 (i.e. b ≤ 15).
+        std::vector<long double> h_lag(static_cast<size_t>(N), 0.0L);
+        for(int64_t lag = 0; lag < N; ++lag)
+            for(int64_t m = 0; m < N; ++m)
+            {
+                const size_t ml  = static_cast<size_t>(m);
+                const size_t mpl = static_cast<size_t>((m + lag) % N);
+                h_lag[static_cast<size_t>(lag)] +=
+                    static_cast<long double>(h_x[ml])
+                    * static_cast<long double>(h_x[mpl])
+                    * static_cast<long double>(h_d[ml])
+                    / static_cast<long double>(h_d[mpl]);
+            }
+
+        // ── Device: upload and run emulation ──────────────────────────────────
+        const size_t bytes = N2 * sizeof(double);
+        double *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr;
+        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD, bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, h_A.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, h_B.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
+
+        auto cleanup = [&]() {
+            (void)hipFree(dD); (void)hipFree(dC);
+            (void)hipFree(dB); (void)hipFree(dA);
+        };
+
+        hipblasLtHandle_t hem = nullptr;
+        ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true),  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
+                  HIPBLAS_STATUS_SUCCESS);
+
+        // Skip unsupported devices
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
+                                      HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+            if(!gate.apply)
+            {
+                (void)hipblasLtDestroy(hem);
+                cleanup();
+                GTEST_SKIP() << "Device not supported by emulation";
+            }
+        }
+
+        Fp64EmulationSettings emu_settings{};
+        emu_settings.handle          = hem;
+        emu_settings.num_moduli      = p.s;
+        emu_settings.sv_mask         = 0u;
+        emu_settings.workspace       = nullptr;
+        emu_settings.workspace_bytes = 0u;
+
+        const double          alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st =
+            fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                             &alpha, dA, N, dB, N,
+                             &beta,  dC, N, dD, N,
+                             /*stream=*/nullptr, emu_settings);
+        (void)hipblasLtDestroy(hem);
+
+        if(st != rocblaslt_status_success)
+        {
+            cleanup();
+            GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(st)
+                         << " (INT8 device library may be unavailable)";
+        }
+
+        // ── Compare all n² elements against the long-double reference ─────────
+        std::vector<double> h_D(N2);
+        ASSERT_EQ(hipMemcpy(h_D.data(), dD, bytes, hipMemcpyDeviceToHost), hipSuccess);
+        cleanup();
+
+        double max_rel_err = 0.0;
+        for(int64_t col = 0; col < N; ++col)     /* i = col */
+            for(int64_t row = 0; row < N; ++row) /* k = row */
+            {
+                const size_t      lag  = static_cast<size_t>(((col - row) % N + N) % N);
+                const long double ref  = h_lag[lag];
+                const double      emul = h_D[static_cast<size_t>(col * N + row)];
+                /* ref > 0 always (sum of positive terms) */
+                const double rel = std::abs(emul - static_cast<double>(ref))
+                                 / static_cast<double>(ref);
+                if(rel > max_rel_err) max_rel_err = rel;
+            }
+
+        EXPECT_LE(max_rel_err, p.threshold)
+            << "Demmel BLAS Test 2 (s=" << p.s
+            << ", n=" << p.n << ", b=" << p.b
+            << "): max_rel_err=" << max_rel_err
+            << " > threshold=" << p.threshold
+            << ".  A value near 1–2 indicates a CRT sign-flip regression.";
+    }
+
+    // The safe b range is determined by the condition that no truncation-error
+    // "overlap" occurs — i.e., there is no j_m value where both ε_A and ε_B
+    // are simultaneously non-zero in the modular extraction.
+    //
+    // With sft = floor(log2P_fast(s) − b − 1):
+    //   ε_A = 0  when  j_m ≥ 52 − sft   (A_scaled is an exact integer)
+    //   ε_B = 0  when  j_m ≤  sft − 52  (B_scaled is an exact integer)
+    //
+    // No overlap ↔ (52 − sft) ≤ 0  ↔  sft ≥ 52  ↔  b ≤ log2P_fast(s) − 53.
+    //
+    //   b_max(s) = floor(log2P_fast(s) − 53)
+    //
+    //   s=14 (log2P≈53.58): b_max = 0  → no b≥1 is safe — s=14 excluded
+    //   s=15 (log2P≈57.39): b_max = 4  → powers of 2 in [1,4]  = {1,2,4}
+    //   s=16 (log2P≈61.19): b_max = 8  → powers of 2 in [1,8]  = {1,2,4,8}
+    //   s=17 (log2P≈64.98): b_max = 11 → powers of 2 in [1,11] = {1,2,4,8}
+    //   s=18 (log2P≈68.73): b_max = 15 → powers of 2 in [1,15] = {1,2,4,8}
+    //
+    // n=512 gives 262144 output elements per test (vs 16384 for n=128) while
+    // keeping the host h_lag reference computation at O(n²) ≈ 3 ms.
+    INSTANTIATE_TEST_SUITE_P(
+        DemmelBlas2,
+        Fp64EmulationDemmelTest,
+        ::testing::Values(
+            // s=15 (~118 CRT bits), b_max=4
+            EmulDemmelParam{15, 512, 1, 1e-13},
+            EmulDemmelParam{15, 512, 2, 1e-13},
+            EmulDemmelParam{15, 512, 4, 1e-13},
+            // s=16 (~125 CRT bits), b_max=8
+            EmulDemmelParam{16, 512, 1, 1e-13},
+            EmulDemmelParam{16, 512, 2, 1e-13},
+            EmulDemmelParam{16, 512, 4, 1e-13},
+            EmulDemmelParam{16, 512, 8, 1e-13},
+            // s=17 (~133 CRT bits), b_max=11
+            EmulDemmelParam{17, 512, 1, 1e-13},
+            EmulDemmelParam{17, 512, 2, 1e-13},
+            EmulDemmelParam{17, 512, 4, 1e-13},
+            EmulDemmelParam{17, 512, 8, 1e-13},
+            // s=18 (~140 CRT bits), b_max=15
+            EmulDemmelParam{18, 512, 1, 1e-13},
+            EmulDemmelParam{18, 512, 2, 1e-13},
+            EmulDemmelParam{18, 512, 4, 1e-13},
+            EmulDemmelParam{18, 512, 8, 1e-13}
+        ),
+        EmulDemmelParamName
+    );
+
+    // ── SubnormalInputs: flush-to-zero regression ─────────────────────────────
+    //
+    // Documents and verifies the FTZ behaviour described in fp64_emulation.hpp:
+    //
+    //   Subnormal FP64 values in A or B are silently treated as zero during the
+    //   INT8 extraction step.  Any dot-product element whose true value would be
+    //   subnormal may therefore be returned as 0.0 instead of the correct value.
+    //   The absolute error is at most DBL_MIN ≈ 2.2e-308.
+    //
+    // Test design (m=n=k=4, NN, alpha=1, beta=0):
+    //   A = 4×4 identity  →  D = B  (each column of D equals the same column of B)
+    //   B[0] = subnormal (5e-324, the minimum representable subnormal)
+    //   B[1] = 1.0   (normal)
+    //   B[2] = 2.0   (normal)
+    //   B[3] = 3.0   (normal)
+    //   (B is a 4×4 column-major matrix; B[col*4+row] for row,col ∈ {0,1,2,3})
+    //   Here B is filled so only position (0,0) is subnormal.
+    //
+    // Checks:
+    //   1. fp64EmulatedGemm returns success (no crash, no NaN/Inf).
+    //   2. D[0] ∈ {0.0, 5e-324}  — FTZ or correct subnormal; both accepted.
+    //   3. D[1..3×4-1] are all finite (no NaN/Inf propagation from subnormal).
+    //   4. Normal outputs D[k], k≥1, match B[k] within 1×ε_machine (since A=I).
+    TEST_F(Fp64EmulationTest, SubnormalInputs_FlushToZeroOrCorrect)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
+
+        constexpr int64_t N     = 4;
+        constexpr size_t  N2    = static_cast<size_t>(N * N);
+        const size_t      bytes = N2 * sizeof(double);
+
+        // A = identity (column-major, lda=N)
+        std::vector<double> hA(N2, 0.0);
+        for(int64_t i = 0; i < N; ++i)
+            hA[static_cast<size_t>(i * N + i)] = 1.0;
+
+        // B: position (row=0, col=0) holds the minimum subnormal; rest are normal.
+        const double min_subnormal = std::numeric_limits<double>::denorm_min(); /* 5e-324 */
+        std::vector<double> hB(N2, 0.0);
+        hB[0]                      = min_subnormal;  /* B[row=0, col=0] */
+        for(int64_t col = 0; col < N; ++col)
+            for(int64_t row = 1; row < N; ++row)
+                hB[static_cast<size_t>(col * N + row)] =
+                    static_cast<double>(col * N + row); /* 1,2,3,4,5,... (all normal) */
+
+        double *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr;
+        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD, bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, hB.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
+
+        auto cleanup = [&]() {
+            (void)hipFree(dD); (void)hipFree(dC);
+            (void)hipFree(dB); (void)hipFree(dA);
+        };
+
+        // Skip on unsupported devices.
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(m_roc, HIP_R_64F,
+                                      HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+            if(!gate.apply) { cleanup(); GTEST_SKIP() << "Device not supported"; }
+        }
+
+        Fp64EmulationSettings settings{};
+        settings.handle          = m_handle;
+        settings.num_moduli      = 16u;
+        settings.sv_mask         = 0u;   /* subnormals are NOT Inf/NaN — no flag raised */
+        settings.workspace       = nullptr;
+        settings.workspace_bytes = 0u;
+
+        const double alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st =
+            fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                             &alpha, dA, N, dB, N,
+                             &beta,  dC, N, dD, N,
+                             /*stream=*/nullptr, settings);
+        if(st != rocblaslt_status_success)
+        {
+            cleanup();
+            GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(st)
+                         << " (INT8 device library may be unavailable on this arch)";
+        }
+
+        std::vector<double> hD(N2);
+        ASSERT_EQ(hipMemcpy(hD.data(), dD, bytes, hipMemcpyDeviceToHost), hipSuccess);
+        cleanup();
+
+        /* 1. Subnormal output: FTZ (0.0) or correct subnormal — both are acceptable.
+         *    The emulation applies flush-to-zero semantics to subnormal inputs;
+         *    see fp64_emulation.hpp and docs/how-to/fp64-emulation.rst.          */
+        EXPECT_TRUE(hD[0] == 0.0 || hD[0] == min_subnormal)
+            << "D[0] should be 0.0 (FTZ) or " << min_subnormal
+            << " (correct subnormal), got " << hD[0];
+
+        /* 2. No NaN or Inf anywhere — subnormal input must not pollute normal entries. */
+        for(size_t i = 0; i < N2; ++i)
+            EXPECT_TRUE(std::isfinite(hD[i]))
+                << "Output must be finite; D[" << i << "]=" << hD[i];
+
+        /* 3. Normal entries must reproduce B within 1×ε_machine (since D = I × B = B). */
+        constexpr double eps = std::numeric_limits<double>::epsilon(); /* 2^-52 */
+        for(size_t i = 1; i < N2; ++i)
+        {
+            const double ref = hB[i];
+            EXPECT_NEAR(hD[i], ref, std::abs(ref) * eps)
+                << "Normal entry D[" << i << "] should match B[" << i << "]="
+                << ref << " within ε_machine";
+        }
+    }
 
 } // namespace

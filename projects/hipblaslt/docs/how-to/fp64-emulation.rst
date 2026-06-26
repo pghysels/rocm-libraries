@@ -105,7 +105,7 @@ The library selects the minimum number of moduli required to meet the target:
    # 55 bits ≈ 7 moduli (fixed-mode minimum for correct FP64 results on typical inputs)
    export HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT=55
 
-   # 79 bits ≈ 10 moduli (ADP adaptive maximum)
+   # 79 bits ≈ 10 moduli
    export HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT=79
 
    # 125 bits ≈ 16 moduli (default — full FP64 accuracy)
@@ -115,16 +115,16 @@ The library selects the minimum number of moduli required to meet the target:
 
 Two mantissa control modes are available:
 
-*  ``HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC`` (default) — the library automatically selects
+*  ``HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC`` (default) — the library automatically selects
    the number of moduli based on an arithmetic-intensity model.
-*  ``HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED`` — use the exact bit count set by
+*  ``HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED`` — use the exact bit count set by
    ``hipblasLtSetFixedPointEmulationMaxMantissaBitCount``.
 
 .. code-block:: c
 
    // Switch to fixed mode and request ≈125 mantissa bits (16 moduli).
    hipblasLtSetFixedPointEmulationMantissaControl(
-       handle, HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED);
+       handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED);
    hipblasLtSetFixedPointEmulationMaxMantissaBitCount(handle, 125);
 
 Configuring Inf/NaN detection
@@ -145,6 +145,73 @@ Or via the API:
 .. code-block:: c
 
    hipblasLtSetEmulationSpecialValuesSupport(handle, 0u);
+
+Numerical behavior and limitations
+=====================================
+
+Inf and NaN inputs
+------------------
+
+By default (``HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK=3``), the emulation checks every
+element of the input matrices for Inf and NaN before computing.
+If any Inf or NaN is found, the emulation falls back internally to native FP64 DGEMM, which
+propagates the Inf or NaN to the output in the standard IEEE 754 manner.
+``hipblasLtMatmul`` returns ``HIPBLAS_STATUS_SUCCESS``; non-finite values appear in D exactly
+as they would without emulation.
+The per-call device-to-host synchronization for the check can be skipped by setting mask ``0``
+if your application guarantees finite inputs.
+
+Subnormal inputs (flush-to-zero semantics)
+-------------------------------------------
+
+The emulation applies **flush-to-zero (FTZ) semantics to subnormal inputs**.
+Subnormal FP64 values (magnitudes between roughly ``5×10⁻³²⁴`` and ``2.2×10⁻³⁰⁸``) are not
+detected by the special-values mask and are **silently treated as zero** during the INT8
+extraction step.
+
+Specifically:
+
+*  During the preliminary per-row shift computation, any row whose maximum absolute value is
+   below ``10⁻³⁰⁰`` is treated as a unit-magnitude row (the subnormal or zero guard prevents
+   ``log2(0)``).
+*  During the final extraction, each element is scaled by ``2^sft`` and then truncated to the
+   nearest integer.
+   For subnormal values, this product is still subnormal (less than ``2⁻¹⁰¹⁶``), so the integer
+   truncation returns **zero**.
+
+**Consequence**: if the true result of a dot product is a subnormal FP64 value, the emulated
+result may be returned as **0.0** instead of the correct subnormal.
+The absolute error is at most ``2.2×10⁻³⁰⁸`` (the minimum normal double).
+Native FP64 DGEMM handles gradual underflow correctly and will return the true subnormal value.
+
+If subnormal correctness is required, disable emulation for the affected GEMMs
+(``hipblasLtSetEmulationEnabled(handle, false)``) or use the eager strategy only for the
+computationally intensive part of your workload where subnormal outputs are unlikely.
+
+Extreme dynamic range — ADP overflow fallback
+----------------------------------------------
+
+Native FP64 DGEMM can produce ``Inf`` from finite inputs when the magnitude of the inner
+products exceeds the FP64 range (approximately when
+``max(|A|) × max(|B|) × k > 1.8 × 10³⁰⁸``).
+The emulation works through scaled INT8 integer arithmetic and cannot itself produce ``Inf``,
+so it must detect these cases and fall back rather than returning a wrong finite result.
+
+In **ADP mode** (``HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC``, the default), the library
+estimates the required CRT capacity from the preliminary INT8 GEMM result.
+For inputs that would overflow native FP64 DGEMM, the required CRT capacity is far above the
+maximum supported (~140 bits, 18 moduli), so ADP detects this and falls back internally to
+native FP64 DGEMM.
+The native path then correctly computes the result, including ``Inf`` when appropriate.
+``hipblasLtMatmul`` returns ``HIPBLAS_STATUS_SUCCESS``.
+A rate-limited warning is also printed to ``stderr`` (at most 5 times per process).
+
+In **fixed-s mode** (``HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED``), no CRT overflow check is
+performed.
+For inputs that would overflow native FP64 DGEMM, fixed-s emulation silently produces a wrong
+finite result instead of ``Inf``.
+Users who opt into fixed-s mode should ensure that their inputs do not cause DGEMM overflow
+(for example by keeping input magnitudes well below ``2^500``).
 
 Environment variables reference
 ==================================
@@ -205,14 +272,14 @@ hipblasLtSetFixedPointEmulationMantissaControl
 
    hipblasStatus_t hipblasLtSetFixedPointEmulationMantissaControl(
        hipblasLtHandle_t                 handle,
-       hipblasEmulationMantissaControl_t control);
+       hipblasLtEmulationMantissaControl_t control);
 
 Sets the mantissa precision control mode for a handle.
-Valid values for ``hipblasEmulationMantissaControl_t``:
+Valid values for ``hipblasLtEmulationMantissaControl_t``:
 
-*  ``HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC`` — automatically select the number of moduli
+*  ``HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC`` — automatically select the number of moduli
    (ADP mode; default).
-*  ``HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED`` — use the exact bit count set by
+*  ``HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED`` — use the exact bit count set by
    ``hipblasLtSetFixedPointEmulationMaxMantissaBitCount``.
 
 hipblasLtSetFixedPointEmulationMaxMantissaBitCount

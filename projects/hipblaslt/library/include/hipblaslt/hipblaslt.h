@@ -95,9 +95,9 @@ typedef enum {
  *  \brief Mantissa precision control for FP64 fixed-point emulation.
  */
 typedef enum {
-    HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC = 0, /**<Use dynamic mantissa control. Runtime ADP is not enabled yet; current builds use the existing default emulation precision. */
-    HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED   = 1, /**<Use the fixed bit count set by hipblasLtSetFixedPointEmulationMaxMantissaBitCount(). */
-} hipblasEmulationMantissaControl_t;
+    HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC = 0, /**<Use dynamic mantissa control. Runtime ADP is not enabled yet; current builds use the existing default emulation precision. */
+    HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED   = 1, /**<Use the fixed bit count set by hipblasLtSetFixedPointEmulationMaxMantissaBitCount(). */
+} hipblasLtEmulationMantissaControl_t;
 
 /*! \ingroup types_module
  *  \brief Specifies the enumeration type to set the postprocessing options for the epilogue.
@@ -1225,7 +1225,7 @@ hipblasStatus_t hipblasLtGetEmulationStrategy(hipblasLtHandle_t             hand
 HIPBLASLT_EXPORT
 hipblasStatus_t hipblasLtSetFixedPointEmulationMantissaControl(
     hipblasLtHandle_t                 handle,
-    hipblasEmulationMantissaControl_t control);
+    hipblasLtEmulationMantissaControl_t control);
 
 /*! \ingroup library_module
  *  \brief Set the maximum CRT mantissa bit count for FP64 fixed-point emulation.

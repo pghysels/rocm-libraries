@@ -127,6 +127,16 @@ struct Fp64EmulationSettings {
  * device pointers to double arrays. C and D may be the same pointer.
  * Only non-batched (batch count == 1) FP64 GEMM is supported.
  *
+ * Subnormal inputs (flush-to-zero semantics)
+ * -------------------------------------------
+ * Subnormal FP64 values in A or B (magnitudes in the range [DBL_TRUE_MIN,
+ * DBL_MIN)) are silently treated as zero during the INT8 extraction step.
+ * Any dot-product element whose true value would be subnormal may therefore
+ * be returned as 0.0 instead of the correct subnormal.  The absolute error
+ * is at most DBL_MIN ≈ 2.2e-308.
+ * If subnormal correctness is required, disable emulation for the affected
+ * GEMMs or fall back to native FP64 DGEMM.
+ *
  * Returns rocblaslt_status_success on success,
  *         rocblaslt_status_memory_error if workspace allocation fails,
  *         rocblaslt_status_invalid_value if Inf/NaN is detected in the inputs

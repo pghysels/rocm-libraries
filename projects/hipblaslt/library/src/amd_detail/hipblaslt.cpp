@@ -884,12 +884,12 @@ catch(...)
 
 hipblasStatus_t hipblasLtSetFixedPointEmulationMantissaControl(
     hipblasLtHandle_t                 handle,
-    hipblasEmulationMantissaControl_t control)
+    hipblasLtEmulationMantissaControl_t control)
 try
 {
     if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    if(control < HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC
-       || control > HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED)
+    if(control < HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC
+       || control > HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED)
         return HIPBLAS_STATUS_INVALID_VALUE;
     auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
     h->emulation.mantissa_control = static_cast<int>(control);

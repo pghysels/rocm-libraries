@@ -610,7 +610,8 @@ struct Fp64PerfModelTimes {
 
 static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool tA, bool tB,
                                                       int64_t m, int64_t n, int64_t k,
-                                                      unsigned num_moduli, int device)
+                                                      unsigned num_moduli, int device,
+                                                      bool dynamic_mode = false)
 {
     const auto hw_opt = oz2_get_perf_model_params(device);
     assert(hw_opt.has_value() &&
@@ -620,6 +621,11 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool tA, bool tB,
     static constexpr double LATENCY_KERNEL = 5.0e-6;
     static constexpr double LATENCY_MATMUL = 10.0e-6;
     static constexpr double LATENCY_MEMSET = 2.0e-6;
+    /* CPU-GPU roundtrip for hipStreamSynchronize: the host parks until the GPU
+     * drains and signals, then re-queues the remaining kernels.  This is a
+     * true OS/driver latency, distinct from the GPU-side LATENCY_KERNEL or
+     * LATENCY_MATMUL scheduling overheads.                                  */
+    static constexpr double LATENCY_SYNC   = 50.0e-6;
 
     const double c0 = hw.latency / LATENCY_MATMUL;
     const double c1 = c0 * hw.ai;
@@ -674,16 +680,26 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool tA, bool tB,
 
     /* Scale always runs.  Fused kernel replaces only GEMM + CRT accum. */
     const double t_gemm_accum  = std::min(t_int8_gemms + t_accum_kern, t_fused);
+    /* ADP (dynamic-mode) overhead: two small reduction kernels (oz2_adp_reduce_A
+     * reads m ints; oz2_adp_reduce_B reads the full m×n C32i matrix), followed by
+     * a hipStreamSynchronize that blocks the CPU until the GPU drains so the host
+     * can inspect the results and choose effective_s.
+     * LATENCY_SYNC is the CPU-GPU roundtrip latency (distinct from the GPU-side
+     * LATENCY_KERNEL or LATENCY_MATMUL scheduling overheads).                  */
+    const double t_adp = dynamic_mode
+        ? LATENCY_KERNEL                            /* oz2_adp_reduce_A  */
+        + std::max(4.0 * mn / c0, LATENCY_KERNEL)  /* oz2_adp_reduce_B  */
+        + LATENCY_SYNC                              /* hipStreamSynchronize */
+        : 0.0;
     const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
-                               + t_scale_kern  + t_gemm_accum  + t_host;
+                               + t_scale_kern  + t_gemm_accum  + t_host + t_adp;
     const double t_native      = std::max(2.0 * mnk / c1, 8.0 * (mk + kn + mn) / c0) + LATENCY_MATMUL;
 
     constexpr double s2ms = 1000.0;
-    const double t_fused_ret = t_fused * s2ms;
     return { t_prelim_kern * s2ms, t_prelim_gemm * s2ms, t_refine_kern * s2ms,
              t_scale_kern  * s2ms, t_int8_gemms  * s2ms, t_accum_kern  * s2ms,
              t_host        * s2ms, t_launch      * s2ms,
-             t_fused_ret,
+             t_fused       * s2ms,
              t_total       * s2ms, t_native      * s2ms };
 }
 
@@ -697,9 +713,10 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool tA, bool tB,
  * recursive sub-call for the half discovers and accounts for those deeper
  * splits, returning the true best achievable time for that half.       */
 static double oz2_effective_time_ms(bool tA, bool tB,
-                                    int64_t m, int64_t n, int64_t k, unsigned s, int device)
+                                    int64_t m, int64_t n, int64_t k, unsigned s, int device,
+                                    bool dynamic_mode = false)
 {
-    const double t_mono = fp64EmulationPerfModelTimes(tA, tB, m, n, k, s, device).t_total_ms;
+    const double t_mono = fp64EmulationPerfModelTimes(tA, tB, m, n, k, s, device, dynamic_mode).t_total_ms;
 
     const unsigned chunk_sz = oz2_compute_chunk_size(m, n, s);
     const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -710,7 +727,7 @@ static double oz2_effective_time_ms(bool tA, bool tB,
 
         /* Both halves are nearly identical in size (differ by at most 1 when
          * m or n is odd), so approximate t_split = 2 × t_half.             */
-        const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, s, device);
+        const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode);
         if(t_split <= t_mono * 1.01)
             return t_split;
     }
@@ -762,10 +779,13 @@ bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
                                    hipblasOperation_t opA, hipblasOperation_t opB,
                                    int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
-    const int  device = h->device;
-    const bool tA     = (opA != HIPBLAS_OP_N);
-    const bool tB     = (opB != HIPBLAS_OP_N);
-    const double t_emul   = oz2_effective_time_ms(tA, tB, m, n, k, num_moduli, device);
+    const int  device      = h->device;
+    const bool tA          = (opA != HIPBLAS_OP_N);
+    const bool tB          = (opB != HIPBLAS_OP_N);
+    /* Include ADP overhead when the handle is configured for dynamic (ADP) mode,
+     * so the performance gate correctly accounts for the hipStreamSynchronize cost. */
+    const bool dyn         = (h->emulation.mantissa_control != 1);
+    const double t_emul   = oz2_effective_time_ms(tA, tB, m, n, k, num_moduli, device, dyn);
     const double t_native = fp64EmulationPerfModelTimes(tA, tB, m, n, k, num_moduli, device).t_native_ms;
     return t_emul <= t_native;
 }
@@ -2441,13 +2461,14 @@ static const char* oz2_profile_file()
 /* HIPBLASLT_EMULATION_FUSED controls whether the fused MFMA+CRT kernel is used:
  *   "on"  / "force"      → always use fused (bypasses performance model)
  *   "off" / "never"      → never  use fused (forces non-fused path)
- *   "auto"/ "performant" → performance model decides (default)               */
+ *   "auto"/ "performant" → performance model decides
+ *   unset (default)      → OFF — fused kernel disabled until production-ready */
 enum class Oz2FusedMode { AUTO, ON, OFF };
 static Oz2FusedMode oz2_fused_mode()
 {
     static const Oz2FusedMode v = []() -> Oz2FusedMode {
         const char* e = std::getenv("HIPBLASLT_EMULATION_FUSED");
-        if (e == nullptr) return Oz2FusedMode::AUTO;
+        if (e == nullptr) return Oz2FusedMode::OFF;   /* disabled by default */
         if (std::strcmp(e, "on") == 0 || std::strcmp(e, "force") == 0)
             return Oz2FusedMode::ON;
         if (std::strcmp(e, "off") == 0 || std::strcmp(e, "never") == 0)
