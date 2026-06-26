@@ -79,6 +79,46 @@ set_target_properties(fp64_emul_accuracy PROPERTIES
     BUILD_RPATH  "${HIPBLASLT_BUILD_DIR}/library"
     INSTALL_RPATH "${HIPBLASLT_BUILD_DIR}/library")
 
+# ── papers_fig234_bench ───────────────────────────────────────────────────────
+# Reproduces Figures 2, 3, and 4 from arXiv:2511.13778:
+#   Fig 2  : BLAS Test 2 — max error vs. exponent-range parameter b
+#   Fig 3/4: Grade A criterion — componentwise error vs. matrix size N
+#
+# Run:
+#   ./build/papers_fig234_bench [--fig 2|34|all] [options]
+#   python3 src/papers_fig234_plot.py
+add_executable(papers_fig234_bench
+    src/papers_fig234_bench.cpp)
+
+set_source_files_properties(
+    src/papers_fig234_bench.cpp
+    PROPERTIES LANGUAGE HIP)
+
+target_link_libraries(papers_fig234_bench
+    PRIVATE
+        hipblaslt_bt
+        hip::device)
+
+target_include_directories(papers_fig234_bench
+    PRIVATE
+        "/opt/rocm/include")
+
+target_compile_features(papers_fig234_bench PRIVATE cxx_std_17)
+
+set_target_properties(papers_fig234_bench PROPERTIES
+    BUILD_RPATH  "${HIPBLASLT_BUILD_DIR}/library"
+    INSTALL_RPATH "${HIPBLASLT_BUILD_DIR}/library")
+
+# ── s14_diag — diagnostic for the s=14 library bug ───────────────────────────
+add_executable(s14_diag src/s14_diag.cpp)
+set_source_files_properties(src/s14_diag.cpp PROPERTIES LANGUAGE HIP)
+target_link_libraries(s14_diag PRIVATE hipblaslt_bt hip::device)
+target_include_directories(s14_diag PRIVATE "/opt/rocm/include")
+target_compile_features(s14_diag PRIVATE cxx_std_17)
+set_target_properties(s14_diag PROPERTIES
+    BUILD_RPATH  "${HIPBLASLT_BUILD_DIR}/library"
+    INSTALL_RPATH "${HIPBLASLT_BUILD_DIR}/library")
+
 # ── Correctness test ─────────────────────────────────────────────────────────
 # Tests all 4 transpose combinations and alpha/beta ∈ {-2,-1,0,1,2}.
 # Compares emulated DGEMM against native DGEMM element-wise.
