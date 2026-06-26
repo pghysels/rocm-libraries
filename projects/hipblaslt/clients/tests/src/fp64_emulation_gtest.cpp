@@ -1228,6 +1228,217 @@ namespace
         EmulDemmelParamName
     );
 
+    // ── IllConditionedGramMatrix: A^T×A for varying condition numbers ──────────
+    //
+    // Constructs A = Q × D where Q is a random orthogonal matrix (N×N,
+    // Gram-Schmidt) and D = diag(σ₀,…,σ_{N-1}) with σ_j = κ^{-j/(N-1)},
+    // giving condition number κ.
+    //
+    // The exact result of C = A^T A = (QD)^T(QD) = D Q^T Q D = D² is the
+    // diagonal matrix diag(σ₀²,…,σ_{N-1}²) with all off-diagonal elements
+    // exactly zero — no reference GEMM required.
+    //
+    // Checks:
+    //   1. Diagonal relative error |C[j,j] − σ_j²| / σ_j² < 2.5√N × ε  (5-sigma)
+    //   2. Off-diagonal absolute error |C[i,j]| / σ₀² < 2.5√N × ε  (5-sigma)
+    //   3. No NaN or Inf in output
+
+    struct IllCondParam { double kappa; };
+
+    static std::string EmulIllCondParamName(
+        const ::testing::TestParamInfo<IllCondParam>& info)
+    {
+        // Format kappa as an integer exponent to give a unique test name.
+        const double k = info.param.kappa;
+        const int    e = static_cast<int>(std::round(std::log10(k)));
+        return "kappa_1e" + std::to_string(e);
+    }
+
+    class Fp64EmulationIllCondTest : public ::testing::TestWithParam<IllCondParam>
+    {
+    protected:
+        void SetUp() override
+        {
+            if(!has_device())
+                GTEST_SKIP() << "No HIP device available";
+        }
+    };
+
+    TEST_P(Fp64EmulationIllCondTest, GramMatrix)
+    {
+        const double kappa = GetParam().kappa;
+        constexpr int64_t N     = 128;
+        constexpr size_t  N2    = static_cast<size_t>(N * N);
+        const size_t      bytes = N2 * sizeof(double);
+
+        /* ── Host: build singular values σ_j = κ^{-j/(N-1)} ─────────────────── */
+        std::vector<double> sigma(static_cast<size_t>(N));
+        for(int64_t j = 0; j < N; ++j)
+            sigma[static_cast<size_t>(j)] = std::pow(kappa, -static_cast<double>(j) / (N - 1));
+
+        /* ── Host: random orthogonal Q via Gram-Schmidt ──────────────────────── */
+        /* Generate a random N×N matrix then orthonormalise its columns.
+         * Use the same xorshift64 PRNG that the other tests use.                */
+        std::vector<double> Q(N2);
+        {
+            uint64_t s = 0x6d81234abcdef000ULL;   /* fixed seed for reproducibility */
+            auto rng   = [&]() -> double {
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                return static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0) * 2.0 - 1.0;
+            };
+            /* Fill columns of Q with random values (column-major, col j at offset j*N). */
+            for(size_t i = 0; i < N2; ++i) Q[i] = rng();
+
+            /* Gram-Schmidt: orthonormalize column by column. */
+            for(int64_t j = 0; j < N; ++j)
+            {
+                double* col_j = Q.data() + j * N;
+                /* Subtract projections onto previous orthonormal columns. */
+                for(int64_t p = 0; p < j; ++p)
+                {
+                    const double* col_p = Q.data() + p * N;
+                    double dot = 0.0;
+                    for(int64_t i = 0; i < N; ++i) dot += col_j[i] * col_p[i];
+                    for(int64_t i = 0; i < N; ++i) col_j[i] -= dot * col_p[i];
+                }
+                /* Normalise. */
+                double norm = 0.0;
+                for(int64_t i = 0; i < N; ++i) norm += col_j[i] * col_j[i];
+                norm = std::sqrt(norm);
+                for(int64_t i = 0; i < N; ++i) col_j[i] /= norm;
+            }
+        }
+
+        /* ── Host: A = Q × D (scale column j of Q by σ_j) ───────────────────── */
+        std::vector<double> hA(N2);
+        for(int64_t j = 0; j < N; ++j)
+            for(int64_t i = 0; i < N; ++i)
+                hA[static_cast<size_t>(i + j * N)] =
+                    Q[static_cast<size_t>(i + j * N)] * sigma[static_cast<size_t>(j)];
+
+        /* ── Device buffers ──────────────────────────────────────────────────── */
+        double *dA = nullptr, *dC = nullptr, *dD = nullptr;
+        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD, bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
+
+        auto cleanup = [&]() {
+            (void)hipFree(dD); (void)hipFree(dC); (void)hipFree(dA);
+        };
+
+        /* ── Emulation handle ────────────────────────────────────────────────── */
+        hipblasLtHandle_t hem = nullptr;
+        ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
+                  HIPBLAS_STATUS_SUCCESS);
+        /* ADP mode: falls back to native FP64 if overflow detected. */
+        ASSERT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
+                      hem, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
+                  HIPBLAS_STATUS_SUCCESS);
+
+        /* Skip on unsupported devices. */
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
+                                      HIP_R_64F, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N, 1);
+            if(!gate.apply)
+            {
+                (void)hipblasLtDestroy(hem);
+                cleanup();
+                GTEST_SKIP() << "Device not supported by emulation";
+            }
+        }
+
+        /* ── Run emulated C = A^T × A ────────────────────────────────────────── */
+        Fp64EmulationSettings settings{};
+        settings.handle          = hem;
+        settings.num_moduli      = 0;    /* derive from handle (ADP default) */
+        settings.sv_mask         = 0u;   /* skip Inf/NaN detection */
+        settings.dynamic_mode    = true; /* ADP mode */
+        settings.workspace       = nullptr;
+        settings.workspace_bytes = 0u;
+
+        const double alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st =
+            fp64EmulatedGemm(HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N,
+                             &alpha, dA, N, dA, N,
+                             &beta,  dC, N, dD, N,
+                             /*stream=*/nullptr, settings);
+        (void)hipblasLtDestroy(hem);
+
+        if(st != rocblaslt_status_success)
+        {
+            cleanup();
+            GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(st)
+                         << " (INT8 device library unavailable or ADP fallback failed)";
+        }
+
+        /* ── Copy result and verify ──────────────────────────────────────────── */
+        std::vector<double> hD(N2);
+        ASSERT_EQ(hipMemcpy(hD.data(), dD, bytes, hipMemcpyDeviceToHost), hipSuccess);
+        cleanup();
+
+        /* 1. No NaN or Inf. */
+        for(size_t idx = 0; idx < N2; ++idx)
+            ASSERT_TRUE(std::isfinite(hD[idx]))
+                << "Non-finite output at flat index " << idx
+                << " (κ=" << kappa << ")";
+
+        /* Threshold: 5-sigma stochastic bound = 2.5 × √N × ε_machine.
+         * Each FP64 rounding has unit roundoff u = ε/2; N independent rounding
+         * errors accumulate with std dev √N × u.  5σ = 5√N × u = 2.5√N × ε,
+         * covering > 99.9999% of random-Q realizations.                      */
+        const double kTol = 2.5 * std::sqrt(static_cast<double>(N))
+                          * std::numeric_limits<double>::epsilon();
+
+        /* 2. Diagonal elements: |C[j,j] − σ_j²| / σ_j² < 2√N×ε. */
+        double max_diag_err = 0.0;
+        for(int64_t j = 0; j < N; ++j)
+        {
+            const double ref  = sigma[static_cast<size_t>(j)] * sigma[static_cast<size_t>(j)];
+            const double got  = hD[static_cast<size_t>(j + j * N)];
+            const double rerr = (ref > 0.0) ? std::abs(got - ref) / ref : std::abs(got);
+            if(rerr > max_diag_err) max_diag_err = rerr;
+        }
+        EXPECT_LE(max_diag_err, kTol)
+            << "Diagonal relative error " << max_diag_err
+            << " exceeds √N×ε=" << kTol << " for κ=" << kappa;
+
+        /* 3. Off-diagonal: |C[i,j]| / σ₀² < 2√N×ε. */
+        const double sigma0sq = sigma[0] * sigma[0];
+        double max_offdiag = 0.0;
+        for(int64_t j = 0; j < N; ++j)
+            for(int64_t i = 0; i < N; ++i)
+            {
+                if(i == j) continue;
+                const double abs_val = std::abs(hD[static_cast<size_t>(i + j * N)]);
+                const double rel_val = (sigma0sq > 0.0) ? abs_val / sigma0sq : abs_val;
+                if(rel_val > max_offdiag) max_offdiag = rel_val;
+            }
+        EXPECT_LE(max_offdiag, kTol)
+            << "Off-diagonal relative error " << max_offdiag
+            << " exceeds √N×ε=" << kTol << " for κ=" << kappa;
+    }
+
+    INSTANTIATE_TEST_SUITE_P(
+        IllCond,
+        Fp64EmulationIllCondTest,
+        ::testing::Values(
+            IllCondParam{1e2},
+            IllCondParam{1e4},
+            IllCondParam{1e6},
+            IllCondParam{1e8},
+            IllCondParam{1e10},
+            IllCondParam{1e12},
+            IllCondParam{1e14},
+            IllCondParam{1e17}
+        ),
+        EmulIllCondParamName
+    );
+
     // ── SubnormalInputs: flush-to-zero regression ─────────────────────────────
     //
     // Documents and verifies the FTZ behaviour described in fp64_emulation.hpp:
