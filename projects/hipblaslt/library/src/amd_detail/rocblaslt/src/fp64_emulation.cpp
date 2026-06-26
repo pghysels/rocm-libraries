@@ -50,9 +50,15 @@
 #include <cstdio>       // std::fopen / std::fprintf / std::fclose / std::ftell
 #include <cstring>      // std::strcmp
 #include <cmath>        // std::log2, std::floor, etc.
+#include <cstdlib>      // std::getenv
+#include <cstdio>       // std::fopen / std::fprintf / std::fclose / std::ftell
+#include <cstring>      // std::strcmp
+#include <cmath>        // std::log2, std::floor, etc.
 #include <cerrno>
 #include <climits>
 #include <atomic>
+#include <optional>     // std::optional
+#include <unordered_map>// std::unordered_map
 #include <optional>     // std::optional
 #include <unordered_map>// std::unordered_map
 
@@ -807,37 +813,33 @@ struct Fp64EmulationMantissaPolicy {
 
 static Fp64EmulationMantissaPolicy resolve_mantissa_policy(const _rocblaslt_handle* h)
 {
-    const auto& mantissa_env = cached_mantissa_bit_count_env();
-    if((h->emulation.mantissa_control < 0
-        || (h->emulation.mantissa_control == HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED
-            && h->emulation.max_mantissa_bits < 0))
-       && invalid_if_set(mantissa_env) != rocblaslt_status_success) {
-        return {rocblaslt_status_invalid_value, 0u, false};
-    }
-
-    if(h->emulation.mantissa_control == HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED
-       && h->emulation.max_mantissa_bits >= 0) {
-        return {rocblaslt_status_success,
-                num_moduli_for_mantissa_bits(static_cast<unsigned>(h->emulation.max_mantissa_bits)),
-                false};
-    }
-
-    if(h->emulation.mantissa_control < 0
-       && mantissa_env.state == FP64_EMULATION_ENV_VALID) {
-        return {rocblaslt_status_success,
-                num_moduli_for_mantissa_bits(mantissa_env.value),
-                false};
-    }
-
-    return {rocblaslt_status_success, FP64_EMULATION_DEFAULT_NUM_MODULI, true};
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0x3u};
+    char*         endp = nullptr;
+    const long    v    = std::strtol(value, &endp, 0);
+    if(endp == value || *endp != '\0' || v < 0)
+        return {FP64_EMULATION_ENV_INVALID, 0u};
+    return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
 }
 
-unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
+Fp64EmulationEnvValue fp64EmulationParseMantissaBitCountEnv(const char* value)
 {
-    const Fp64EmulationMantissaPolicy policy = resolve_mantissa_policy(h);
-    return policy.status == rocblaslt_status_success ? policy.num_moduli
-                                                     : FP64_EMULATION_DEFAULT_NUM_MODULI;
+    if(value == nullptr) return {FP64_EMULATION_ENV_UNSET, 0u};
+    char*      endp = nullptr;
+    const long v    = std::strtol(value, &endp, 10);
+    if(endp == value || *endp != '\0' || v < 0 || v > 140)
+        return {FP64_EMULATION_ENV_INVALID, 0u};
+    return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
 }
+
+bool fp64EmulationIsValidMantissaBitCount(int value)
+{
+    return value >= -1 && value <= 140;
+}
+
+/* =========================================================================
+ * Status-returning emulation gate (replaces the bool fp64EmulationWouldApply
+ * for callers that need error propagation on bad env-var values).
+ * ========================================================================= */
 
 Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
                                             hipDataType              type_a,
@@ -882,9 +884,19 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
                                 ? h->emulation.special_values_mask
                                 : 0x3u);
 
-    const Fp64EmulationMantissaPolicy mantissa = resolve_mantissa_policy(h);
-    result.status = mantissa.status;
-    if(result.status != rocblaslt_status_success) return result;
+    /* Handle special_values_mask override. */
+    if(h->emulation.special_values_mask != ~0u)
+        result.sv_mask = h->emulation.special_values_mask;
+
+    /* dynamic_mode: DYNAMIC (ADP) mantissa control — adaptively selects
+     * the minimum s needed for FP64 precision on the given input data.   */
+    result.dynamic_mode = (h->emulation.mantissa_control != 1);
+
+    /* Strategy (eager vs performant). */
+    const bool eager = (h->emulation.strategy == 2)
+                     || (h->emulation.strategy != 1 && fp64EmulationIsEager());
+    if(eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, result.num_moduli))
+        result.apply = true;
 
     result.num_moduli   = mantissa.num_moduli;
     result.dynamic_mode = mantissa.dynamic_mode;
@@ -925,7 +937,8 @@ size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_
            + cola8i * sizeof(int16_t)
            + padn   * sizeof(int16_t)
            + sizeof(uint32_t)
-           + cola8i * sizeof(int32_t);
+           + cola8i * sizeof(int32_t)
+           + 2 * sizeof(float);     /* ADP float buffer: adp_buf[0..1] (bias ±200) */
 }
 
 unsigned fp64EmulationNumModuli()
@@ -1272,6 +1285,62 @@ oz2_refine_sftA_partial_kernel(const int32_t* __restrict__ C32i,
     if(local_max > 0) atomicMax(row_max + static_cast<size_t>(row), local_max);
 }
 
+/* ── ADP (Adaptive Precision) helpers ────────────────────────────────────── */
+/* atomicMax for non-negative floats: IEEE 754 positive floats are totally ordered
+ * by their integer bit representation, so int-based atomicMax is correct.
+ * The caller must ensure val ≥ 0 (we bias log2P_req values by +200 to guarantee this). */
+static __device__ __forceinline__ void oz2_adp_atomicMaxF(float* addr, float val)
+{
+    atomicMax(reinterpret_cast<int*>(addr), __float_as_int(val));
+}
+
+/* Computes global max of  (52 − sftA_init[i]) + 0.5·log2(row_max[i]) + 200
+ * over all rows i ∈ [0, m).  The +200 bias guarantees a non-negative result
+ * (log2P_req_unbiased is in ≈ [−50, 170] for any valid FP64 input).
+ * Subtract 200 on the host to recover the actual log2P requirement.
+ *
+ * Must be launched AFTER oz2_refine_sftA_partial_kernel (which fills row_max[])
+ * and BEFORE oz2_refine_sftA_apply_kernel (which overwrites sftA[]).           */
+__global__ static void
+oz2_adp_reduce_A_kernel(const int32_t* __restrict__ row_max,
+                         const int16_t* __restrict__ sftA_init,
+                         int64_t m,
+                         float* __restrict__ adp_A_out)
+{
+    __shared__ float s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
+    const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                      + static_cast<int64_t>(threadIdx.x);
+
+    /* Biased log2P requirement for this row.
+     * Skip rows where row_max == 0: those rows have all-zero preliminary inner
+     * products (e.g. zero-matrix inputs) and need zero CRT precision (s=2).
+     * Using max(row_max,1) would incorrectly return (52 − sftA_init) bits for
+     * zero rows because sftA_init=6 is a dummy value set for zero inputs.    */
+    float local_val = 0.0f;  /* 0.0f = biased −200 = needs no precision */
+    if(row < m && row_max[row] > 0) {
+        const int32_t rm   = row_max[row];
+        const float sftA_f = static_cast<float>(sftA_init[row]);
+        local_val = (52.0f - sftA_f) + 0.5f * log2f(static_cast<float>(rm)) + 200.0f;
+    }
+
+    /* Warp-level max reduction. */
+    for(int off = warpSize >> 1; off > 0; off >>= 1) {
+        float other = __shfl_down(local_val, off);
+        if(other > local_val) local_val = other;
+    }
+
+    if(threadIdx.x % warpSize == 0) s_wmax[threadIdx.x / warpSize] = local_val;
+    __syncthreads();
+
+    if(threadIdx.x == 0) {
+        float block_max = 0.0f;
+        const int nw = (blockDim.x + warpSize - 1) / warpSize;
+        for(int w = 0; w < nw; ++w)
+            if(s_wmax[w] > block_max) block_max = s_wmax[w];
+        oz2_adp_atomicMaxF(adp_A_out, block_max);
+    }
+}
+
 /* log2P is passed as a host-side float constant (from h_accu_log2P_all[s-2]).
  * For s=13,14,15 this is fast::log2P (1 bit below accu) to prevent the OZ2
  * CRT invariant |X_true| < M_s/2 from being violated by floor discretisation.
@@ -1289,6 +1358,43 @@ oz2_refine_sftA_apply_kernel(const int32_t* __restrict__ row_max,
     sftA[row] += static_cast<int16_t>(floorf(-0.5f * log2f(static_cast<float>(max_val)) + log2P));
 }
 
+/* Computes global max of  (52 − sftB_init[j]) + 0.5·log2(col_max[j]) + 200
+ * over all columns j ∈ [0, n).  col_max[j] is the per-column max of |C32i[i,j]|.
+ * Does NOT modify sftB[].  Must be launched BEFORE oz2_refine_sftB_kernel
+ * so that sftB[] still holds sftB_init (the initial values from step 1b).     */
+__global__ static void
+oz2_adp_reduce_B_kernel(const int32_t* __restrict__ C32i,
+                         int64_t m, int64_t n, size_t ldc32i,
+                         const int16_t* __restrict__ sftB_init,
+                         float* __restrict__ adp_B_out)
+{
+    __shared__ int32_t s_wmax[8];
+    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    if(col >= n) return;
+    int32_t local_max = 0;
+    for(int64_t i = threadIdx.x; i < m; i += blockDim.x) {
+        int32_t v  = C32i[static_cast<size_t>(i) + static_cast<size_t>(col) * ldc32i];
+        int32_t av = v < 0 ? -v : v;
+        if(av > local_max) local_max = av;
+    }
+    local_max = warp_reduce_max_abs_i32(local_max);
+    local_max = block_reduce_max_i32(local_max, s_wmax);
+    /* Skip zero columns for the same reason as zero rows in the A-side kernel:
+     * col_max == 0 means all preliminary products for this column are zero,
+     * so no CRT precision is needed (leaves adp_B_out at its init value 0.0f). */
+    if(threadIdx.x == 0 && local_max > 0) {
+        const float sftB_f = static_cast<float>(sftB_init[col]);
+        const float req_biased = (52.0f - sftB_f)
+                               + 0.5f * log2f(static_cast<float>(local_max))
+                               + 200.0f;
+        oz2_adp_atomicMaxF(adp_B_out, req_biased);
+    }
+}
+
+/* oz2_refine_sftB_kernel — computes per-column max of |C32i_prelim| and applies
+ * the shift-refinement delta to sftB[col].  When used in dynamic (ADP) mode, the
+ * log2P argument is already the correct value for effective_s (chosen after the
+ * ADP reduction above); no separate ADP output is needed here.                */
 __global__ static void
 oz2_refine_sftB_kernel(const int32_t* __restrict__ C32i,
                        int64_t m, int64_t n, size_t ldc32i,
@@ -2368,6 +2474,7 @@ struct Fp64ProfileAccum {
     float    t_int8        = 0.f;
     float    t_accum       = 0.f;
     float    t_finalize    = 0.f;
+    unsigned effective_s_used = 0u;   /* ADP: actual s chosen (= num_moduli in fixed mode) */
     unsigned n_sub_gemms   = 0u;
 };
 
@@ -2417,8 +2524,15 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
         }
     };
 
-    const unsigned chunk_size       = oz2_compute_chunk_size(m, n, num_moduli);
-    const unsigned scale_chunk_size = oz2_compute_scale_chunk_size(m, n, k, num_moduli, chunk_size);
+    /* In dynamic (ADP) mode the workspace was allocated for OZ2_S_MAX=18 moduli,
+     * so use OZ2_S_MAX for the chunk-size calculation.  This ensures:
+     *  - layout_moduli ≥ effective_s for any ADP-chosen effective_s
+     *  - chunk_size ≥ effective_s, so all moduli are processed in a single
+     *    scale pass + single GEMM pass regardless of effective_s (no 16+2 split)
+     *  - buffer layout is consistent with the workspace allocation             */
+    const unsigned layout_moduli    = settings.dynamic_mode ? OZ2_S_MAX : num_moduli;
+    const unsigned chunk_size       = oz2_compute_chunk_size(m, n, layout_moduli);
+    const unsigned scale_chunk_size = oz2_compute_scale_chunk_size(m, n, k, layout_moduli, chunk_size);
 
     const size_t lda8i  = oz2_pad(static_cast<size_t>(k));
     const size_t cola8i = oz2_pad(static_cast<size_t>(m));
@@ -2590,13 +2704,98 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     _pstart();
     const unsigned sftA_m_blks = static_cast<unsigned>((m + 63) / 64);
     const unsigned sftA_n_blks = static_cast<unsigned>((n + 63) / 64);
+    /* adp_buf: 2 floats at the end of the workspace for ADP (Adaptive Precision).
+     * [0] = biased max log2P_req for A-side (+200 bias, subtract on host)
+     * [1] = biased max log2P_req for B-side (+200 bias, subtract on host)
+     * Initialised to 0.0f (= biased −200 → effective_s=2 if all rows/cols zero). */
+    float* const adp_buf = reinterpret_cast<float*>(row_max + szRowMax);
+
+    /* effective_s: ADP may reduce this below num_moduli; determined BEFORE the
+     * shift-refinement delta is applied so we can use the correct log2P.       */
+    unsigned effective_s = num_moduli;
+
     (void)hipMemsetAsync(row_max, 0, szRowMax * sizeof(int32_t), stream);
     hipLaunchKernelGGL(oz2_refine_sftA_partial_kernel, dim3(sftA_m_blks, sftA_n_blks), dim3(64), 0, stream,
                        C32i, m, n, ldc32i, row_max);
+
+    /* ADP (dynamic mode): determine effective_s from the preliminary GEMM result
+     * BEFORE applying any shift delta.  Both ADP kernels read sftA_init and
+     * sftB_init (the values set in step 1a/1b, before any += delta).
+     * The refine delta is then applied using log2P_{effective_s} so that
+     * X_true is sized to fit within M_{effective_s}/2, not M_{num_moduli}/2.  */
+    if(settings.dynamic_mode) {
+        (void)hipMemsetAsync(adp_buf, 0, 2 * sizeof(float), stream);
+        /* A-side: reads row_max[] and sftA[] before apply_kernel modifies sftA. */
+        hipLaunchKernelGGL(oz2_adp_reduce_A_kernel, dim3(sftA_m_blks), dim3(OZ2_PRELIM_COALESC_THRS), 0, stream,
+                           row_max, sftA, m, adp_buf + 0);
+        /* B-side: reads C32i and sftB[] before refine_sftB_kernel modifies sftB. */
+        hipLaunchKernelGGL(oz2_adp_reduce_B_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, stream,
+                           C32i, m, n, ldc32i, sftB, adp_buf + 1);
+
+        /* Sync, copy 2 floats, compute effective_s on host. */
+        (void)hipStreamSynchronize(stream);
+        float h_adp[2] = {0.0f, 0.0f};
+        (void)hipMemcpy(h_adp, adp_buf, 2 * sizeof(float), hipMemcpyDeviceToHost);
+
+        const float log2P_needed = std::max(h_adp[0], h_adp[1]) - 200.0f;
+
+        if(log2P_needed > h_accu_log2P_all[OZ2_S_MAX - 2u]) {
+            /* ADP determined s=OZ2_S_MAX is still insufficient for this input.
+             * This occurs for matrices with extremely large dynamic range within
+             * a single row/column (e.g. condition number ≫ 2^{2×log2P_18}).
+             * The Ozaki shift-refinement would set A8i_final or B8i_final to
+             * near-zero for the elements providing cancellation, giving wrong
+             * results regardless of s.  Fall back to native DGEMM.
+             * Rate-limited warning (≤5 per process).                         */
+            static std::atomic<unsigned> adp_overflow_warns{0u};
+            if(adp_overflow_warns.fetch_add(1u, std::memory_order_relaxed) < 5u) {
+                std::fprintf(stderr,
+                    "[hipBLASLt FP64 emulation] WARNING: ADP overflow for GEMM "
+                    "(m=%lld, n=%lld, k=%lld): "
+                    "A-side log2P_req=%.1f bits, B-side=%.1f bits, "
+                    "max required=%.1f > supported max=%.1f "
+                    "(s=%u moduli, ~%.0f cumulative bits). "
+                    "Falling back to native DGEMM.\n",
+                    (long long)m, (long long)n, (long long)k,
+                    h_adp[0] - 200.0f, h_adp[1] - 200.0f,
+                    log2P_needed, h_accu_log2P_all[OZ2_S_MAX - 2u],
+                    OZ2_S_MAX, oz2_cum_bits[OZ2_S_MAX - 2u]);
+            }
+            hipblasLtMatmulDescDestroy(matmulDesc);
+            hipblasLtMatrixLayoutDestroy(layoutCD);
+            hipblasLtMatrixLayoutDestroy(layoutB);
+            hipblasLtMatrixLayoutDestroy(layoutA);
+            if(_prof) { (void)hipEventDestroy(_ev1); (void)hipEventDestroy(_ev0); }
+            return rocblaslt_status_invalid_value;
+        }
+
+        for(unsigned s = 2u; s <= OZ2_S_MAX; ++s) {
+            if(h_accu_log2P_all[s - 2u] >= log2P_needed) {
+                effective_s = s;
+                break;
+            }
+        }
+
+        if(effective_s != num_moduli) {
+            if(oz2_init_constants(effective_s) != hipSuccess) {
+                hipblasLtMatmulDescDestroy(matmulDesc);
+                hipblasLtMatrixLayoutDestroy(layoutCD);
+                hipblasLtMatrixLayoutDestroy(layoutB);
+                hipblasLtMatrixLayoutDestroy(layoutA);
+                if(_prof) { (void)hipEventDestroy(_ev1); (void)hipEventDestroy(_ev0); }
+                return rocblaslt_status_internal_error;
+            }
+        }
+    }
+
+    /* Apply shift-refinement delta using the correct log2P for effective_s.
+     * This ensures X_true ≤ M_{effective_s}/4 < M_{effective_s}/2 (CRT safe). */
+    const float refine_log2P = h_accu_log2P_all[effective_s - 2u];
+
     hipLaunchKernelGGL(oz2_refine_sftA_apply_kernel, dim3(sftA_m_blks), dim3(64), 0, stream,
-                       row_max, sftA, m, accu_log2P);
+                       row_max, sftA, m, refine_log2P);
     hipLaunchKernelGGL(oz2_refine_sftB_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, stream,
-                       C32i, m, n, ldc32i, sftB, accu_log2P);
+                       C32i, m, n, ldc32i, sftB, refine_log2P);
     _pstop(_t_refine);
 
     /* ── Scale + Fused/non-fused dispatch ────────────────────────────────────
@@ -2690,16 +2889,16 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
                     (void)hipMemsetAsync(B8i, 0, szB8i, stream);
                 }
                 /* Fused path: run scale first, then MFMA+CRT fused kernel. */
-                for (unsigned scale_start = 0; scale_start < num_moduli; scale_start += scale_chunk_size) {
-                    const unsigned scale_start_as = (scale_start + scale_chunk_size <= num_moduli)
-                                                    ? scale_chunk_size : (num_moduli - scale_start);
+                for (unsigned scale_start = 0; scale_start < effective_s; scale_start += scale_chunk_size) {
+                    const unsigned scale_start_as = (scale_start + scale_chunk_size <= effective_s)
+                                                    ? scale_chunk_size : (effective_s - scale_start);
                     launch_scale_chunk(scale_start, scale_start_as);
                 }
                 /* Fused MFMA+CRT kernel: reads A8i/B8i, writes D directly. */
                 _pstart();
                 fused_st = oz2_launch_fused_TN(A8i, B8i, lda8i, cola8i, ldb8i,
                                                C, D, m, n, k, ldc, ldd,
-                                               *alpha, *beta, sftA, sftB, num_moduli, stream);
+                                               *alpha, *beta, sftA, sftB, effective_s, stream);
                 _pstop(_t_fused);
                 took_fused_path = true;
             }
@@ -2728,9 +2927,9 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     if(hipblasLtMatrixLayoutSetAttribute(layoutCD_b, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_C_b, sizeof(stride_C_b)) != HIPBLAS_STATUS_SUCCESS)
         return fail_internal();
 
-    for(unsigned scale_start = 0; scale_start < num_moduli; scale_start += scale_chunk_size) {
-        const unsigned actual_scale = (scale_start + scale_chunk_size <= num_moduli)
-                                      ? scale_chunk_size : (num_moduli - scale_start);
+    for(unsigned scale_start = 0; scale_start < effective_s; scale_start += scale_chunk_size) {
+        const unsigned actual_scale = (scale_start + scale_chunk_size <= effective_s)
+                                      ? scale_chunk_size : (effective_s - scale_start);
         /* Scale: one call dispatches all 18 cases via the shared lambda. */
         launch_scale_chunk(scale_start, actual_scale);
 
@@ -2759,7 +2958,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
 
             const unsigned global_chunk_start = scale_start + gemm_local;
             const bool is_first = (global_chunk_start == 0);
-            const bool is_last  = (global_chunk_start + actual_gemm == num_moduli);
+            const bool is_last  = (global_chunk_start + actual_gemm == effective_s);
             _pstart();
 #define OZ2_FARGS C32i_batch, Zhi, Zlo, C, D, m, n, ldc32i, ldc, ldd, *alpha, *beta, sftA, sftB, global_chunk_start
 #define OZ2_AARGS C32i_batch, Zhi, Zlo, m, n, ldc32i, global_chunk_start
@@ -2770,7 +2969,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
             do { if(is_first) hipLaunchKernelGGL((oz2_chunk_accum_kernel<(HL),(CS),true>),  grid_acc, blk_acc, 0, stream, OZ2_AARGS); \
                  else         hipLaunchKernelGGL((oz2_chunk_accum_kernel<(HL),(CS),false>), grid_acc, blk_acc, 0, stream, OZ2_AARGS); } while(0)
             if(is_last) {
-                if(num_moduli <= 7u) {
+                if(effective_s <= 7u) {
                     switch(actual_gemm) {
                         case  1: OZ2_FINALIZE(false,  1); break; case  2: OZ2_FINALIZE(false,  2); break;
                         case  3: OZ2_FINALIZE(false,  3); break; case  4: OZ2_FINALIZE(false,  4); break;
@@ -2802,7 +3001,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
                     }
                 }
             } else {
-                if(num_moduli <= 7u) {
+                if(effective_s <= 7u) {
                     switch(actual_gemm) {
                         case  1: OZ2_ACCUM(false,  1); break; case  2: OZ2_ACCUM(false,  2); break;
                         case  3: OZ2_ACCUM(false,  3); break; case  4: OZ2_ACCUM(false,  4); break;
@@ -2861,6 +3060,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
         prof->t_int8        += _t_int8;
         prof->t_accum       += _t_accum;
         prof->t_finalize    += _t_finalize;
+        prof->effective_s_used = std::max(prof->effective_s_used, effective_s);
         prof->n_sub_gemms   += 1u;
         (void)hipEventDestroy(_ev1);
         (void)hipEventDestroy(_ev0);
@@ -2905,9 +3105,12 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
     const int device = reinterpret_cast<const _rocblaslt_handle*>(settings.handle)->device;
+    /* For dynamic (ADP) mode: allocate workspace for OZ2_S_MAX=18 so that
+     * any adaptive s ∈ [2,18] can be used without reallocation.          */
+    const unsigned ws_moduli = settings.dynamic_mode ? OZ2_S_MAX : num_moduli;
     const size_t wsNeeded = fp64EmulationWorkspaceSize(
                                 reinterpret_cast<const _rocblaslt_handle*>(settings.handle),
-                                opA, opB, m, n, k, num_moduli);
+                                opA, opB, m, n, k, ws_moduli);
 
     Fp64EmulationSettings effectiveSettings = settings;
     void* ws_toplevel = nullptr;
@@ -2949,9 +3152,12 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         float t_total = 0.f;
         (void)hipEventElapsedTime(&t_total, ev_start, ev_end);
 
-        const unsigned chunk_size = oz2_compute_chunk_size(m, n, num_moduli);
+        /* Use effective_s_used for profiling chunk sizes so the CSV reflects
+         * what was actually computed per pass (not the configured maximum).  */
+        const unsigned prof_s = accum.effective_s_used ? accum.effective_s_used : num_moduli;
+        const unsigned chunk_size = oz2_compute_chunk_size(m, n, prof_s);
         const unsigned scale_chunk_size =
-            oz2_compute_scale_chunk_size(m, n, k, num_moduli, chunk_size);
+            oz2_compute_scale_chunk_size(m, n, k, prof_s, chunk_size);
         const bool tA = (opA != HIPBLAS_OP_N);
         const bool tB = (opB != HIPBLAS_OP_N);
         /* Use the split-aware model: each component is the sum across all leaves.
@@ -2962,7 +3168,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
         if(_f) {
             if(std::ftell(_f) == 0)
                 std::fprintf(_f,
-                    "m,n,k,transA,transB,num_moduli,scale_chunk_size,gemm_chunk_size,"
+                    "m,n,k,transA,transB,num_moduli,effective_s,scale_chunk_size,gemm_chunk_size,"
                     "workspace_bytes,num_sub_gemms,"
                     "t_prelim_ms,t_prelim_gemm_ms,t_extract_ms,t_refine_ms,"
                     "t_fused_ms,t_scale_ms,t_int8_gemm_ms,t_accum_ms,"
@@ -2971,13 +3177,13 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
                     "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
                     "pred_host_ms,pred_launch_ms,pred_fused_ms,pred_total_ms,pred_native_dgemm_ms\n");
             std::fprintf(_f,
-                "%lld,%lld,%lld,%c,%c,%u,%u,%u,"
+                "%lld,%lld,%lld,%c,%c,%u,%u,%u,%u,"
                 "%llu,%u,"
                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                 "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                 (long long)m, (long long)n, (long long)k,
                 tA ? 'T' : 'N', tB ? 'T' : 'N',
-                num_moduli, scale_chunk_size, chunk_size,
+                num_moduli, accum.effective_s_used, scale_chunk_size, chunk_size,
                 (unsigned long long)wsNeeded, accum.n_sub_gemms,
                 accum.t_prelim, accum.t_prelim_gemm, accum.t_extract, accum.t_refine,
                 accum.t_fused, accum.t_scale, accum.t_int8, accum.t_accum, accum.t_finalize, t_total,

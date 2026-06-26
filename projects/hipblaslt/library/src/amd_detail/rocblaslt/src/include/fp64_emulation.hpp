@@ -82,11 +82,11 @@ size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_
 struct _rocblaslt_handle;
 
 struct Fp64EmulationDecision {
-    rocblaslt_status status;
-    bool             apply;
-    unsigned int     num_moduli;
-    unsigned int     sv_mask;
-    bool             dynamic_mode;
+    rocblaslt_status status;       /* rocblaslt_status_invalid_value on bad env   */
+    bool             apply;        /* true → use emulation; false → native path  */
+    unsigned int     num_moduli;   /* resolved moduli count to pass to settings  */
+    unsigned int     sv_mask;      /* resolved special-values mask               */
+    bool             dynamic_mode; /* true when DYNAMIC (ADP) mode selected      */
 };
 
 /* Status-returning FP64 emulation gate. Invalid env-var values return
@@ -99,8 +99,6 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
                                             int64_t                  n,
                                             int64_t                  k,
                                             int                      batch_count);
-
-void fp64EmulationWarnDynamicTemporary();
 
 /* Returns the effective number of CRT moduli (2..18) given the handle's emulation
  * settings.
@@ -117,7 +115,7 @@ unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h);
 struct Fp64EmulationSettings {
     unsigned int      num_moduli;      /* 2..18; 0 = derive from env var          */
     unsigned int      sv_mask;         /* special-values mask; ~0u = env var      */
-    bool              dynamic_mode;    /* current temporary DYNAMIC path selected */
+    bool              dynamic_mode;    /* true when ADP (Adaptive Precision) mode */
     void*             workspace;       /* caller workspace; nullptr = allocate     */
     size_t            workspace_bytes; /* size of caller workspace                */
     hipblasLtHandle_t handle;          /* caller handle for INT8 GEMMs             */
@@ -131,22 +129,25 @@ struct Fp64EmulationSettings {
  *
  * Returns rocblaslt_status_success on success,
  *         rocblaslt_status_memory_error if workspace allocation fails,
- *         rocblaslt_status_not_supported if Inf/NaN is detected (caller
- *             should fall back to native FP64). */
-rocblaslt_status fp64EmulatedGemm(hipblasOperation_t          opA,
-                                  hipblasOperation_t          opB,
-                                  int64_t                     m,
-                                  int64_t                     n,
-                                  int64_t                     k,
-                                  const double*               alpha,
-                                  const double*               A,
-                                  int64_t                     lda,
-                                  const double*               B,
-                                  int64_t                     ldb,
-                                  const double*               beta,
-                                  const double*               C,
-                                  int64_t                     ldc,
-                                  double*                     D,
-                                  int64_t                     ldd,
-                                  hipStream_t                 stream,
+ *         rocblaslt_status_invalid_value if Inf/NaN is detected in the inputs
+ *             (controlled by the sv_mask field in settings), or if dynamic
+ *             mode (ADP) determines that even s=18 is insufficient for the
+ *             given input's dynamic range.
+ *             In both cases the caller should fall back to native FP64. */
+rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
+                                  hipblasOperation_t           opB,
+                                  int64_t                      m,
+                                  int64_t                      n,
+                                  int64_t                      k,
+                                  const double*                alpha,
+                                  const double*                A,
+                                  int64_t                      lda,
+                                  const double*                B,
+                                  int64_t                      ldb,
+                                  const double*                beta,
+                                  const double*                C,
+                                  int64_t                      ldc,
+                                  double*                      D,
+                                  int64_t                      ldd,
+                                  hipStream_t                  stream,
                                   const Fp64EmulationSettings& settings);
