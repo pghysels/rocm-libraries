@@ -793,7 +793,7 @@ int main(int argc, char** argv)
         /* ── Adaptive-s emulation run ─────────────────────────────────── */
         if(cfg.run_adaptive) {
             HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-                emulated.handle, HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC));
+                emulated.handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC));
             emulated.requery();
             const size_t emu_ws = emulated.workspaceSize();
             ensure_ws(emu_ws);
@@ -815,7 +815,7 @@ int main(int argc, char** argv)
         /* ── Emulation sweep over num_moduli = min_s .. max_s ─────────── */
         for(unsigned s = cfg.min_s; s <= cfg.max_s; ++s) {
             HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-                emulated.handle, HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED));
+                emulated.handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
             HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(
                 emulated.handle, bits_for_moduli(s)));
             emulated.requery();

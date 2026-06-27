@@ -445,7 +445,7 @@ struct DgemmRunner {
     void set_fixed_s(unsigned s)
     {
         HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-            handle, HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED));
+            handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
         HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(
             handle, bits_for_moduli(s)));
         requery();
@@ -457,7 +457,7 @@ struct DgemmRunner {
     void set_dynamic()
     {
         HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-            handle, HIPBLAS_EMULATION_MANTISSA_CONTROL_DYNAMIC));
+            handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC));
         requery();
     }
 

@@ -176,7 +176,7 @@ struct Runner {
         requery();
     }
     void set_s(unsigned s) {
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(handle,HIPBLAS_EMULATION_MANTISSA_CONTROL_FIXED));
+        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(handle,HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
         HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(handle,bits_for_moduli(s)));
         requery();
     }
