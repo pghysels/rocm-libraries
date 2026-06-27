@@ -119,6 +119,18 @@ set_target_properties(s14_diag PROPERTIES
     BUILD_RPATH  "${HIPBLASLT_BUILD_DIR}/library"
     INSTALL_RPATH "${HIPBLASLT_BUILD_DIR}/library")
 
+# ── gram_illcond_bench ────────────────────────────────────────────────────────
+# A^T×A for ill-conditioned matrices (QD construction), varying condition numbers.
+# Prints diagonal / off-diagonal errors for native and emulated DGEMM (s=8,12,16).
+add_executable(gram_illcond_bench src/gram_illcond_bench.cpp)
+set_source_files_properties(src/gram_illcond_bench.cpp PROPERTIES LANGUAGE HIP)
+target_link_libraries(gram_illcond_bench PRIVATE hipblaslt_bt hip::device)
+target_include_directories(gram_illcond_bench PRIVATE "/opt/rocm/include")
+target_compile_features(gram_illcond_bench PRIVATE cxx_std_17)
+set_target_properties(gram_illcond_bench PROPERTIES
+    BUILD_RPATH  "${HIPBLASLT_BUILD_DIR}/library"
+    INSTALL_RPATH "${HIPBLASLT_BUILD_DIR}/library")
+
 # ── Correctness test ─────────────────────────────────────────────────────────
 # Tests all 4 transpose combinations and alpha/beta ∈ {-2,-1,0,1,2}.
 # Compares emulated DGEMM against native DGEMM element-wise.

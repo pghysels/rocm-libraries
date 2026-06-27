@@ -1439,6 +1439,472 @@ namespace
         EmulIllCondParamName
     );
 
+    // ── StructuredGemmTest: stress matrices targeting the Ozaki extraction ────
+    //
+    // Five structured matrix types (N×N, NN mode, C = A × B):
+    //   CatastrophicCancel  row pairs (+v,−v): (A×B)[2k,:] + (A×B)[2k+1,:] = 0
+    //   ScaledDynamicRange  row i scaled by 2^{i·16/(N-1)−8}: N distinct sftA values
+    //   OnesAndEpsilons     A[i,j]=ε for j<N-1, A[i,N-1]=1 — tests ε residual capture
+    //   Moler               M[i,j] = min(i+1,j+1)          — structured SPD-like
+    //   Alternating         A=checkerboard×U, B=U(0,1)      — signed cancellation
+    //
+    // All tests run with ADP mode (dynamic moduli selection) — the production default.
+    // Reference: native FP64 DGEMM; threshold 1e-10.
+    // CatastrophicCancel has an additional exact-zero check on row-pair sums.
+
+    enum StructuredMatType {
+        SMAT_CATASTROPHIC_CANCEL, SMAT_SCALED_DYNAMIC_RANGE, SMAT_ONES_AND_EPSILONS,
+        SMAT_MOLER, SMAT_ALTERNATING,
+    };
+
+    struct StructuredGemmParam {
+        StructuredMatType mat_type;
+        int               N;
+        double            threshold;
+    };
+
+    static std::string StructuredGemmParamName(
+        const ::testing::TestParamInfo<StructuredGemmParam>& info)
+    {
+        const char* names[] = {
+            "CatastrophicCancel", "ScaledDynamicRange", "OnesAndEpsilons",
+            "Moler", "Alternating"
+        };
+        return std::string(names[static_cast<int>(info.param.mat_type)])
+               + "_N" + std::to_string(info.param.N);
+    }
+
+    class Fp64EmulationStructuredTest : public ::testing::TestWithParam<StructuredGemmParam>
+    {
+    protected:
+        void SetUp() override
+        {
+            if(!has_device()) GTEST_SKIP() << "No HIP device available";
+        }
+    };
+
+    /* Build N×N column-major A and B matrices for a given structured type.
+     * A and B are independently filled where indicated (ExtremeScale, Alternating). */
+    static void build_structured_ab(
+        StructuredMatType type, int N,
+        std::vector<double>& hA, std::vector<double>& hB)
+    {
+        const size_t N2 = static_cast<size_t>(N) * N;
+        hA.resize(N2); hB.resize(N2);
+        uint64_t sA = 0xabcd1234ef567890ULL;
+        uint64_t sB = 0x1032547698badcfeULL;
+        auto nextA = [&]() -> double {
+            sA ^= sA << 13; sA ^= sA >> 7; sA ^= sA << 17;
+            return static_cast<double>(sA >> 11) * (1.0 / 9007199254740992.0);
+        };
+        auto nextB = [&]() -> double {
+            sB ^= sB << 13; sB ^= sB >> 7; sB ^= sB << 17;
+            return static_cast<double>(sB >> 11) * (1.0 / 9007199254740992.0);
+        };
+
+        /* CatastrophicCancel: pre-generate one v[j] per column so that
+         * A[2k,j] = +v[j] and A[2k+1,j] = -v[j] share EXACTLY the same value.
+         * Drawing v inside the (i,j) loop would give different values per row,
+         * breaking the exact cancellation A[2k,j] + A[2k+1,j] = 0.            */
+        std::vector<double> v_cat(type == SMAT_CATASTROPHIC_CANCEL ? N : 0);
+        if(type == SMAT_CATASTROPHIC_CANCEL)
+            for(int jj = 0; jj < N; ++jj)
+                v_cat[jj] = 1.0 + nextA();   /* v[j] ~ U(1,2), shared across pair */
+
+        for(int j = 0; j < N; ++j)
+            for(int i = 0; i < N; ++i)
+            {
+                const size_t idx = static_cast<size_t>(i + j * N);
+                switch(type)
+                {
+                case SMAT_CATASTROPHIC_CANCEL:
+                {
+                    /* A[2k,j] = +v[j],  A[2k+1,j] = -v[j]  (same v per column j).
+                     * (A×B)[2k,:] + (A×B)[2k+1,:] = 0 exactly for any B.          */
+                    hA[idx] = (i % 2 == 0) ? +v_cat[j] : -v_cat[j];
+                    hB[idx] = nextB() * 2.0 - 1.0;
+                    break;
+                }
+                case SMAT_SCALED_DYNAMIC_RANGE:
+                {
+                    /* Row i scaled by 2^{i·16/(N-1)−8}: N distinct sftA values
+                     * from 2^{−8} (row 0) to 2^{8} (row N-1).  Stresses the per-row
+                     * shift refinement with every possible sftA in the range.          */
+                    const double exp = static_cast<double>(i) * 16.0 / std::max(N-1,1) - 8.0;
+                    const double scale = std::ldexp(1.0, static_cast<int>(std::round(exp)));
+                    hA[idx] = scale * (nextA() * 2.0 - 1.0);
+                    hB[idx] = nextB() * 2.0 - 1.0;
+                    break;
+                }
+                case SMAT_ONES_AND_EPSILONS:
+                {
+                    /* A[i,j] = ε_machine for j < N-1, A[i,N-1] = 1.0; B = all-ones.
+                     * The ε elements round to 0 in the primary INT8 extraction (since
+                     * sftA = 6 − 0 = 6 and ε × 2^6 ≈ 0) but are recovered from the
+                     * residual in subsequent Ozaki passes.  Expected result:
+                     *   (A×B)[i,k] = (N-1)×ε + 1.0  (all i,k).                       */
+                    constexpr double eps_m = std::numeric_limits<double>::epsilon();
+                    hA[idx] = (j < N - 1) ? eps_m : 1.0;
+                    hB[idx] = 1.0;
+                    break;
+                }
+                case SMAT_MOLER:
+                    hA[idx] = hB[idx] = static_cast<double>(std::min(i + 1, j + 1));
+                    break;
+                case SMAT_ALTERNATING:
+                {
+                    /* A: checkerboard signs, B: all-positive → genuine cancellation */
+                    const double sign = ((i + j) % 2 == 0) ? 1.0 : -1.0;
+                    hA[idx] = sign * nextA();
+                    hB[idx] = nextB();
+                    break;
+                }
+                }
+            }
+    }
+
+    TEST_P(Fp64EmulationStructuredTest, VsNativeDgemm)
+    {
+        const StructuredGemmParam& p = GetParam();
+        const int64_t N     = static_cast<int64_t>(p.N);
+        const size_t  N2    = static_cast<size_t>(N) * N;
+        const size_t  bytes = N2 * sizeof(double);
+
+        std::vector<double> hA, hB, hD_nat(N2), hD_emu(N2);
+        build_structured_ab(p.mat_type, p.N, hA, hB);
+
+        double *dA = nullptr, *dB = nullptr, *dC = nullptr;
+        double *dD_nat = nullptr, *dD_emu = nullptr;
+        ASSERT_EQ(hipMalloc(&dA,     bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB,     bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC,     bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_nat, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_emu, bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, hB.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
+
+        auto cleanup = [&](hipblasLtHandle_t hem, hipblasLtHandle_t hnat,
+                           hipblasLtMatmulDesc_t desc,
+                           hipblasLtMatrixLayout_t la, hipblasLtMatrixLayout_t lb,
+                           hipblasLtMatrixLayout_t ld, hipblasLtMatmulPreference_t pref) {
+            if(pref) hipblasLtMatmulPreferenceDestroy(pref);
+            if(ld) hipblasLtMatrixLayoutDestroy(ld);
+            if(lb) hipblasLtMatrixLayoutDestroy(lb);
+            if(la) hipblasLtMatrixLayoutDestroy(la);
+            if(desc) hipblasLtMatmulDescDestroy(desc);
+            if(hnat) hipblasLtDestroy(hnat);
+            if(hem)  hipblasLtDestroy(hem);
+            (void)hipFree(dD_emu); (void)hipFree(dD_nat);
+            (void)hipFree(dC); (void)hipFree(dB); (void)hipFree(dA);
+        };
+
+        hipblasLtHandle_t hem = nullptr;
+        ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
+                  HIPBLAS_STATUS_SUCCESS);
+        /* ADP: let the algorithm choose the number of moduli from the data */
+        ASSERT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
+                      hem, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
+                  HIPBLAS_STATUS_SUCCESS);
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
+                                      HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+            if(!gate.apply) {
+                cleanup(hem, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                GTEST_SKIP() << "Device not supported by emulation";
+            }
+        }
+
+        hipblasLtHandle_t hnat = nullptr;
+        hipblasLtMatmulDesc_t desc = nullptr;
+        hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtMatmulHeuristicResult_t heur{};
+        ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F),
+                  HIPBLAS_STATUS_SUCCESS);
+        {
+            hipblasOperation_t opN = HIPBLAS_OP_N;
+            hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
+            hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+        }
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&la, HIP_R_64F,
+            static_cast<uint64_t>(N), static_cast<uint64_t>(N), N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lb, HIP_R_64F,
+            static_cast<uint64_t>(N), static_cast<uint64_t>(N), N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&ld, HIP_R_64F,
+            static_cast<uint64_t>(N), static_cast<uint64_t>(N), N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&pref), HIPBLAS_STATUS_SUCCESS);
+        {
+            constexpr size_t ws_zero = 0u;
+            hipblasLtMatmulPreferenceSetAttribute(pref,
+                HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_zero, sizeof(ws_zero));
+        }
+        int nat_cnt = 0;
+        hipblasLtMatmulAlgoGetHeuristic(hnat, desc, la, lb, ld, ld, pref, 1, &heur, &nat_cnt);
+        if(nat_cnt == 0) {
+            cleanup(hem, hnat, desc, la, lb, ld, pref);
+            GTEST_SKIP() << "No native FP64 DGEMM algorithm found on this device";
+        }
+
+        Fp64EmulationSettings emu_settings{};
+        emu_settings.handle          = hem;
+        emu_settings.num_moduli      = 18u;    /* ADP upper bound */
+        emu_settings.dynamic_mode    = true;   /* ADP: select s from data */
+        emu_settings.sv_mask         = 0u;
+        emu_settings.workspace       = nullptr;
+        emu_settings.workspace_bytes = 0u;
+
+        const double alpha = 1.0, beta = 0.0;
+
+        /* Native reference */
+        const hipblasStatus_t nat_st =
+            hipblasLtMatmul(hnat, desc, &alpha, dA, la, dB, lb,
+                            &beta, dC, ld, dD_nat, ld,
+                            &heur.algo, nullptr, 0, nullptr);
+        if(nat_st != HIPBLAS_STATUS_SUCCESS) {
+            cleanup(hem, hnat, desc, la, lb, ld, pref);
+            GTEST_SKIP() << "Native hipblasLtMatmul failed";
+        }
+
+        /* Emulated */
+        const rocblaslt_status emu_st =
+            fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                             &alpha, dA, N, dB, N,
+                             &beta,  dC, N, dD_emu, N,
+                             nullptr, emu_settings);
+        if(emu_st != rocblaslt_status_success) {
+            cleanup(hem, hnat, desc, la, lb, ld, pref);
+            GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(emu_st)
+                         << " (ADP may have triggered — scale too large for N="
+                         << p.N << ")";
+        }
+
+        /* Copy results back before freeing GPU buffers */
+        ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, bytes, hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(hD_emu.data(), dD_emu, bytes, hipMemcpyDeviceToHost), hipSuccess);
+        cleanup(hem, hnat, desc, la, lb, ld, pref);
+
+        double dmax = 0.0;
+        for(double v : hD_nat) dmax = std::max(dmax, std::abs(v));
+        const double norm = std::max(dmax, 1.0);
+        double max_rel_err = 0.0;
+        for(size_t idx = 0; idx < N2; ++idx)
+            max_rel_err = std::max(max_rel_err,
+                                   std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
+
+        const char* mat_names[] = {
+            "CatastrophicCancel", "ScaledDynamicRange", "OnesAndEpsilons",
+            "Moler", "Alternating"
+        };
+        EXPECT_LE(max_rel_err, p.threshold)
+            << "Structured GEMM (" << mat_names[static_cast<int>(p.mat_type)]
+            << " N=" << p.N << " ADP): max_rel_err=" << max_rel_err
+            << " > threshold=" << p.threshold;
+
+        /* Extra check for CatastrophicCancel: paired row sums must be ≈ 0.
+         * The alternating-sign construction gives (A×B)[2k,:] = -(A×B)[2k+1,:],
+         * so the sum of each row pair is exactly zero.  If a CRT sign-flip occurs
+         * the error ≈ 1–2 and the sum will be large.                               */
+        if(p.mat_type == SMAT_CATASTROPHIC_CANCEL)
+        {
+            double max_pair_sum = 0.0;
+            for(size_t col = 0; col < static_cast<size_t>(N); ++col)
+                for(int64_t row = 0; row + 1 < N; row += 2)
+                {
+                    const double sum =
+                        std::abs(hD_emu[static_cast<size_t>(row)   + col * static_cast<size_t>(N)] +
+                                 hD_emu[static_cast<size_t>(row+1) + col * static_cast<size_t>(N)]);
+                    max_pair_sum = std::max(max_pair_sum, sum);
+                }
+            /* Normalise by the max output magnitude so the check is scale-independent. */
+            const double pair_rel = (dmax > 0.0) ? max_pair_sum / dmax : max_pair_sum;
+            EXPECT_LE(pair_rel, p.threshold)
+                << "CatastrophicCancel: row-pair sum " << max_pair_sum
+                << " / max=" << dmax << " = " << pair_rel
+                << " (a CRT sign-flip would give ≈ 1.0 here)";
+        }
+    }
+
+    INSTANTIATE_TEST_SUITE_P(
+        Structured,
+        Fp64EmulationStructuredTest,
+        ::testing::Values(
+            StructuredGemmParam{SMAT_CATASTROPHIC_CANCEL,  128, 1e-10},
+            StructuredGemmParam{SMAT_SCALED_DYNAMIC_RANGE, 128, 1e-10},
+            StructuredGemmParam{SMAT_ONES_AND_EPSILONS,    128, 1e-10},
+            StructuredGemmParam{SMAT_MOLER,                128, 1e-10},
+            StructuredGemmParam{SMAT_ALTERNATING,          128, 1e-10}
+        ),
+        StructuredGemmParamName
+    );
+
+    // ── AdpFallbackExtremeScale: ADP fallback path is transparent ─────────────
+    //
+    // Constructs an extreme-scale matrix with rows alternating 1e16 / 1e-16,
+    // which exceeds the ADP-safe zone (max element >> threshold for N=64).
+    //
+    // Step 1: fp64EmulatedGemm(ADP) must return rocblaslt_status_invalid_value.
+    // Step 2: hipblasLtMatmul(emulation+ADP) must match pure native FP64 —
+    //         rocblaslt_mat.cpp silently falls through to native on invalid_value.
+    TEST_F(Fp64EmulationTest, AdpFallbackExtremeScale)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
+        ASSERT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
+                      m_handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
+                  HIPBLAS_STATUS_SUCCESS);
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(m_roc, HIP_R_64F,
+                                      HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, 64, 1);
+            if(!gate.apply) GTEST_SKIP() << "Device not supported by emulation";
+        }
+
+        constexpr int    N  = 64;
+        constexpr size_t N2 = static_cast<size_t>(N) * N;
+        const size_t     bytes = N2 * sizeof(double);
+
+        /* Build 1e16 / 1e-16 alternating-row matrix */
+        std::vector<double> hA(N2), hB(N2);
+        {
+            uint64_t sA = 0x1234abcd5678ef90ULL;
+            uint64_t sB = 0xfedcba9876543210ULL;
+            for(int j = 0; j < N; ++j)
+                for(int i = 0; i < N; ++i)
+                {
+                    const size_t idx = static_cast<size_t>(i + j * N);
+                    const double scl = (i % 2 == 0) ? 1e16 : 1e-16;
+                    sA ^= sA << 13; sA ^= sA >> 7; sA ^= sA << 17;
+                    sB ^= sB << 13; sB ^= sB >> 7; sB ^= sB << 17;
+                    hA[idx] = scl * (static_cast<double>(sA >> 11)*(1.0/9007199254740992.0)*2-1);
+                    hB[idx] = scl * (static_cast<double>(sB >> 11)*(1.0/9007199254740992.0)*2-1);
+                }
+        }
+
+        double *dA = nullptr, *dB = nullptr, *dC = nullptr;
+        double *dD_emul = nullptr, *dD_nat = nullptr;
+        ASSERT_EQ(hipMalloc(&dA,     bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB,     bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC,     bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_emul, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_nat,  bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, hB.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
+
+        auto free_bufs = [&]() {
+            (void)hipFree(dD_nat); (void)hipFree(dD_emul);
+            (void)hipFree(dC); (void)hipFree(dB); (void)hipFree(dA);
+        };
+
+        /* ── Step 1: ADP triggers at the fp64EmulatedGemm level ────────────── */
+        {
+            Fp64EmulationSettings emu{};
+            emu.handle = m_handle;
+            emu.num_moduli = 16u;
+            emu.sv_mask = 0u;
+            emu.dynamic_mode = true;
+            emu.workspace = nullptr;
+            emu.workspace_bytes = 0u;
+            const double alpha = 1.0, beta = 0.0;
+            const rocblaslt_status st =
+                fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                                 &alpha, dA, N, dB, N,
+                                 &beta,  dC, N, dD_emul, N, nullptr, emu);
+            if(st == rocblaslt_status_success) {
+                free_bufs();
+                GTEST_SKIP() << "ADP did not trigger for 1e16/1e-16 scale on this config";
+            }
+            EXPECT_EQ(st, rocblaslt_status_invalid_value)
+                << "ADP should return invalid_value for 1e16/1e-16 extreme scale";
+        }
+
+        /* ── Step 2: hipblasLtMatmul falls back transparently ───────────────── */
+        hipblasLtHandle_t hnat = nullptr;
+        hipblasLtMatmulDesc_t desc = nullptr;
+        hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtMatmulHeuristicResult_t heur{};
+
+        ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F),
+                  HIPBLAS_STATUS_SUCCESS);
+        {
+            hipblasOperation_t opN = HIPBLAS_OP_N;
+            hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
+            hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+        }
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&la, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lb, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&ld, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&pref), HIPBLAS_STATUS_SUCCESS);
+        {
+            constexpr size_t ws_zero = 0u;
+            hipblasLtMatmulPreferenceSetAttribute(pref,
+                HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_zero, sizeof(ws_zero));
+        }
+        int nat_cnt = 0;
+        hipblasLtMatmulAlgoGetHeuristic(hnat, desc, la, lb, ld, ld, pref, 1, &heur, &nat_cnt);
+
+        auto destroy_handles = [&]() {
+            hipblasLtMatmulPreferenceDestroy(pref);
+            hipblasLtMatrixLayoutDestroy(ld);
+            hipblasLtMatrixLayoutDestroy(lb);
+            hipblasLtMatrixLayoutDestroy(la);
+            hipblasLtMatmulDescDestroy(desc);
+            hipblasLtDestroy(hnat);
+        };
+
+        if(nat_cnt == 0) {
+            destroy_handles();
+            free_bufs();
+            GTEST_SKIP() << "No native FP64 DGEMM algorithm found";
+        }
+
+        const double alpha = 1.0, beta = 0.0;
+
+        /* Pure native (emulation disabled via hnat) */
+        const hipblasStatus_t nat_st =
+            hipblasLtMatmul(hnat, desc, &alpha, dA, la, dB, lb,
+                            &beta, dC, ld, dD_nat, ld,
+                            &heur.algo, nullptr, 0, nullptr);
+
+        /* m_handle has emulation+ADP enabled → falls back to native internally */
+        ASSERT_EQ(hipMemset(dD_emul, 0, bytes), hipSuccess);
+        const hipblasStatus_t emul_st =
+            hipblasLtMatmul(m_handle, desc, &alpha, dA, la, dB, lb,
+                            &beta, dC, ld, dD_emul, ld,
+                            nullptr, nullptr, 0, nullptr);
+
+        destroy_handles();
+
+        if(nat_st != HIPBLAS_STATUS_SUCCESS || emul_st != HIPBLAS_STATUS_SUCCESS) {
+            free_bufs();
+            GTEST_SKIP() << "hipblasLtMatmul failed (nat=" << static_cast<int>(nat_st)
+                         << " emul=" << static_cast<int>(emul_st) << ")";
+        }
+
+        std::vector<double> hD_nat(N2), hD_emul_h(N2);
+        ASSERT_EQ(hipMemcpy(hD_nat.data(),    dD_nat,  bytes, hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(hD_emul_h.data(), dD_emul, bytes, hipMemcpyDeviceToHost), hipSuccess);
+        free_bufs();
+
+        double dmax = 0.0;
+        for(double v : hD_nat) dmax = std::max(dmax, std::abs(v));
+        const double norm = std::max(dmax, 1.0);
+        double max_rel = 0.0;
+        for(size_t idx = 0; idx < N2; ++idx)
+            max_rel = std::max(max_rel, std::abs(hD_emul_h[idx] - hD_nat[idx]) / norm);
+
+        EXPECT_LE(max_rel, 1e-10)
+            << "ADP fallback differs from pure native by max_rel=" << max_rel
+            << " (fallback should produce native-equivalent FP64 result)";
+    }
+
     // ── SubnormalInputs: flush-to-zero regression ─────────────────────────────
     //
     // Documents and verifies the FTZ behaviour described in fp64_emulation.hpp:

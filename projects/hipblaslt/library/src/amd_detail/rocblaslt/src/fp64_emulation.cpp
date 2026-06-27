@@ -941,6 +941,47 @@ void fp64EmulationWarnDynamicTemporary()
  * ========================================================================= */
 size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
 {
+    assert(h != nullptr && "fp64EmulationWorkspaceSize requires a valid handle");
+    const int  device = h->device;
+    const bool tA     = (opA != HIPBLAS_OP_N);
+    const bool tB     = (opB != HIPBLAS_OP_N);
+
+    /* Mirror the splitting decision in fp64EmulatedGemmImpl exactly.
+     *
+     * fp64EmulatedGemmImpl uses settings.num_moduli (= fp64EmulationEffectiveNumModuli(h))
+     * for the chunk-size / n_chunks check that decides whether to split, regardless of
+     * whether dynamic mode is active (where num_moduli parameter = OZ2_S_MAX but
+     * settings.num_moduli is the user-configured max, e.g. 16).
+     *
+     * Using num_moduli (= ws_moduli = OZ2_S_MAX in dynamic mode) here instead would
+     * cause the workspace function to decide to split for problem sizes where the
+     * implementation goes to the monolithic path.  The monolithic path needs the full
+     * (m, n) workspace, which is larger than max(WS(half), WS(half)), resulting in
+     * the workspace being under-allocated and a buffer overflow at runtime.           */
+    const unsigned split_num_moduli = fp64EmulationEffectiveNumModuli(h);
+    const unsigned chunk_sz = oz2_compute_chunk_size(m, n, split_num_moduli);
+    const unsigned n_chunks = (split_num_moduli + chunk_sz - 1u) / chunk_sz;
+
+    if(n_chunks > 1u) {
+        const bool    split_m = (m >= n);
+        const int64_t half_m  = split_m ? m / 2 : m;
+        const int64_t half_n  = split_m ? n     : n / 2;
+        const int64_t m2      = split_m ? (m - m / 2) : m;
+        const int64_t n2      = split_m ? n            : (n - n / 2);
+
+        const double t_mono  = fp64EmulationPerfModelTimes(tA, tB, m, n, k, split_num_moduli, device).t_total_ms;
+        const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, split_num_moduli, device);
+
+        if(t_split <= t_mono * 1.01) {
+            /* num_moduli (= ws_moduli) is forwarded to the recursive calls so that
+             * the monolithic workspace at each leaf is sized for the correct layout
+             * (e.g. OZ2_S_MAX in dynamic mode, matching layout_moduli in the impl). */
+            return std::max(fp64EmulationWorkspaceSize(h, opA, opB, half_m, half_n, k, num_moduli),
+                            fp64EmulationWorkspaceSize(h, opA, opB, m2,     n2,     k, num_moduli));
+        }
+    }
+
+    /* Monolithic path workspace. */
     const size_t lda8i  = oz2_pad(static_cast<size_t>(k));
     const size_t cola8i = oz2_pad(static_cast<size_t>(m));
     const size_t ldb8i  = lda8i;
