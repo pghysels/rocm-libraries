@@ -213,6 +213,27 @@ namespace
         const _rocblaslt_handle* m_roc    = nullptr;
     };
 
+    // Workspace must be non-empty and not shrink as the moduli count grows.
+    TEST_F(Fp64EmulationTest, WorkspaceSizePositiveAndMonotonic)
+    {
+        const int64_t m = 1024, n = 1024, k = 1024;
+        Fp64EmulationDecision d{};
+        d.dynamic_mode = false;
+        d.num_moduli = 8;
+        const size_t  ws8  = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+        d.num_moduli = 16;
+        const size_t  ws16 = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+        EXPECT_GT(ws8, 0u);
+        EXPECT_GE(ws16, ws8);
+    }
+
+    TEST_F(Fp64EmulationTest, PublicWorkspaceSizeRejectsNegativeDimensions)
+    {
+        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, -1, 64, 64), 0u);
+        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, -1, 64), 0u);
+        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, -1), 0u);
+    }
+
     // Explicit "off" must win regardless of the environment variable.
     TEST_F(Fp64EmulationTest, WouldApply_ForcedOffReturnsFalse)
     {

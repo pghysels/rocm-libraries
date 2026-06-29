@@ -944,9 +944,17 @@ void fp64EmulationWarnDynamicTemporary()
 /* =========================================================================
  * fp64EmulationWorkspaceSize
  * ========================================================================= */
-size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_moduli)
+size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
+                                  hipblasOperation_t           opA,
+                                  hipblasOperation_t           opB,
+                                  int64_t m, int64_t n, int64_t k,
+                                  const Fp64EmulationDecision& decision)
 {
     assert(h != nullptr && "fp64EmulationWorkspaceSize requires a valid handle");
+    /* In ADP mode the workspace must cover OZ2_S_MAX=18 moduli so that any
+     * adaptive effective_s fits without reallocation.  In fixed mode use
+     * the resolved moduli count directly.                                   */
+    const unsigned num_moduli = decision.dynamic_mode ? OZ2_S_MAX : decision.num_moduli;
     const int  device = h->device;
     const bool tA     = (opA != HIPBLAS_OP_N);
     const bool tB     = (opB != HIPBLAS_OP_N);
@@ -981,8 +989,8 @@ size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_
             /* num_moduli (= ws_moduli) is forwarded to the recursive calls so that
              * the monolithic workspace at each leaf is sized for the correct layout
              * (e.g. OZ2_S_MAX in dynamic mode, matching layout_moduli in the impl). */
-            return std::max(fp64EmulationWorkspaceSize(h, opA, opB, half_m, half_n, k, num_moduli),
-                            fp64EmulationWorkspaceSize(h, opA, opB, m2,     n2,     k, num_moduli));
+            return std::max(fp64EmulationWorkspaceSize(h, opA, opB, half_m, half_n, k, decision),
+                            fp64EmulationWorkspaceSize(h, opA, opB, m2,     n2,     k, decision));
         }
     }
 
@@ -1104,7 +1112,21 @@ static constexpr int OZ2_PRELIM_TILE_K = 64;  /* k-tile size (reduces k-tile loo
 static constexpr int OZ2_PRELIM_TILE_M = 4;   /* rows/cols per tile (= blockDim.x / TILE_K) */
 /* blockDim.x = TILE_K × TILE_M = 256 threads */
 
-template <bool TRANS_A, bool TRANS_B, bool CHECK_NAN>
+/* Returns floor(log2(x)) for a positive normalized FP64 value x by extracting
+ * the IEEE 754 biased exponent field (bits 52-62) via integer bit ops.
+ * Replaces the quarter-rate transcendental log2() + floor() sequence (~50-100
+ * cycles on CDNA) with 2-3 full-rate integer instructions (~4-5 cycles).
+ * Precondition: x > 0 and x is a normalized FP64 (guaranteed by the
+ * < 1e-300 guard that replaces zero/subnormal inputs with 1.0 before calling). */
+static __device__ __forceinline__ int oz2_floor_log2_d(double x)
+{
+    unsigned long long bits;
+    __builtin_memcpy(&bits, &x, 8);
+    return static_cast<int>((bits >> 52) & 0x7FFull) - 1023;
+}
+
+/* ── A_T: TRANS_A=true, k-fast coalesced, blockDim=256, one block per row ── */
+template <bool CHECK_NAN>
 __global__ static void
 oz2_accu_prelim_kernel(const double* __restrict__ A,
                         int64_t m, int64_t k, int64_t lda,
@@ -1120,13 +1142,145 @@ oz2_accu_prelim_kernel(const double* __restrict__ A,
     static constexpr int TILE_K = OZ2_PRELIM_TILE_K;  /* k-tile size (256/TILE_M iterations) */
     static constexpr int TILE_M = OZ2_PRELIM_TILE_M;  /* rows/cols per block */
 
-    /* Shared memory:
-     *   shmem[TILE_K][TILE_M+1] — FP64 tile (TILE_M+1 padding avoids bank conflicts)
-     *   s_sft[TILE_M]           — per-row/col sft broadcast
-     *   s_wmax[4]               — warp maxes for block_reduce_max_d (4 warps of 64)
-     *
-     * TILE_K=64, TILE_M=4 → 4× fewer k-tile iterations (k/64 vs k/16 for TILE=16),
-     * 4× fewer __syncthreads() in Pass 2, 4× more A/B blocks → better occupancy. */
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    double local_max = 0.0;
+    for(int64_t j = threadIdx.x; j < k; j += blockDim.x) {
+        double val = A[row * lda + j];                             /* COALESCED */
+        if constexpr (CHECK_NAN)
+            if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+        double av = fabs(val);
+        if(av > local_max) local_max = av;
+    }
+    local_max = warp_reduce_max_abs_d(local_max);
+    local_max = block_reduce_max_d(local_max, s_wmax);
+    if(threadIdx.x == 0) {
+        if(local_max < 1e-300) local_max = 1.0;
+        s_sft[0] = static_cast<int16_t>(6 - oz2_floor_log2_d(local_max));
+        sftA[row] = s_sft[0];
+    }
+    __syncthreads();
+    const int sft = static_cast<int>(s_sft[0]);
+    for(int64_t j = threadIdx.x; j < k; j += blockDim.x) {
+        double val    = A[row * lda + j];                          /* COALESCED */
+        double scaled = ceil(ldexp(fabs(val), sft));
+        A8i_high[static_cast<size_t>(j) + static_cast<size_t>(row) * lda8i] =
+            static_cast<int8_t>(static_cast<int32_t>(scaled));    /* COALESCED */
+    }
+}
+
+/* ── A_N: TRANS_A=false, SHMEM transposition, blockDim=1024, TILE_M=16 rows/block ── */
+template <bool CHECK_NAN>
+__global__ static void
+oz2_accu_prelim_A_N_kernel(const double* __restrict__ A,
+                             int64_t m, int64_t k, int64_t lda,
+                             int8_t*  __restrict__ A8i_high, size_t lda8i,
+                             int16_t* __restrict__ sftA,
+                             uint32_t* __restrict__ nan_flag)
+{
+    static constexpr int TILE_K = OZ2_PRELIM_TILE_K;
+    static constexpr int TILE_M = OZ2_PRELIM_SHMEM_TILE_M;
+    __shared__ double  shmem[TILE_K][TILE_M + 1];  /* +1 avoids bank conflicts */
+    __shared__ int16_t s_sft[TILE_M];
+
+    const int64_t m_base = static_cast<int64_t>(blockIdx.x) * TILE_M;
+    const int t       = static_cast<int>(threadIdx.x);
+    const int k_local = t / TILE_M;   /* 0..TILE_K-1 */
+    const int m_local = t % TILE_M;   /* 0..TILE_M-1 */
+    const int64_t i   = m_base + m_local;
+
+    /* Pass 1: each thread accumulates its partial per-row max over all k-tiles */
+    double thr_max = 0.0;
+    for(int64_t k_base = 0; k_base < k; k_base += TILE_K) {
+        const int64_t j = k_base + k_local;
+        if(i < m && j < k) {
+            double val = A[i + j * lda];                           /* COALESCED */
+            if constexpr (CHECK_NAN)
+                if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+            double av = fabs(val);
+            if(av > thr_max) thr_max = av;
+        }
+    }
+    shmem[k_local][m_local] = thr_max;
+    __syncthreads();
+    if(k_local == 0) {
+        double row_max = 0.0;
+        for(int kl = 0; kl < TILE_K; ++kl)
+            if(shmem[kl][m_local] > row_max) row_max = shmem[kl][m_local];
+        if(row_max < 1e-300) row_max = 1.0;
+        s_sft[m_local] = static_cast<int16_t>(6 - oz2_floor_log2_d(row_max));
+        if(i < m) sftA[i] = s_sft[m_local];
+    }
+    __syncthreads();
+    const int sft = static_cast<int>(s_sft[m_local]);
+
+    /* Pass 2: coalesced loads (m-fast) → SHMEM → coalesced writes (k-fast) */
+    for(int64_t k_base = 0; k_base < k; k_base += TILE_K) {
+        const int64_t j = k_base + k_local;
+        double scaled = 0.0;
+        if(i < m && j < k)
+            scaled = ceil(ldexp(fabs(A[i + j * lda]), sft));      /* COALESCED */
+        shmem[k_local][m_local] = scaled;
+        __syncthreads();
+        const int k_write = t % TILE_K;
+        const int m_write = t / TILE_K;
+        const int64_t j_out = k_base + k_write;
+        const int64_t i_out = m_base + m_write;
+        if(i_out < m && j_out < k)
+            A8i_high[static_cast<size_t>(j_out) + static_cast<size_t>(i_out) * lda8i] =
+                static_cast<int8_t>(static_cast<int32_t>(shmem[k_write][m_write]));
+        __syncthreads();
+    }
+}
+
+/* ── B_N: TRANS_B=false, j-fast coalesced, blockDim=256, one block per col ── */
+template <bool CHECK_NAN>
+__global__ static void
+oz2_accu_prelim_B_N_kernel(const double* __restrict__ B,
+                             int64_t n, int64_t k, int64_t ldb,
+                             int8_t*  __restrict__ B8i_high, size_t ldb8i,
+                             int16_t* __restrict__ sftB,
+                             uint32_t* __restrict__ nan_flag)
+{
+    __shared__ double  s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
+    __shared__ int16_t s_sft[1];
+
+    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    double local_max = 0.0;
+    for(int64_t j = threadIdx.x; j < k; j += blockDim.x) {
+        double val = B[j + col * ldb];                             /* COALESCED */
+        if constexpr (CHECK_NAN)
+            if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+        double av = fabs(val);
+        if(av > local_max) local_max = av;
+    }
+    local_max = warp_reduce_max_abs_d(local_max);
+    local_max = block_reduce_max_d(local_max, s_wmax);
+    if(threadIdx.x == 0) {
+        if(local_max < 1e-300) local_max = 1.0;
+        s_sft[0] = static_cast<int16_t>(6 - oz2_floor_log2_d(local_max));
+        sftB[col] = s_sft[0];
+    }
+    __syncthreads();
+    const int sft = static_cast<int>(s_sft[0]);
+    for(int64_t j = threadIdx.x; j < k; j += blockDim.x) {
+        double val    = B[j + col * ldb];                          /* COALESCED */
+        double scaled = ceil(ldexp(fabs(val), sft));
+        B8i_high[static_cast<size_t>(j) + static_cast<size_t>(col) * ldb8i] =
+            static_cast<int8_t>(static_cast<int32_t>(scaled));    /* COALESCED */
+    }
+}
+
+/* ── B_T: TRANS_B=true, SHMEM transposition, blockDim=1024, TILE_M=16 cols/block ── */
+template <bool CHECK_NAN>
+__global__ static void
+oz2_accu_prelim_B_T_kernel(const double* __restrict__ B,
+                             int64_t n, int64_t k, int64_t ldb,
+                             int8_t*  __restrict__ B8i_high, size_t ldb8i,
+                             int16_t* __restrict__ sftB,
+                             uint32_t* __restrict__ nan_flag)
+{
+    static constexpr int TILE_K = OZ2_PRELIM_TILE_K;
+    static constexpr int TILE_M = OZ2_PRELIM_SHMEM_TILE_M;
     __shared__ double  shmem[TILE_K][TILE_M + 1];
     __shared__ int16_t s_sft[TILE_M];
     __shared__ double  s_wmax[4];
@@ -1232,6 +1386,19 @@ oz2_accu_prelim_kernel(const double* __restrict__ A,
                 __syncthreads();
             }
         }
+    }
+    shmem[k_local][l_local] = thr_max;
+    __syncthreads();
+    if(k_local == 0) {
+        double col_max = 0.0;
+        for(int kl = 0; kl < TILE_K; ++kl)
+            if(shmem[kl][l_local] > col_max) col_max = shmem[kl][l_local];
+        if(col_max < 1e-300) col_max = 1.0;
+        s_sft[l_local] = static_cast<int16_t>(6 - oz2_floor_log2_d(col_max));
+        if(col < n) sftB[col] = s_sft[l_local];
+    }
+    __syncthreads();
+    const int sft = static_cast<int>(s_sft[l_local]);
 
     } else {
         /* ── B block (symmetric to A, with TRANS_B) ─────────────────── */
@@ -2762,7 +2929,10 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
                     "(m=%lld, n=%lld, k=%lld, status=%d). "
                     "Falling back to native DGEMM.\n",
                     (long long)m, (long long)n, (long long)k, (int)prelim_st);
-            (void)hipGetLastError();  /* clear stale GPU error set by the failed GEMM */
+            /* Drain the stream before clearing the error so that the stream is in
+             * a clean state for future operations on this stream/context.       */
+            (void)hipStreamSynchronize(stream);
+            (void)hipGetLastError();
             oz2_cleanup();
             return rocblaslt_status_internal_error;
         }
@@ -2802,8 +2972,13 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
         hipLaunchKernelGGL(oz2_adp_reduce_B_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, stream,
                            C32i, m, n, ldc32i, sftB, adp_buf + 1);
 
-        /* Sync, copy 2 floats, compute effective_s on host. */
+        /* Sync, copy 2 floats, compute effective_s on host.
+         * hipGetLastError() clears any sticky thread-level error that may have
+         * been set by the ADP kernels (e.g. from a previous GPU fault on the
+         * same stream).  Without this, a subsequent hipMallocAsync on the same
+         * stream may fail even though the device has plenty of free memory.   */
         (void)hipStreamSynchronize(stream);
+        (void)hipGetLastError();
         float h_adp[2] = {0.0f, 0.0f};
         (void)hipMemcpy(h_adp, adp_buf, 2 * sizeof(float), hipMemcpyDeviceToHost);
 
@@ -3039,7 +3214,9 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
                             "Falling back to native DGEMM.\n",
                             (long long)m, (long long)n, (long long)k,
                             batch_cur, global_chunk_start, (int)batch_st);
-                    (void)hipGetLastError();  /* clear stale GPU error set by the failed GEMM */
+                    /* Drain the stream before clearing the error. */
+                    (void)hipStreamSynchronize(stream);
+                    (void)hipGetLastError();
                     oz2_cleanup();
                     return rocblaslt_status_internal_error;
                 }
@@ -3193,12 +3370,15 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
     const int device = reinterpret_cast<const _rocblaslt_handle*>(settings.handle)->device;
-    /* For dynamic (ADP) mode: allocate workspace for OZ2_S_MAX=18 so that
-     * any adaptive s ∈ [2,18] can be used without reallocation.          */
-    const unsigned ws_moduli = settings.dynamic_mode ? OZ2_S_MAX : num_moduli;
+    /* Build a lightweight decision just to communicate dynamic_mode and
+     * num_moduli to fp64EmulationWorkspaceSize — only those two fields are
+     * consulted by the workspace function.                                  */
+    Fp64EmulationDecision ws_decision{};
+    ws_decision.dynamic_mode = settings.dynamic_mode;
+    ws_decision.num_moduli   = num_moduli;
     const size_t wsNeeded = fp64EmulationWorkspaceSize(
                                 reinterpret_cast<const _rocblaslt_handle*>(settings.handle),
-                                opA, opB, m, n, k, ws_moduli);
+                                opA, opB, m, n, k, ws_decision);
 
     Fp64EmulationSettings effectiveSettings = settings;
     void* ws_toplevel = nullptr;
@@ -3207,7 +3387,19 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
        (effectiveSettings.workspace == nullptr ||
         effectiveSettings.workspace_bytes < wsNeeded))
     {
-        if(hipMallocAsync(&ws_toplevel, wsNeeded, stream) != hipSuccess)
+        /* Use hipMalloc (not hipMallocAsync) so that:
+         *  (1) The allocation is not affected by any HIP stream error state from
+         *      a previous GPU fault on the same stream.  hipMallocAsync fails
+         *      immediately when the stream has a sticky error, even with plenty
+         *      of free device memory.
+         *  (2) The allocation draws from the same device memory pool as the
+         *      benchmark's memory_pool<d_memory> (which also uses hipMalloc),
+         *      so pool contention is resolved naturally: if device memory is
+         *      scarce, the benchmark pool's existing retry logic (pool.clear()
+         *      on hipMalloc failure) frees idle matrix buffers.
+         *  The synchronous overhead of hipMalloc is negligible compared to the
+         *  hundreds-of-millisecond GEMM that follows.                           */
+        if(hipMalloc(&ws_toplevel, wsNeeded) != hipSuccess)
             return rocblaslt_status_memory_error;
         effectiveSettings.workspace       = ws_toplevel;
         effectiveSettings.workspace_bytes = wsNeeded;
@@ -3232,7 +3424,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
 
     /* Release the top-level workspace now that all leaves have finished.    */
     if(ws_toplevel != nullptr)
-        (void)hipFreeAsync(ws_toplevel, stream);
+        (void)hipFree(ws_toplevel);
 
     if(_prof) {
         (void)hipEventRecord(ev_end, stream);

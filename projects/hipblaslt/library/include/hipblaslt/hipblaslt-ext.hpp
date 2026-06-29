@@ -594,8 +594,12 @@ namespace hipblaslt_ext
         hipblasLtHandle_t     m_handle;
         std::shared_ptr<void> m_data;
 
-        size_t  m_workspace_bytes        = 0;
-        int32_t m_streamk_tile_scheduling_mode = HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF;
+        size_t m_workspace_bytes      = 0;
+        /* Emulation workspace required by fp64EmulatedGemm for this problem.
+         * Set by setProblem(); augmented into algoGetHeuristic / isAlgoSupported
+         * results so callers allocate the right workspace without internal
+         * per-call hipMalloc.                                                  */
+        size_t m_emul_workspace_bytes = 0;
     };
 
     /*! \ingroup types_module

@@ -540,7 +540,8 @@ try
         if(emulDecision.apply && *returnAlgoCount > 0)
         {
             const size_t emul_ws =
-                fp64EmulationWorkspaceSize(m, n, k, emulDecision.num_moduli);
+                fp64EmulationWorkspaceSize(h, desc_ptr->op_A, desc_ptr->op_B,
+                                           m, n, k, emulDecision);
             for(int i = 0; i < *returnAlgoCount; ++i)
                 heuristicResultsArray[i].workspaceSize = emul_ws;
         }
@@ -932,17 +933,25 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
-size_t hipblasLtFp64EmulationWorkspaceSize(int64_t  m,
-                                           int64_t  n,
-                                           int64_t  k,
-                                           unsigned num_moduli)
+size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t  handle,
+                                           hipblasOperation_t opA,
+                                           hipblasOperation_t opB,
+                                           int64_t            m,
+                                           int64_t            n,
+                                           int64_t            k)
 try
 {
     if(m < 0 || n < 0 || k < 0) return 0;
-    /* Clamp num_moduli to the valid range [2, 18] used by the emulation. */
-    if(num_moduli < 2u)  num_moduli = 2u;
-    if(num_moduli > 18u) num_moduli = 18u;
-    return fp64EmulationWorkspaceSize(m, n, k, num_moduli);
+    /* Resolve all handle settings via the canonical decision function.
+     * type_a=HIP_R_64F is the only type that triggers emulation;
+     * batch_count=1 because emulation only supports non-batched GEMMs.
+     * Returns 0 when d.apply=false (device not in perf-model table, or
+     * emulation disabled on the handle) — no emulation workspace needed.    */
+    const auto* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
+    const Fp64EmulationDecision d =
+        fp64EmulationDecision(h, HIP_R_64F, opA, opB, m, n, k, /*batch_count=*/1);
+    if(d.status != rocblaslt_status_success || !d.apply) return 0;
+    return fp64EmulationWorkspaceSize(h, opA, opB, m, n, k, d);
 }
 catch(...)
 {

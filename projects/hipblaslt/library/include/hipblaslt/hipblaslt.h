@@ -1281,12 +1281,14 @@ hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t hand
  *  heuristic selects a compatible algorithm, and allocate at least this many
  *  bytes for the workspace pointer supplied to \ref hipblasLtMatmul.
  *
- *  @param[in]  handle      hipBLASLt handle (provides device selection for the
- *                          performance model).
- *  @param[in]  m           Number of rows of op(A) and D.
- *  @param[in]  n           Number of columns of op(B) and D.
- *  @param[in]  k           Shared dimension of op(A) and op(B).
- *  @param[in]  num_moduli  Number of CRT moduli (2..18); clamped to that range.
+ *  @param[in]  handle  hipBLASLt handle (provides device selection for the
+ *                      performance model, and the configured moduli count and
+ *                      mantissa-control mode — FIXED or DYNAMIC — set via
+ *                      \ref hipblasLtSetFixedPointEmulationMantissaControl and
+ *                      \ref hipblasLtSetFixedPointEmulationMaxMantissaBitCount).
+ *  @param[in]  m       Number of rows of op(A) and D.
+ *  @param[in]  n       Number of columns of op(B) and D.
+ *  @param[in]  k       Shared dimension of op(A) and op(B).
  *
  *  \retval  Workspace size in bytes, or 0 on error.
  */
@@ -1296,8 +1298,7 @@ size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t  handle,
                                            hipblasOperation_t opB,
                                            int64_t            m,
                                            int64_t            n,
-                                           int64_t            k,
-                                           unsigned           num_moduli);
+                                           int64_t            k);
 
 #ifdef __cplusplus
 }

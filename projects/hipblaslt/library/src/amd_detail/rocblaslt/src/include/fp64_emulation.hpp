@@ -73,14 +73,9 @@ uint32_t fp64EmulationSpecialValuesMask();
  * Notable values: 55 bits → 7 GEMMs, 79 bits → 10 GEMMs, 110 bits → 14 GEMMs. */
 unsigned fp64EmulationNumModuli();
 
-/* Returns the byte count of the emulation workspace for the given problem.
- * Use this to check whether a caller-provided workspace is sufficient. */
-size_t fp64EmulationWorkspaceSize(int64_t m, int64_t n, int64_t k, unsigned num_moduli);
-
-/* Forward declaration — callers already include handle.h which provides the full
- * definition.  Declared here so the two helpers below can use the type.     */
-struct _rocblaslt_handle;
-
+/* =========================================================================
+ * Decision struct and gate function — status-propagating
+ * ========================================================================= */
 struct Fp64EmulationDecision {
     rocblaslt_status status;       /* rocblaslt_status_invalid_value on bad env   */
     bool             apply;        /* true → use emulation; false → native path  */
@@ -108,6 +103,19 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
  *     forces FIXED at the requested bit count.
  *   DYNAMIC mode or no precision hint: uses the current non-ADP 16-moduli path. */
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h);
+
+/* Returns the byte count of the emulation workspace for the given problem.
+ * The decision is used to derive the layout moduli (OZ2_S_MAX=18 in ADP mode,
+ * decision.num_moduli otherwise) and the handle to obtain the device for the
+ * performance model.
+ * Use this to check whether a caller-provided workspace is sufficient. */
+size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
+                                  hipblasOperation_t           opA,
+                                  hipblasOperation_t           opB,
+                                  int64_t                      m,
+                                  int64_t                      n,
+                                  int64_t                      k,
+                                  const Fp64EmulationDecision& decision);
 
 /* Per-call emulation settings.
  * Fields with sentinel values (0 for num_moduli, ~0u for sv_mask) cause the
