@@ -179,7 +179,24 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
                                  stream, emulSettings);
             if(emulSt == rocblaslt_status_success)
                 return rocblaslt_status_success;
-            // Non-success (memory error, Inf/NaN detected, etc.): fall through to native.
+            /* Non-success: fall through to native DGEMM.
+             * Emit a rate-limited warning so the caller knows emulation was skipped
+             * and the reason why.  Rate cap: ≤5 messages per process lifetime.   */
+            {
+                static std::atomic<unsigned> fallback_warns{0u};
+                if(fallback_warns.fetch_add(1u, std::memory_order_relaxed) < 5u) {
+                    const char* reason =
+                        (emulSt == rocblaslt_status_memory_error)  ?
+                            "workspace allocation failed (hipMallocAsync)" :
+                        (emulSt == rocblaslt_status_invalid_value)  ?
+                            "NaN/Inf detected in inputs or ADP precision overflow" :
+                            "INT8 GEMM failed (hipblasLtMatmul returned error)";
+                    std::fprintf(stderr,
+                        "[hipBLASLt FP64 emulation] INFO: falling back to native DGEMM "
+                        "(m=%lld, n=%lld, k=%lld, reason: %s).\n",
+                        (long long)m, (long long)n, (long long)k, reason);
+                }
+            }
         }
     }
 

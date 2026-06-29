@@ -80,7 +80,7 @@ static __host__ __device__ size_t oz2_pad(size_t n)
     return (n + OZ2_ALIGN - 1) / OZ2_ALIGN * OZ2_ALIGN;
 }
 
-static constexpr size_t OZ2_CHUNK_TARGET_BYTES = 8ull << 30;  /* 16 GiB   */
+static constexpr size_t OZ2_CHUNK_TARGET_BYTES = 8ull << 30;  /* 8 GiB    */
 static constexpr size_t OZ2_SCALE_CHUNK_TARGET_BYTES = 8ull << 30;  /* 8 GiB */
 
 static unsigned oz2_compute_chunk_size(int64_t m, int64_t n, unsigned num_moduli)
@@ -100,8 +100,13 @@ static unsigned oz2_compute_scale_chunk_size(int64_t m, int64_t n, int64_t k,
     const size_t ldb8i       = lda8i;
     const size_t slice_bytes = lda8i * cola8i + ldb8i * static_cast<size_t>(n);
     if(slice_bytes == 0u) return num_moduli;
+    /* Do NOT use max(gemm_chunk_sz, ...) here: forcing scale_sz >= gemm_chunk_sz causes
+     * scale_sz = num_moduli for problems where mn is small (gemm_chunk_sz = num_moduli),
+     * making the workspace grow linearly with K regardless of the scale target.
+     * The non-fused path handles scale_sz < gemm_chunk_sz correctly via its outer loop.
+     * The fused path is guarded separately (fused_single_pass check in the caller).    */
     const size_t s = std::min(static_cast<size_t>(num_moduli),
-                              std::max(static_cast<size_t>(gemm_chunk_sz),
+                              std::max(size_t(1),
                                        OZ2_SCALE_CHUNK_TARGET_BYTES / slice_bytes));
     return static_cast<unsigned>(s);
 }
@@ -2655,12 +2660,6 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     const uint32_t svmask = (settings.sv_mask != ~0u)
                                 ? settings.sv_mask : fp64EmulationSpecialValuesMask();
 
-    if(svmask != 0u) {
-        if(hipMemsetAsync(nan_flag, 0, sizeof(uint32_t), stream) != hipSuccess) {
-            (void)hipFreeAsync(ws, stream); return rocblaslt_status_internal_error;
-        }
-    }
-
     hipblasLtMatrixLayout_t layoutA  = nullptr;
     hipblasLtMatrixLayout_t layoutB  = nullptr;
     hipblasLtMatrixLayout_t layoutCD = nullptr;
@@ -2669,31 +2668,30 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     hipblasLtMatrixLayout_t layoutCD_b = nullptr;
     hipblasLtMatmulDesc_t   matmulDesc = nullptr;
 
-    auto cleanup = [&]() noexcept {
-        bool ok = true;
-        if(layoutCD_b) (void)hipblasLtMatrixLayoutDestroy(layoutCD_b);
-        if(layoutB_b)  (void)hipblasLtMatrixLayoutDestroy(layoutB_b);
-        if(layoutA_b)  (void)hipblasLtMatrixLayoutDestroy(layoutA_b);
+    /* Cleanup helper: destroys hipblasLt descriptor objects and HIP profiling events
+     * on every early-return path.  All four handles are initialised to nullptr above,
+     * so this is safe to call even before hipblasLtMatrixLayoutCreate has been invoked.
+     * The normal-success path and the ADP-overflow path handle cleanup explicitly and
+     * do not use this lambda.                                                         */
+    auto oz2_cleanup = [&]() noexcept {
         if(matmulDesc) (void)hipblasLtMatmulDescDestroy(matmulDesc);
         if(layoutCD)   (void)hipblasLtMatrixLayoutDestroy(layoutCD);
         if(layoutB)    (void)hipblasLtMatrixLayoutDestroy(layoutB);
         if(layoutA)    (void)hipblasLtMatrixLayoutDestroy(layoutA);
-        if(ws_owned && hipFreeAsync(ws, stream) != hipSuccess) ok = false;
-        return ok;
-    };
-    auto fail_internal = [&]() {
-        cleanup();
-        return rocblaslt_status_internal_error;
+        if(_prof) { (void)hipEventDestroy(_ev1); (void)hipEventDestroy(_ev0); }
     };
 
-    if(hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(m), static_cast<int64_t>(lda8i)) != HIPBLAS_STATUS_SUCCESS)
-        return fail_internal();
-    if(hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(ldb8i)) != HIPBLAS_STATUS_SUCCESS)
-        return fail_internal();
-    if(hipblasLtMatrixLayoutCreate(&layoutCD, HIP_R_32I, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(ldc32i)) != HIPBLAS_STATUS_SUCCESS)
-        return fail_internal();
-    if(hipblasLtMatmulDescCreate(&matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I) != HIPBLAS_STATUS_SUCCESS)
-        return fail_internal();
+    if(svmask != 0u) {
+        if(hipMemsetAsync(nan_flag, 0, sizeof(uint32_t), stream) != hipSuccess) {
+            oz2_cleanup();
+            return rocblaslt_status_internal_error;
+        }
+    }
+
+    hipblasLtMatrixLayoutCreate(&layoutA,  HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(m), static_cast<int64_t>(lda8i));
+    hipblasLtMatrixLayoutCreate(&layoutB,  HIP_R_8I, static_cast<uint64_t>(k), static_cast<uint64_t>(n), static_cast<int64_t>(ldb8i));
+    hipblasLtMatrixLayoutCreate(&layoutCD, HIP_R_32I, static_cast<uint64_t>(m), static_cast<uint64_t>(n), static_cast<int64_t>(ldc32i));
+    hipblasLtMatmulDescCreate(&matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I);
     {
         hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
         if(hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT)) != HIPBLAS_STATUS_SUCCESS)
@@ -2739,26 +2737,36 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
 
     if(svmask != 0u) {
         if(hipStreamSynchronize(stream) != hipSuccess) {
-            return fail_internal();
+            oz2_cleanup(); return rocblaslt_status_internal_error;
         }
         uint32_t detected = 0u;
         if(hipMemcpy(&detected, nan_flag, sizeof(uint32_t), hipMemcpyDeviceToHost) != hipSuccess) {
-            return fail_internal();
+            oz2_cleanup(); return rocblaslt_status_internal_error;
         }
         if(detected & svmask) {
-            cleanup();
-            return rocblaslt_status_invalid_value;
+            oz2_cleanup(); return rocblaslt_status_invalid_value;
         }
     }
 
     /* Preliminary INT8 GEMM: C32i_prelim = A8i_high^T × B8i_high */
     _pstart();
-    if(hipblasLtMatmul(settings.handle, matmulDesc,
-                       &one_i, A8i_high, layoutA, B8i_high, layoutB,
-                       &zero_i, C32i, layoutCD, C32i, layoutCD, nullptr, nullptr, 0, stream)
-       != HIPBLAS_STATUS_SUCCESS)
-        return fail_internal();
-    _pstop(_t_prelim_gemm);
+    {
+        const hipblasStatus_t prelim_st =
+            hipblasLtMatmul(settings.handle, matmulDesc,
+                            &one_i, A8i_high, layoutA, B8i_high, layoutB,
+                            &zero_i, C32i, layoutCD, C32i, layoutCD, nullptr, nullptr, 0, stream);
+        _pstop(_t_prelim_gemm);
+        if(prelim_st != HIPBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                    "[hipBLASLt FP64 emulation] WARNING: preliminary INT8 GEMM failed "
+                    "(m=%lld, n=%lld, k=%lld, status=%d). "
+                    "Falling back to native DGEMM.\n",
+                    (long long)m, (long long)n, (long long)k, (int)prelim_st);
+            (void)hipGetLastError();  /* clear stale GPU error set by the failed GEMM */
+            oz2_cleanup();
+            return rocblaslt_status_internal_error;
+        }
+    }
 
     /* log2P from the mixed table: fast::log2P for s=13,14,15 (prevents CRT overflow);
      * accu::log2P for all other s (preserves maximum precision).               */
@@ -2809,9 +2817,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
              * near-zero for the elements providing cancellation, giving wrong
              * results regardless of s.  Fall back to native DGEMM.
              * Rate-limited warning (≤5 per process).                         */
-            static std::atomic<unsigned> adp_overflow_warns{0u};
-            if(adp_overflow_warns.fetch_add(1u, std::memory_order_relaxed) < 5u) {
-                std::fprintf(stderr,
+            std::fprintf(stderr,
                     "[hipBLASLt FP64 emulation] WARNING: ADP overflow for GEMM "
                     "(m=%lld, n=%lld, k=%lld): "
                     "A-side log2P_req=%.1f bits, B-side=%.1f bits, "
@@ -2822,7 +2828,6 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
                     h_adp[0] - 200.0f, h_adp[1] - 200.0f,
                     log2P_needed, h_accu_log2P_all[OZ2_S_MAX - 2u],
                     OZ2_S_MAX, oz2_cum_bits[OZ2_S_MAX - 2u]);
-            }
             hipblasLtMatmulDescDestroy(matmulDesc);
             hipblasLtMatrixLayoutDestroy(layoutCD);
             hipblasLtMatrixLayoutDestroy(layoutB);
@@ -2935,9 +2940,16 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
             /* Gate: fused replaces only INT8 GEMM + accum; scale always runs.
              * Works for all transpose combinations (A8i/B8i always in canonical format).
              * HIPBLASLT_EMULATION_FUSED=off disables the fused path entirely;
-             * HIPBLASLT_EMULATION_FUSED=on/force forces it regardless of perf model. */
+             * HIPBLASLT_EMULATION_FUSED=on/force forces it regardless of perf model.
+             *
+             * fused_single_pass: the fused kernel reads all effective_s moduli from A8i/B8i
+             * in one pass.  When scale_chunk_size < effective_s the scale loop ran in
+             * multiple passes, each overwriting the beginning of A8i/B8i with a new chunk,
+             * so only the last chunk is valid at the point the fused kernel would run.
+             * Only use the fused path when all moduli were written in a single scale pass. */
+            const bool fused_single_pass = (scale_chunk_size >= effective_s);
             const Oz2FusedMode fused_mode = oz2_fused_mode();
-            if (fused_mode != Oz2FusedMode::OFF &&
+            if (fused_single_pass && fused_mode != Oz2FusedMode::OFF &&
                 (fused_mode == Oz2FusedMode::ON ||
                  (pm.t_fused_ms > 0.0 &&
                   pm.t_fused_ms < pm.t_int8_gemms_ms + pm.t_accum_ms))) {
@@ -3009,16 +3021,30 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
             }
             const int8_t* const A8i_gemm = A8i + gemm_local * strideA8i;
             const int8_t* const B8i_gemm = B8i + gemm_local * strideB8i;
-            _pstart();
-            if(hipblasLtMatmul(settings.handle, matmulDesc,
-                               &one_i, A8i_gemm, layoutA_b, B8i_gemm, layoutB_b,
-                               &zero_i, C32i_batch, layoutCD_b, C32i_batch, layoutCD_b,
-                               nullptr, nullptr, 0, stream)
-               != HIPBLAS_STATUS_SUCCESS)
-                return fail_internal();
-            _pstop(_t_int8);
-
             const unsigned global_chunk_start = scale_start + gemm_local;
+            _pstart();
+            {
+                const hipblasStatus_t batch_st =
+                    hipblasLtMatmul(settings.handle, matmulDesc,
+                                    &one_i, A8i_gemm, layoutA, B8i_gemm, layoutB,
+                                    &zero_i, C32i_batch, layoutCD, C32i_batch, layoutCD,
+                                    nullptr, nullptr, 0, stream);
+                _pstop(_t_int8);
+                if(batch_st != HIPBLAS_STATUS_SUCCESS) {
+                    static std::atomic<unsigned> batch_gemm_warns{0u};
+                    if(batch_gemm_warns.fetch_add(1u, std::memory_order_relaxed) < 5u)
+                        std::fprintf(stderr,
+                            "[hipBLASLt FP64 emulation] WARNING: INT8 batch GEMM failed "
+                            "(m=%lld, n=%lld, k=%lld, batch_count=%d, moduli_offset=%u, status=%d). "
+                            "Falling back to native DGEMM.\n",
+                            (long long)m, (long long)n, (long long)k,
+                            batch_cur, global_chunk_start, (int)batch_st);
+                    (void)hipGetLastError();  /* clear stale GPU error set by the failed GEMM */
+                    oz2_cleanup();
+                    return rocblaslt_status_internal_error;
+                }
+            }
+
             const bool is_first = (global_chunk_start == 0);
             const bool is_last  = (global_chunk_start + actual_gemm == effective_s);
             _pstart();
