@@ -81,7 +81,7 @@ static __host__ __device__ size_t oz2_pad(size_t n)
 }
 
 static constexpr size_t OZ2_CHUNK_TARGET_BYTES = 16ull << 30;  /* 16 GiB    */
-static constexpr size_t OZ2_SCALE_CHUNK_TARGET_BYTES = 16ull << 30;  /* 16 GiB */
+static constexpr size_t OZ2_SCALE_CHUNK_TARGET_BYTES = 8ull << 30;  /* 16 GiB */
 
 static unsigned oz2_compute_chunk_size(int64_t m, int64_t n, unsigned num_moduli)
 {
