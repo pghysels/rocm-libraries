@@ -75,13 +75,20 @@ static constexpr unsigned OZ2_S_MAX = 18;
 /* Alignment for INT8 arrays (128 bytes = 128 INT8 elements) */
 static constexpr size_t OZ2_ALIGN = 128;
 
+/* Workspace reserved for the INT8 GEMM algorithms (preliminary and batch).
+ * Passing a non-null workspace allows hipBLASLt to select algorithms that
+ * require workspace, which is necessary for very large k values where no
+ * zero-workspace INT8 GEMM algorithm is available.
+ * 128 MiB matches the default value of HIPBLASLT_TUNING_USER_MAX_WORKSPACE. */
+static constexpr size_t OZ2_INT8_GEMM_WS_BYTES = 128ull << 20;  /* 128 MiB */
+
 static __host__ __device__ size_t oz2_pad(size_t n)
 {
     return (n + OZ2_ALIGN - 1) / OZ2_ALIGN * OZ2_ALIGN;
 }
 
 static constexpr size_t OZ2_CHUNK_TARGET_BYTES = 16ull << 30;  /* 16 GiB    */
-static constexpr size_t OZ2_SCALE_CHUNK_TARGET_BYTES = 8ull << 30;  /* 16 GiB */
+static constexpr size_t OZ2_SCALE_CHUNK_TARGET_BYTES = 8ull << 30;  /* 8 GiB */
 
 static unsigned oz2_compute_chunk_size(int64_t m, int64_t n, unsigned num_moduli)
 {
@@ -1047,7 +1054,8 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
            + padn   * sizeof(int16_t)
            + sizeof(uint32_t)
            + cola8i * sizeof(int32_t)
-           + 2 * sizeof(float);     /* ADP float buffer: adp_buf[0..1] (bias ±200) */
+           + 2 * sizeof(float)      /* ADP float buffer: adp_buf[0..1] (bias ±200) */
+           + OZ2_INT8_GEMM_WS_BYTES; /* INT8 GEMM workspace (preliminary + batch)  */
 }
 
 unsigned fp64EmulationNumModuli()
@@ -2876,6 +2884,12 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     int16_t*  const sftB       = sftA + szSftA;
     uint32_t* const nan_flag   = reinterpret_cast<uint32_t*>(sftB + szSftB);
     int32_t*  const row_max    = reinterpret_cast<int32_t*>(nan_flag + szNanFlag);
+    /* adp_buf and int8_ws follow row_max in the workspace layout.
+     * Declared here so they are in scope for both the preliminary GEMM
+     * and the ADP kernels that come later.                               */
+    float*    const adp_buf    = reinterpret_cast<float*>(row_max + szRowMax);
+    void*     const int8_ws    = static_cast<void*>(adp_buf + 2);
+    constexpr size_t int8_ws_size = OZ2_INT8_GEMM_WS_BYTES;
     int32_t*  const C32i       = C32i_batch;
 
     if(_prof) (void)hipEventRecord(_ev_tot, stream);
@@ -2978,7 +2992,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
         const hipblasStatus_t prelim_st =
             hipblasLtMatmul(settings.handle, matmulDesc,
                             &one_i, A8i_high, layoutA, B8i_high, layoutB,
-                            &zero_i, C32i, layoutCD, C32i, layoutCD, nullptr, nullptr, 0, stream);
+                            &zero_i, C32i, layoutCD, C32i, layoutCD, nullptr, int8_ws, int8_ws_size, stream);
         _pstop(_t_prelim_gemm);
         if(prelim_st != HIPBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr,
@@ -3001,11 +3015,8 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
     _pstart();
     const unsigned sftA_m_blks = static_cast<unsigned>((m + 63) / 64);
     const unsigned sftA_n_blks = static_cast<unsigned>((n + 63) / 64);
-    /* adp_buf: 2 floats at the end of the workspace for ADP (Adaptive Precision).
-     * [0] = biased max log2P_req for A-side (+200 bias, subtract on host)
-     * [1] = biased max log2P_req for B-side (+200 bias, subtract on host)
+    /* adp_buf: 2 floats used by ADP (Adaptive Precision) kernels (see above).
      * Initialised to 0.0f (= biased −200 → effective_s=2 if all rows/cols zero). */
-    float* const adp_buf = reinterpret_cast<float*>(row_max + szRowMax);
 
     /* effective_s: ADP may reduce this below num_moduli; determined BEFORE the
      * shift-refinement delta is applied so we can use the correct log2P.       */
@@ -3256,7 +3267,7 @@ fp64EmulatedGemmImpl(hipblasOperation_t           opA,
                     hipblasLtMatmul(settings.handle, matmulDesc,
                                     &one_i, A8i_gemm, layoutA, B8i_gemm, layoutB,
                                     &zero_i, C32i_batch, layoutCD, C32i_batch, layoutCD,
-                                    nullptr, nullptr, 0, stream);
+                                    nullptr, int8_ws, int8_ws_size, stream);
                 _pstop(_t_int8);
                 if(batch_st != HIPBLAS_STATUS_SUCCESS) {
                     std::fprintf(stderr,
