@@ -165,11 +165,8 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
             emulSettings.workspace       = workspace;
             emulSettings.workspace_bytes = workspaceSizeInBytes;
 
-            /* caller handle: reused for INT8 GEMMs inside the emulation */
-            emulSettings.handle = handle;
-
             const rocblaslt_status emulSt =
-                fp64EmulatedGemm(opA, opB, m, n, k,
+                fp64EmulatedGemm(handle, opA, opB, m, n, k,
                                  static_cast<const double*>(alpha),
                                  static_cast<const double*>(A), lda,
                                  static_cast<const double*>(B), ldb,

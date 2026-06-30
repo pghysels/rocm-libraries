@@ -48,9 +48,19 @@ bool                 fp64EmulationIsValidMantissaBitCount(int value);
 bool fp64EmulationIsEnabled();
 
 /* Returns true when the emulation is estimated to be at least as fast as
- * native FP64 DGEMM for the given problem size and number of moduli.
- * Uses a Roofline performance model calibrated for the target hardware. */
-bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num_moduli);
+ * native FP64 DGEMM for the given problem size.
+ * The number of moduli is derived from the handle's emulation settings via
+ * fp64EmulationEffectiveNumModuli(h) so the check always uses the same
+ * moduli count that would be used at run time.
+ * Uses a Roofline performance model calibrated for the target hardware.
+ * The handle is used to obtain the target device for the performance model.
+ * opA/opB select per-transpose efficiency factors in the BW-kernel model. */
+bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
+                                   hipblasOperation_t       opA,
+                                   hipblasOperation_t       opB,
+                                   int64_t                  m,
+                                   int64_t                  n,
+                                   int64_t                  k);
 
 /* Returns true when HIPBLASLT_EMULATION_STRATEGY=eager is set.
  * In eager mode emulation is used regardless of arithmetic intensity.
@@ -126,7 +136,6 @@ struct Fp64EmulationSettings {
     bool              dynamic_mode;    /* true when ADP (Adaptive Precision) mode */
     void*             workspace;       /* caller workspace; nullptr = allocate     */
     size_t            workspace_bytes; /* size of caller workspace                */
-    hipblasLtHandle_t handle;          /* caller handle for INT8 GEMMs             */
 };
 
 /* Run an emulated FP64 GEMM using Ozaki Scheme II (accurate mode).
@@ -152,7 +161,8 @@ struct Fp64EmulationSettings {
  *             mode (ADP) determines that even s=18 is insufficient for the
  *             given input's dynamic range.
  *             In both cases the caller should fall back to native FP64. */
-rocblaslt_status fp64EmulatedGemm(hipblasOperation_t           opA,
+rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
+                                  hipblasOperation_t           opA,
                                   hipblasOperation_t           opB,
                                   int64_t                      m,
                                   int64_t                      n,

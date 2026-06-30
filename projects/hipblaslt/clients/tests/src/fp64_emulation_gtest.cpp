@@ -348,9 +348,9 @@ namespace
         settings.sv_mask         = 0; // skip Inf/NaN check (faster, inputs are finite)
         settings.workspace       = nullptr; // library allocates
         settings.workspace_bytes = 0;
-        settings.handle          = m_handle;
 
-        const rocblaslt_status st = fp64EmulatedGemm(HIPBLAS_OP_N,
+        const rocblaslt_status st = fp64EmulatedGemm(m_handle,
+                                      HIPBLAS_OP_N,
                                                      HIPBLAS_OP_N,
                                                      N,
                                                      N,
@@ -649,7 +649,6 @@ namespace
 
         /* ── Emulation settings (use settings.num_moduli directly) ──────── */
         Fp64EmulationSettings emu_settings{};
-        emu_settings.handle          = hem;
         emu_settings.num_moduli      = p.s;
         emu_settings.sv_mask         = 0u;   /* skip Inf/NaN detection */
         emu_settings.workspace       = nullptr; /* library allocates internally */
@@ -715,7 +714,8 @@ namespace
 
             /* Emulated DGEMM (C→D_emu). */
             const rocblaslt_status emu_st =
-                fp64EmulatedGemm(p.opA, p.opB, p.m, p.n, p.k,
+                fp64EmulatedGemm(hem,
+                                              p.opA, p.opB, p.m, p.n, p.k,
                                  &p.alpha, dA, lda, dB, ldb,
                                  &p.beta,  dC, p.m, dD_emu, p.m,
                                  /*stream=*/nullptr, emu_settings);
@@ -992,7 +992,6 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
         Fp64EmulationSettings emu_settings{};
-        emu_settings.handle          = m_handle;
         emu_settings.num_moduli      = 16u;    /* ADP upper bound */
         emu_settings.sv_mask         = 0u;     /* skip Inf/NaN detection */
         emu_settings.dynamic_mode    = true;   /* enable ADP */
@@ -1001,7 +1000,8 @@ namespace
 
         const double alpha = 1.0, beta = 0.0;
         const rocblaslt_status st =
-            fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n,
+            fp64EmulatedGemm(m_handle,
+                                          HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n,
                              &alpha, dA, n, dB, n,
                              &beta,  dC, n, dD, n,
                              /*stream=*/nullptr, emu_settings);
@@ -1155,7 +1155,6 @@ namespace
         }
 
         Fp64EmulationSettings emu_settings{};
-        emu_settings.handle          = hem;
         emu_settings.num_moduli      = p.s;
         emu_settings.sv_mask         = 0u;
         emu_settings.workspace       = nullptr;
@@ -1163,7 +1162,8 @@ namespace
 
         const double          alpha = 1.0, beta = 0.0;
         const rocblaslt_status st =
-            fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+            fp64EmulatedGemm(hem,
+                                          HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
                              &alpha, dA, N, dB, N,
                              &beta,  dC, N, dD, N,
                              /*stream=*/nullptr, emu_settings);
@@ -1375,7 +1375,6 @@ namespace
 
         /* ── Run emulated C = A^T × A ────────────────────────────────────────── */
         Fp64EmulationSettings settings{};
-        settings.handle          = hem;
         settings.num_moduli      = 0;    /* derive from handle (ADP default) */
         settings.sv_mask         = 0u;   /* skip Inf/NaN detection */
         settings.dynamic_mode    = true; /* ADP mode */
@@ -1384,7 +1383,8 @@ namespace
 
         const double alpha = 1.0, beta = 0.0;
         const rocblaslt_status st =
-            fp64EmulatedGemm(HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N,
+            fp64EmulatedGemm(hem,
+                                          HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N,
                              &alpha, dA, N, dA, N,
                              &beta,  dC, N, dD, N,
                              /*stream=*/nullptr, settings);
@@ -1672,7 +1672,6 @@ namespace
         }
 
         Fp64EmulationSettings emu_settings{};
-        emu_settings.handle          = hem;
         emu_settings.num_moduli      = 18u;    /* ADP upper bound */
         emu_settings.dynamic_mode    = true;   /* ADP: select s from data */
         emu_settings.sv_mask         = 0u;
@@ -1693,7 +1692,8 @@ namespace
 
         /* Emulated */
         const rocblaslt_status emu_st =
-            fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+            fp64EmulatedGemm(hem,
+                                          HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
                              &alpha, dA, N, dB, N,
                              &beta,  dC, N, dD_emu, N,
                              nullptr, emu_settings);
@@ -1825,7 +1825,6 @@ namespace
         /* ── Step 1: ADP triggers at the fp64EmulatedGemm level ────────────── */
         {
             Fp64EmulationSettings emu{};
-            emu.handle = m_handle;
             emu.num_moduli = 16u;
             emu.sv_mask = 0u;
             emu.dynamic_mode = true;
@@ -1833,7 +1832,8 @@ namespace
             emu.workspace_bytes = 0u;
             const double alpha = 1.0, beta = 0.0;
             const rocblaslt_status st =
-                fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                fp64EmulatedGemm(m_handle,
+                                              HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
                                  &alpha, dA, N, dB, N,
                                  &beta,  dC, N, dD_emul, N, nullptr, emu);
             if(st == rocblaslt_status_success) {
@@ -1995,7 +1995,6 @@ namespace
         }
 
         Fp64EmulationSettings settings{};
-        settings.handle          = m_handle;
         settings.num_moduli      = 16u;
         settings.sv_mask         = 0u;   /* subnormals are NOT Inf/NaN — no flag raised */
         settings.workspace       = nullptr;
@@ -2003,7 +2002,8 @@ namespace
 
         const double alpha = 1.0, beta = 0.0;
         const rocblaslt_status st =
-            fp64EmulatedGemm(HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+            fp64EmulatedGemm(m_handle,
+                                          HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
                              &alpha, dA, N, dB, N,
                              &beta,  dC, N, dD, N,
                              /*stream=*/nullptr, settings);
