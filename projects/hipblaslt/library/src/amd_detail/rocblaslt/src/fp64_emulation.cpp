@@ -745,7 +745,7 @@ static double oz2_effective_time_ms(bool tA, bool tB,
         /* Both halves are nearly identical in size (differ by at most 1 when
          * m or n is odd), so approximate t_split = 2 × t_half.             */
         const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode);
-        if(t_split <= t_mono * 1.01)
+        if(t_split < t_mono)
             return t_split;
     }
     return t_mono;
@@ -770,7 +770,7 @@ static Fp64PerfModelTimes oz2_effective_perf_model_times(bool tA, bool tB,
         const int64_t half_n  = split_m ? n     : n / 2;
 
         const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode);
-        if(t_split <= mono.t_total_ms * 1.01) {
+        if(t_split < mono.t_total_ms) {
             /* Recurse on one half, then double all components.
              * Both halves are ≈ equal in size so the approximation is exact
              * when m (or n) is even and negligible otherwise.               */
@@ -1008,7 +1008,7 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
         const double t_mono  = fp64EmulationPerfModelTimes(tA, tB, m, n, k, split_num_moduli, device, decision.dynamic_mode).t_total_ms;
         const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, split_num_moduli, device, decision.dynamic_mode);
 
-        if(t_split <= t_mono * 1.01) {
+        if(t_split < t_mono) {
             /* num_moduli (= ws_moduli) is forwarded to the recursive calls so that
              * the monolithic workspace at each leaf is sized for the correct layout
              * (e.g. OZ2_S_MAX in dynamic mode, matching layout_moduli in the impl). */
@@ -2770,7 +2770,7 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
             const double t_mono  = fp64EmulationPerfModelTimes(tA, tB, m, n, k, num_moduli, device, settings.dynamic_mode).t_total_ms;
             const double t_split = 2. * oz2_effective_time_ms(tA, tB, half_m, half_n, k, num_moduli, device, settings.dynamic_mode);
 
-            if(t_split <= t_mono * 1.01) {
+            if(t_split < t_mono) {
                 /* First half: rows 0..half_m-1 or cols 0..half_n-1. */
                 {
                     rocblaslt_status st =
