@@ -66,7 +66,7 @@
     } while(0)
 
 /* =========================================================================
- * Double-double primitives — host + device.
+ * Double-double primitives -- host + device.
  * Mirrors GEMMul8/testing/eval.hpp  (namespace dd).
  * ========================================================================= */
 
@@ -214,17 +214,17 @@ randmat_kernel(size_t n_elems, double* __restrict__ A, double phi, uint64_t seed
 }
 
 /* =========================================================================
- * dd_gemm_kernel — double-double reference GEMM, all 4 transpose modes.
+ * dd_gemm_kernel -- double-double reference GEMM, all 4 transpose modes.
  *
- * Computes C_dd = op(A) × op(B) where op is N or T.
- * All matrices are square N×N column-major (leading dim = N).
+ * Computes C_dd = op(A) x op(B) where op is N or T.
+ * All matrices are square NxN column-major (leading dim = N).
  *
- * transA=false (N): op(A)[i,j] = A[i + j*m]   (A is m×k, lda=m)
- * transA=true  (T): op(A)[i,j] = A[j + i*k]   (A is k×m, lda=k)
- * transB=false (N): op(B)[i,j] = B[i + j*k]   (B is k×n, ldb=k)
- * transB=true  (T): op(B)[i,j] = B[j + i*n]   (B is n×k, ldb=n)
+ * transA=false (N): op(A)[i,j] = A[i + j*m]   (A is m*k, lda=m)
+ * transA=true  (T): op(A)[i,j] = A[j + i*k]   (A is k*m, lda=k)
+ * transB=false (N): op(B)[i,j] = B[i + j*k]   (B is k*n, ldb=k)
+ * transB=true  (T): op(B)[i,j] = B[j + i*n]   (B is n*k, ldb=n)
  *
- * For square N×N all leading dims equal N, so the formulas simplify to:
+ * For square NxN all leading dims equal N, so the formulas simplify to:
  *   A load: transA ? A[a_col + row*N] : A[row + a_col*N]
  *   B load: transB ? B[col  + b_row*N] : B[b_row + col*N]
  *
@@ -360,7 +360,7 @@ compute_errors(size_t N,
 }
 
 /* =========================================================================
- * DgemmRunner — wraps a hipBLASLt handle + matmul descriptors for N×N DGEMM.
+ * DgemmRunner -- wraps a hipBLASLt handle + matmul descriptors for NxN DGEMM.
  * Used for both native (emulation disabled) and emulated (emulation enabled).
  * ========================================================================= */
 struct DgemmRunner {
@@ -409,7 +409,7 @@ struct DgemmRunner {
                 desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
         }
 
-        /* Square N×N, column-major */
+        /* Square NxN, column-major */
         HLT_CHECK(hipblasLtMatrixLayoutCreate(
             &layoutA, HIP_R_64F,
             static_cast<uint64_t>(N), static_cast<uint64_t>(N), N));
@@ -432,7 +432,7 @@ struct DgemmRunner {
         hasAlgo = (cnt > 0);
         if(!hasAlgo)
             std::fprintf(stderr,
-                "[warning] hipBLASLt: no DGEMM algorithm found — "
+                "[warning] hipBLASLt: no DGEMM algorithm found -- "
                 "passing nullptr algo\n");
     }
 
@@ -554,6 +554,9 @@ struct Config {
     std::vector<std::pair<char,char>> trans_list = {{'N','N'},{'N','T'},{'T','N'},{'T','T'}};
     bool                run_adaptive = true;
     bool                check_errors = true;
+    /* true  -> HIPBLASLT_EMULATION_STRATEGY_EAGER  (default, always emulate)
+     * false -> HIPBLASLT_EMULATION_STRATEGY_PERFORMANT (perf-model gate)   */
+    bool                run_eager    = true;
 };
 
 static void print_usage(const char* prog)
@@ -565,20 +568,26 @@ static void print_usage(const char* prog)
         "  --min-s S      Minimum num_moduli for emulation (default: 2)\n"
         "  --max-s S      Maximum num_moduli for emulation (default: 18)\n"
         "  --phi-list P   Comma-separated phi values\n"
-        "                 (default: 0.5,1,2,4  — same as GEMMul8)\n"
+        "                 (default: 0.5,1,2,4  -- same as GEMMul8)\n"
         "  --trans T      Comma-separated transpose combinations to run\n"
         "                 Each is two chars from {N,T}: NN,NT,TN,TT\n"
-        "                 (default: NN,NT,TN,TT — all four)\n"
+        "                 (default: NN,NT,TN,TT -- all four)\n"
         "  --no-adaptive  Skip the adaptive-s (library-default) run\n"
+        "  --performant   Use PERFORMANT strategy for the adaptive run instead of\n"
+        "                 EAGER: the library performance model decides whether to\n"
+        "                 apply emulation based on predicted emulation vs native\n"
+        "                 DGEMM time.  Fixed-s sweep always uses EAGER regardless.\n"
+        "                 CSV algo label changes to 'OS2-accu-performant'.\n"
         "  --no-check     Skip the double-double reference GEMM and error\n"
         "                 computation.  err_max and err_med are printed as 'nan'.\n"
         "                 Useful for fast timing-only sweeps at large N.\n"
         "  -h, --help     Print this help and exit\n"
         "\n"
         "Output: CSV columns: phi,N,transa,transb,algo,crt_bits,err_max,err_med,ms_per_run\n"
-        "  algo = 'DGEMM'              native FP64 (emulation disabled)\n"
-        "  algo = 'OS2-accu-adaptive'  adaptive s (library default, s<=16)\n"
-        "  algo = 'OS2-accu-sN'        fixed N moduli\n",
+        "  algo = 'DGEMM'                native FP64 (emulation disabled)\n"
+        "  algo = 'OS2-accu-adaptive'    adaptive s, EAGER strategy\n"
+        "  algo = 'OS2-accu-performant'  adaptive s, PERFORMANT strategy (--performant)\n"
+        "  algo = 'OS2-accu-sN'          fixed N moduli\n",
         prog);
 }
 
@@ -641,6 +650,8 @@ static Config parse_args(int argc, char** argv)
             cfg.trans_list = parse_trans_list(argv[++i]);
         } else if(a == "--no-adaptive") {
             cfg.run_adaptive = false;
+        } else if(a == "--performant") {
+            cfg.run_eager = false;
         } else if(a == "--no-check") {
             cfg.check_errors = false;
         } else {
@@ -676,7 +687,7 @@ int main(int argc, char** argv)
     const size_t   N2       = N * N;
     const unsigned num_runs = cfg.num_runs;
 
-    /* ── Device info ──────────────────────────────────────────────────── */
+    /* -- Device info -------------------------------------------------------- */
     {
         hipDeviceProp_t prop{};
         HIP_CHECK(hipGetDeviceProperties(&prop, 0));
@@ -687,9 +698,10 @@ int main(int argc, char** argv)
                  N, num_runs, cfg.min_s, cfg.max_s);
     for(size_t i = 0; i < cfg.phi_list.size(); ++i)
         std::fprintf(stderr, "%s%.4g", (i ? "," : ""), cfg.phi_list[i]);
-    std::fprintf(stderr, "]\n\n");
+    std::fprintf(stderr, "]  strategy=%s\n\n",
+                 cfg.run_eager ? "eager" : "performant");
 
-    /* ── GPU allocations ──────────────────────────────────────────────── */
+    /* -- GPU allocations ---------------------------------------------------- */
     double*  d_A    = nullptr;
     double*  d_B    = nullptr;
     double*  d_D    = nullptr;
@@ -712,9 +724,8 @@ int main(int argc, char** argv)
      * the actual memory allocated per-run equals heur.workspaceSize, which
      * the emulation library computes exactly from the problem size and s.
      */
-    constexpr size_t WS_BUDGET = size_t(-1);    /* no limit — heuristic picks best algo;
-                                                 * actual memory allocated = heur.workspaceSize */
-    size_t ws_bytes = 0;                          /* actual bytes currently allocated */
+    constexpr size_t WS_BUDGET = size_t(-1);    /* no limit */
+    size_t ws_bytes = 0;
     void*  d_ws     = nullptr;
 
     /* Grow the workspace buffer lazily to match what the heuristic requires. */
@@ -729,22 +740,22 @@ int main(int argc, char** argv)
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
 
-    /* ── hipBLASLt runner setup ───────────────────────────────────────── */
+    /* -- hipBLASLt runner setup --------------------------------------------- */
     /* Native DGEMM: emulation explicitly disabled */
     DgemmRunner native;
     native.init(static_cast<int64_t>(N), /*emulation_enabled=*/false, WS_BUDGET);
-    ensure_ws(native.workspaceSize());   /* native DGEMM workspace (typically 0) */
+    ensure_ws(native.workspaceSize());
 
     /* Emulated DGEMM: emulation enabled, EAGER strategy, no Inf/NaN check */
     DgemmRunner emulated;
     emulated.init(static_cast<int64_t>(N), /*emulation_enabled=*/true, WS_BUDGET);
-    ensure_ws(emulated.workspaceSize());   /* emulation workspace for default num_moduli */
+    ensure_ws(emulated.workspaceSize());
 
-    /* ── CSV header ───────────────────────────────────────────────────── */
+    /* -- CSV header --------------------------------------------------------- */
     std::printf("phi,N,transa,transb,algo,crt_bits,err_max,err_med,ms_per_run,workspace_MiB\n");
     std::fflush(stdout);
 
-    /* ── Main sweep: outer = transpose combination, inner = phi ──────── */
+    /* -- Main sweep: outer = transpose combination, inner = phi ------------- */
     for(const auto& tc : cfg.trans_list) {
         const char cTA = tc.first;
         const char cTB = tc.second;
@@ -774,7 +785,7 @@ int main(int argc, char** argv)
             HIP_CHECK(hipStreamSynchronize(stream));
         }
 
-        /* ── Native DGEMM ─────────────────────────────────────────────── */
+        /* -- Native DGEMM --------------------------------------------------- */
         {
             ensure_ws(native.workspaceSize());
             auto fn = [&]{ native.run(d_A, d_B, d_D, d_ws, ws_bytes, stream); };
@@ -790,8 +801,17 @@ int main(int argc, char** argv)
             std::fflush(stdout);
         }
 
-        /* ── Adaptive-s emulation run ─────────────────────────────────── */
+        /* -- Adaptive-s emulation run --------------------------------------- */
         if(cfg.run_adaptive) {
+            /* Set strategy: EAGER bypasses the performance-model gate so
+             * emulation is always applied.  PERFORMANT lets the library decide
+             * based on the predicted emulation vs native DGEMM time — for small
+             * N the library may choose to run native DGEMM instead.           */
+            const hipblasLtEmulationStrategy_t strat = cfg.run_eager
+                ? HIPBLASLT_EMULATION_STRATEGY_EAGER
+                : HIPBLASLT_EMULATION_STRATEGY_PERFORMANT;
+            HLT_CHECK(hipblasLtSetEmulationStrategy(emulated.handle, strat));
+
             HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
                 emulated.handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC));
             emulated.requery();
@@ -806,13 +826,20 @@ int main(int argc, char** argv)
                 std::tie(err_max, err_med) = compute_errors(
                     N, d_D, d_C_dd, d_err, h_err, stream);
 
-            std::printf("%.4g,%zu,%c,%c,OS2-accu-adaptive,%.1f,%.4e,%.4e,%.3f,%.3f\n",
-                        phi, N, cTA, cTB, CRT_BITS[16],
+            const char* algo_label = cfg.run_eager
+                ? "OS2-accu-adaptive"
+                : "OS2-accu-performant";
+
+            std::printf("%.4g,%zu,%c,%c,%s,%.1f,%.4e,%.4e,%.3f,%.3f\n",
+                        phi, N, cTA, cTB, algo_label, CRT_BITS[16],
                         err_max, err_med, ms, emu_ws / (1024.0 * 1024.0));
             std::fflush(stdout);
         }
 
-        /* ── Emulation sweep over num_moduli = min_s .. max_s ─────────── */
+        /* -- Emulation sweep over num_moduli = min_s .. max_s --------------- */
+        /* Fixed-s sweep always uses EAGER (emulation forced regardless of N). */
+        HLT_CHECK(hipblasLtSetEmulationStrategy(emulated.handle,
+                                                HIPBLASLT_EMULATION_STRATEGY_EAGER));
         for(unsigned s = cfg.min_s; s <= cfg.max_s; ++s) {
             HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
                 emulated.handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
@@ -841,7 +868,7 @@ int main(int argc, char** argv)
     } /* phi loop */
     } /* trans loop */
 
-    /* ── Cleanup ──────────────────────────────────────────────────────── */
+    /* -- Cleanup ------------------------------------------------------------ */
     emulated.destroy();
     native.destroy();
     HIP_CHECK(hipFree(d_ws));
