@@ -619,8 +619,10 @@ static void run_figure2(FILE* fp_out,
         /* Fill A and B on GPU */
         hipLaunchKernelGGL(fill_test2_A_kernel, grd2d, blk2d, 0, stream,
                            n, d_A, d_x, d_d);
+        HIP_CHECK(hipGetLastError());
         hipLaunchKernelGGL(fill_test2_B_kernel, grd2d, blk2d, 0, stream,
                            n, d_B, d_x, d_d);
+        HIP_CHECK(hipGetLastError());
 
         /* Native FP64 GEMM → C_ref (off-diagonal reference and native diagonal) */
         ws.ensure(native.workspaceSize());
@@ -634,6 +636,7 @@ static void run_figure2(FILE* fp_out,
             hipLaunchKernelGGL(extract_diagonal_kernel,
                                dim3(grd1d_diag), dim3(blk1d_diag), 0, stream,
                                n, d_C_ref, d_diag);
+            HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipMemcpyAsync(h_diag.data(), d_diag,
                 (size_t)n * sizeof(double), hipMemcpyDeviceToHost, stream));
             HIP_CHECK(hipStreamSynchronize(stream));
@@ -674,6 +677,7 @@ static void run_figure2(FILE* fp_out,
          */
         hipLaunchKernelGGL(fig2_error_kernel, grd2d, blk2d, 0, stream,
                            n, d_C_emul, d_C_ref, xTx, d_err);
+        HIP_CHECK(hipGetLastError());
         double all_max = reduce_errors(N2, d_err, h_err, stream).first;
 
         const unsigned blk1d_diag = 256u;
@@ -681,6 +685,7 @@ static void run_figure2(FILE* fp_out,
         hipLaunchKernelGGL(extract_diagonal_kernel,
                            dim3(grd1d_diag), dim3(blk1d_diag), 0, stream,
                            n, d_C_emul, d_diag);
+        HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipMemcpyAsync(h_diag.data(), d_diag,
             (size_t)n * sizeof(double), hipMemcpyDeviceToHost, stream));
         HIP_CHECK(hipStreamSynchronize(stream));
@@ -707,6 +712,7 @@ static void run_figure2(FILE* fp_out,
              * off-diagonal vs. native FP64 DGEMM reference. */
             hipLaunchKernelGGL(fig2_error_kernel, grd2d, blk2d, 0, stream,
                                n, d_C_emul, d_C_ref, xTx, d_err);
+            HIP_CHECK(hipGetLastError());
             double adp_all_max = reduce_errors(N2, d_err, h_err, stream).first;
 
             const unsigned blk1d_diag = 256u;
@@ -714,6 +720,7 @@ static void run_figure2(FILE* fp_out,
             hipLaunchKernelGGL(extract_diagonal_kernel,
                                dim3(grd1d_diag), dim3(blk1d_diag), 0, stream,
                                n, d_C_emul, d_diag);
+            HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipMemcpyAsync(h_diag.data(), d_diag,
                 (size_t)n * sizeof(double), hipMemcpyDeviceToHost, stream));
             HIP_CHECK(hipStreamSynchronize(stream));
@@ -806,13 +813,16 @@ static void run_figures34(FILE* fp_out,
             hipLaunchKernelGGL(randmat_uniform01_kernel,
                                dim3(grd1d), dim3(blk1d), 0, stream,
                                N2, d_A, seed_A);
+            HIP_CHECK(hipGetLastError());
             hipLaunchKernelGGL(randmat_uniform01_kernel,
                                dim3(grd1d), dim3(blk1d), 0, stream,
                                N2, d_B, seed_B);
+            HIP_CHECK(hipGetLastError());
 
             /* DD-GEMM reference */
             hipLaunchKernelGGL(dd_gemm_kernel, dd_grd, dd_blk, 0, stream,
                                static_cast<size_t>(N), d_A, d_B, d_C_dd);
+            HIP_CHECK(hipGetLastError());
             HIP_CHECK(hipStreamSynchronize(stream));
 
             /* ── Native FP64 DGEMM ────────────────────────────────────────── */
@@ -824,6 +834,7 @@ static void run_figures34(FILE* fp_out,
             hipLaunchKernelGGL(gemm_err_vs_dd_kernel,
                                dim3(grd1d), dim3(blk1d), 0, stream,
                                N2, d_err, d_C_dd);
+            HIP_CHECK(hipGetLastError());
             auto [nat_max, nat_med] = reduce_errors(N2, d_err, h_err, stream);
             nat_max_sum += nat_max;
             nat_med_sum += nat_med;
@@ -837,6 +848,7 @@ static void run_figures34(FILE* fp_out,
                 hipLaunchKernelGGL(gemm_err_vs_dd_kernel,
                                    dim3(grd1d), dim3(blk1d), 0, stream,
                                    N2, d_err, d_C_dd);
+                HIP_CHECK(hipGetLastError());
                 auto [a_max, a_med] = reduce_errors(N2, d_err, h_err, stream);
                 adp_max_sum += a_max;
                 adp_med_sum += a_med;
@@ -852,6 +864,7 @@ static void run_figures34(FILE* fp_out,
                 hipLaunchKernelGGL(gemm_err_vs_dd_kernel,
                                    dim3(grd1d), dim3(blk1d), 0, stream,
                                    N2, d_err, d_C_dd);
+                HIP_CHECK(hipGetLastError());
                 auto [e_max, e_med] = reduce_errors(N2, d_err, h_err, stream);
                 emu_max_sum[si] += e_max;
                 emu_med_sum[si] += e_med;

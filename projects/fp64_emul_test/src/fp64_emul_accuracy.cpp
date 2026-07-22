@@ -314,6 +314,7 @@ static void launch_randmat(size_t m, size_t n, double* d_A, double phi,
     const unsigned grd   = static_cast<unsigned>((n_elems + blk - 1) / blk);
     hipLaunchKernelGGL(randmat_kernel, dim3(grd), dim3(blk), 0, stream,
                        n_elems, d_A, phi, seed);
+    HIP_CHECK(hipGetLastError());
 }
 
 static void launch_dd_gemm(size_t N,
@@ -326,6 +327,7 @@ static void launch_dd_gemm(size_t N,
                     static_cast<unsigned>((N + DD_TILE - 1) / DD_TILE));
     hipLaunchKernelGGL(dd_gemm_kernel, grid, block, 0, stream,
                        N, N, N, d_A, d_B, d_C_dd, transA, transB);
+    HIP_CHECK(hipGetLastError());
 }
 
 static std::pair<double, double>
@@ -345,6 +347,7 @@ compute_errors(size_t N,
     const unsigned grd = static_cast<unsigned>((n_elems + blk - 1) / blk);
     hipLaunchKernelGGL(gemm_err_kernel, dim3(grd), dim3(blk), 0, stream,
                        n_elems, d_err, d_C_dd);
+    HIP_CHECK(hipGetLastError());
 
     HIP_CHECK(hipMemcpyAsync(h_err.data(), d_err, n_elems * sizeof(double),
                              hipMemcpyDeviceToHost, stream));

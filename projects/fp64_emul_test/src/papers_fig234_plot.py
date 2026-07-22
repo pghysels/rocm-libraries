@@ -92,7 +92,7 @@ def plot_figure2(df: pd.DataFrame, out_dir: str, n_fig2: int = 1024) -> None:
     """
     import math
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 4))
 
     # Drop b=0 (undefined on log x-axis) and any non-positive b values
     df = df[df["b"] > 0].copy()
@@ -158,7 +158,7 @@ def plot_figure2(df: pd.DataFrame, out_dir: str, n_fig2: int = 1024) -> None:
 
     ax.axhline(
         math.sqrt(n_fig2) * EPS_MACH, color="dimgray", linestyle="--", linewidth=1.2,
-        label=f"√n·ε  (n={n_fig2}, = {sqrt_n}·ε, paper threshold)",
+        label=f"√n·ε  (n={n_fig2})",
     )
     ax.axhline(
         EPS_MACH, color="silver", linestyle=":", linewidth=1.0,
@@ -166,12 +166,11 @@ def plot_figure2(df: pd.DataFrame, out_dir: str, n_fig2: int = 1024) -> None:
     )
 
     # ── Formatting ────────────────────────────────────────────────────────────
-    ax.set_xlabel("Exponent-range parameter  b", fontsize=12)
-    ax.set_ylabel("Max componentwise relative error  max_{ij} e_{ij}", fontsize=12)
+    ax.set_xlabel("Exponent-range parameter  $b$", fontsize=12)
+    ax.set_ylabel(r"$\max_{i,j}\,e_{ij}$", fontsize=12)
     ax.set_title(
-        "Figure 2 — BLAS Test 2: Emulated DGEMM vs. b\n"
-        "(arXiv:2511.13778, Section 6 Aspect A1)\n"
-        "Diagonal: |C[k,k] − xᵀx| / |xᵀx|   Off-diag: vs. native FP64",
+        r"diag: $e_{kk}=|C_{kk}-\mathbf{x}^\top\!\mathbf{x}|/|\mathbf{x}^\top\!\mathbf{x}|$;"
+        r"  off-diag: $e_{ij}=|C_{ij}-C_{ij}^{\mathrm{ref}}|/|C_{ij}^{\mathrm{ref}}|$",
         fontsize=10,
     )
     ax.legend(fontsize=8, loc="upper left", ncol=2)
@@ -184,14 +183,14 @@ def plot_figure2(df: pd.DataFrame, out_dir: str, n_fig2: int = 1024) -> None:
     ax.xaxis.set_minor_locator(mticker.NullLocator())  # suppress minor ticks between
     ax.yaxis.set_major_formatter(mticker.LogFormatterSciNotation())
 
-    # y-axis: [10^-17, top] — auto top accommodates native DGEMM if visible
-    ax.set_ylim(bottom=1e-17)
+    ax.set_ylim(1e-17, 1e-1)
 
-    out_path = os.path.join(out_dir, "figure2.png")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    for ext in ("png", "pdf"):
+        out_path = os.path.join(out_dir, f"figure2.{ext}")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"Saved {out_path}")
     plt.close(fig)
-    print(f"Saved {out_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -224,7 +223,7 @@ def plot_figure_34(
     show_grade_a   : if False, suppress the n·ε Grade-A slope line.
     """
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 4))
 
     df_native = df[df["algo"] == "DGEMM"].sort_values("N")
     df_adp    = df[df["algo"] == "ADP-dynamic"].sort_values("N")
@@ -260,6 +259,8 @@ def plot_figure_34(
     _MARKERS = ["o", "s", "^", "D", "v"]
     _LSTYLES = ["-", "--", "-.", ":"]
     for idx, (s, algo) in enumerate(algos_with_s):
+        if s == 6:
+            continue
         sub   = df_emul[df_emul["algo"] == algo].sort_values("N")
         bits  = CRT_BITS_MAP.get(s, float(s) * 7.8)
         color = _MODULI_COLORS.get(s, "gray")
@@ -272,8 +273,8 @@ def plot_figure_34(
             color=color, label=label,
         )
 
-    # ── Reference lines — constants set to sit just above native DGEMM data ──
-    N_ref = np.array([64.0, 16384.0])
+    # ── Reference lines — span the full visible x-axis range ──────────────
+    N_ref = np.array([90.0, 40000.0])
 
     if not df_native.empty:
         nat_N   = df_native["N"].values.astype(float)
@@ -304,29 +305,25 @@ def plot_figure_34(
     )
 
     # ── Formatting ────────────────────────────────────────────────────────────
-    ax.set_xlabel("Matrix size  N", fontsize=12)
+    ax.set_xlabel(r"Matrix size  $m = n = k$", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(
-        f"Figure {fig_num} — {title_suffix} Componentwise Relative Error\n"
-        "(arXiv:2511.13778, Section 6 Aspect A2)",
-        fontsize=11,
-    )
     ax.legend(fontsize=8, loc="upper left", ncol=2)
     ax.grid(True, which="both", alpha=0.3, linestyle=":")
 
-    # x-axis: from just below 128 to just above 16K
-    ax.set_xlim(90, 22000)
+    # x-axis: from just below 128 to just above 32K
+    ax.set_xlim(90, 40000)
     n_vals = sorted(df["N"].unique())
     ax.set_xticks(n_vals)
     ax.set_xticklabels([str(n) for n in n_vals])
     ax.xaxis.set_minor_locator(mticker.NullLocator())
     ax.yaxis.set_major_formatter(mticker.LogFormatterSciNotation())
 
-    out_path = os.path.join(out_dir, f"figure{fig_num}.png")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    for ext in ("png", "pdf"):
+        out_path = os.path.join(out_dir, f"figure{fig_num}.{ext}")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"Saved {out_path}")
     plt.close(fig)
-    print(f"Saved {out_path}")
 
 
 def plot_figures34(df: pd.DataFrame, out_dir: str) -> None:
@@ -334,9 +331,15 @@ def plot_figures34(df: pd.DataFrame, out_dir: str) -> None:
         df,
         fig_num      = 3,
         err_col      = "err_max",
-        ylabel       = "Max componentwise relative error",
+        ylabel       = r"$\max_{i,j}\,|\mathrm{fl}(AB)_{ij} - (AB)_{ij}|\,/\,|(AB)_{ij}|$",
         title_suffix = "Maximum",
         out_dir      = out_dir,
+        extra_ref_lines=[
+            ("O(√n) slope",
+             lambda N_ref, nat_N, nat_err:
+                 np.max(nat_err / np.sqrt(nat_N)) * 1.5 * np.sqrt(N_ref),
+             "darkorange", "-.", 1.2),
+        ],
     )
     plot_figure_34(
         df,

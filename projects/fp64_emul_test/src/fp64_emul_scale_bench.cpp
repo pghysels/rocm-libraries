@@ -74,6 +74,7 @@ static void fill_rand(double* d, size_t n, hipStream_t stream)
     const unsigned grd = (n + blk - 1) / blk;
     hipLaunchKernelGGL(fill_rand_kernel, dim3(grd), dim3(blk), 0, stream,
                        d, n, 42u);
+    HIP_CHECK(hipGetLastError());
 }
 
 /* =========================================================================

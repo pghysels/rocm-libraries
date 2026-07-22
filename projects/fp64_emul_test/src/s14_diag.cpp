@@ -237,12 +237,15 @@ int main()
         /* fill matrices */
         unsigned blk=256u;
         hipLaunchKernelGGL(fill_uniform,dim3((N2+blk-1)/blk),dim3(blk),0,stream,N2,d_A,SEED_A);
+        HIP_CHECK(hipGetLastError());
         hipLaunchKernelGGL(fill_uniform,dim3((N2+blk-1)/blk),dim3(blk),0,stream,N2,d_B,SEED_B);
+        HIP_CHECK(hipGetLastError());
 
         /* DD-GEMM reference */
         dim3 dd_blk(DD_TILE,DD_TILE);
         dim3 dd_grd((N+DD_TILE-1)/DD_TILE,(N+DD_TILE-1)/DD_TILE);
         hipLaunchKernelGGL(dd_gemm_kernel,dd_grd,dd_blk,0,stream,(size_t)N,d_A,d_B,d_dd);
+        HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
 
         /* Emulated GEMM runner */
@@ -299,10 +302,13 @@ int main()
         HIP_CHECK(hipMalloc(&d_dd, N2*sizeof(double2)));
         unsigned blk=256u;
         hipLaunchKernelGGL(fill_uniform,dim3((N2+blk-1)/blk),dim3(blk),0,stream,N2,d_A,SEED_A);
+        HIP_CHECK(hipGetLastError());
         hipLaunchKernelGGL(fill_uniform,dim3((N2+blk-1)/blk),dim3(blk),0,stream,N2,d_B,SEED_B);
+        HIP_CHECK(hipGetLastError());
         dim3 dd_blk(DD_TILE,DD_TILE);
         dim3 dd_grd((N+DD_TILE-1)/DD_TILE,(N+DD_TILE-1)/DD_TILE);
         hipLaunchKernelGGL(dd_gemm_kernel,dd_grd,dd_blk,0,stream,(size_t)N,d_A,d_B,d_dd);
+        HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
 
         Runner emul;
@@ -442,14 +448,17 @@ int main()
         unsigned blk = 256u;
         hipLaunchKernelGGL(fill_uniform, dim3((N2+blk-1)/blk), dim3(blk), 0, stream,
                            N2, d_A, SEED_A);
+        HIP_CHECK(hipGetLastError());
         hipLaunchKernelGGL(fill_uniform, dim3((N2+blk-1)/blk), dim3(blk), 0, stream,
                            N2, d_B, SEED_B);
+        HIP_CHECK(hipGetLastError());
 
         /* DD-GEMM reference */
         dim3 dd_blk(DD_TILE,DD_TILE);
         dim3 dd_grd((N+DD_TILE-1)/DD_TILE, (N+DD_TILE-1)/DD_TILE);
         hipLaunchKernelGGL(dd_gemm_kernel, dd_grd, dd_blk, 0, stream,
                            (size_t)N, d_A, d_B, d_dd_ref);
+        HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(stream));
 
         /* Run emulation with pre-allocated workspace */
