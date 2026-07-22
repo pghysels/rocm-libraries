@@ -1144,7 +1144,7 @@ static constexpr int OZ2_PRELIM_TILE_M = 4;   /* rows/cols per tile (= blockDim.
  * Replaces the quarter-rate transcendental log2() + floor() sequence (~50-100
  * cycles on CDNA) with 2-3 full-rate integer instructions (~4-5 cycles).
  * Precondition: x > 0 and x is a normalized FP64 (guaranteed by the
- * < 1e-300 guard that replaces zero/subnormal inputs with 1.0 before calling). */
+ * < DBL_MIN guard that replaces zero/subnormal row/col maxima with DBL_MIN). */
 static __device__ __forceinline__ int oz2_floor_log2_d(double x)
 {
     unsigned long long bits;
@@ -1181,7 +1181,7 @@ oz2_accu_prelim_kernel(const double* __restrict__ A,
     local_max = warp_reduce_max_abs_d(local_max);
     local_max = block_reduce_max_d(local_max, s_wmax);
     if(threadIdx.x == 0) {
-        if(local_max < 1e-300) local_max = 1.0;
+        if(local_max < std::numeric_limits<double>::min()) local_max = std::numeric_limits<double>::min();
         s_sft[0] = static_cast<int16_t>(6 - oz2_floor_log2_d(local_max));
         sftA[row] = s_sft[0];
     }
@@ -1233,7 +1233,7 @@ oz2_accu_prelim_A_N_kernel(const double* __restrict__ A,
         double row_max = 0.0;
         for(int kl = 0; kl < TILE_K; ++kl)
             if(shmem[kl][m_local] > row_max) row_max = shmem[kl][m_local];
-        if(row_max < 1e-300) row_max = 1.0;
+        if(row_max < std::numeric_limits<double>::min()) row_max = std::numeric_limits<double>::min();
         s_sft[m_local] = static_cast<int16_t>(6 - oz2_floor_log2_d(row_max));
         if(i < m) sftA[i] = s_sft[m_local];
     }
@@ -1283,7 +1283,7 @@ oz2_accu_prelim_B_N_kernel(const double* __restrict__ B,
     local_max = warp_reduce_max_abs_d(local_max);
     local_max = block_reduce_max_d(local_max, s_wmax);
     if(threadIdx.x == 0) {
-        if(local_max < 1e-300) local_max = 1.0;
+        if(local_max < std::numeric_limits<double>::min()) local_max = std::numeric_limits<double>::min();
         s_sft[0] = static_cast<int16_t>(6 - oz2_floor_log2_d(local_max));
         sftB[col] = s_sft[0];
     }
@@ -1420,7 +1420,7 @@ oz2_accu_prelim_B_T_kernel(const double* __restrict__ B,
         double col_max = 0.0;
         for(int kl = 0; kl < TILE_K; ++kl)
             if(shmem[kl][l_local] > col_max) col_max = shmem[kl][l_local];
-        if(col_max < 1e-300) col_max = 1.0;
+        if(col_max < std::numeric_limits<double>::min()) col_max = std::numeric_limits<double>::min();
         s_sft[l_local] = static_cast<int16_t>(6 - oz2_floor_log2_d(col_max));
         if(col < n) sftB[col] = s_sft[l_local];
     }
