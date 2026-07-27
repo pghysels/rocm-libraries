@@ -1374,17 +1374,6 @@ static constexpr unsigned OZ2_SCALE_TILE_M = 4;
 
 template <unsigned T_COUNT, bool TRANS_A, bool TRANS_B>
 __global__ static void
-<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation.cpp
-oz2_scaleAB_kernel(const double* __restrict__ A,
-                   int64_t m, int64_t lda,
-                   int8_t*  __restrict__       A8i, size_t lda8i, size_t cola8i,
-                   const int16_t* __restrict__ sftA,
-                   const double* __restrict__ B,
-                   int64_t n, int64_t ldb,
-                   int8_t*  __restrict__       B8i, size_t ldb8i,
-                   const int16_t* __restrict__ sftB,
-                   int64_t k, unsigned t_start, unsigned m_y_blocks)
-=======
 oz2_scale_A_T_kernel(const double* __restrict__ A,
                      int64_t m, int64_t lda,
                      int8_t* __restrict__ A8i, size_t lda8i, size_t cola8i,
@@ -1450,7 +1439,6 @@ oz2_scale_A_N_kernel(const double* __restrict__ A,
                      int8_t* __restrict__ A8i, size_t lda8i, size_t cola8i,
                      const int16_t* __restrict__ sftA,
                      int64_t k, unsigned t_start)
->>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/fp64_emulation.cpp
 {
     static constexpr int TILE_K = static_cast<int>(OZ2_SCALE_TILE_K);
     static constexpr int TILE_M = static_cast<int>(OZ2_SCALE_TILE_M);
@@ -1466,28 +1454,6 @@ oz2_scale_A_N_kernel(const double* __restrict__ A,
         /* ── A block ─────────────────────────────────────────────────────── */
         const int64_t m_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
 
-<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation.cpp
-        if constexpr (TRANS_A) {
-            /* Coalesced: A stored k×m, A[i,j] = A[j + i*lda].
-             * j = t%TILE_K varies fast within warp → stride-1 reads.       */
-            const int64_t j = static_cast<int64_t>(blockIdx.x) * TILE_K + (t % TILE_K);
-            const int64_t i = m_base + (t / TILE_K);
-            if(i >= m || j >= k) return;
-            const double val  = A[i * lda + j];                         /* COALESCED */
-            const double ival = trunc(ldexp(val, static_cast<int>(sftA[i])));
-            const size_t stride = lda8i * cola8i;
-            const size_t offset = static_cast<size_t>(j) + static_cast<size_t>(i) * lda8i;
-            #pragma unroll
-            for(unsigned t_local = 0; t_local < T_COUNT; ++t_local) {
-                const unsigned tidx = t_start + t_local;
-                const double  r  = fma(cNegMod[tidx], rint(ival * cInvMod[tidx]), ival);
-                const float   rf = static_cast<float>(r);
-                const float  rf2 = fmaf(rintf(rf * cInvModF[tidx]),
-                                        static_cast<float>(cNegMod[tidx]), rf);
-                __builtin_nontemporal_store(static_cast<int8_t>(static_cast<int32_t>(rf2)),
-                                            A8i + t_local * stride + offset);
-            }
-=======
     const int k_write = t % TILE_K;
     const int m_write = t / TILE_K;
     const int64_t j_out = static_cast<int64_t>(blockIdx.x) * TILE_K + k_write;
@@ -1561,7 +1527,6 @@ oz2_scale_B_N_kernel(const double* __restrict__ B,
                                   | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
             __builtin_nontemporal_store(packed,
                 reinterpret_cast<uint16_t*>(B8i + t_local * stride + off0));
->>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/fp64_emulation.cpp
         } else {
             /* Non-coalesced load: A stored m×k, A[i,j] = A[i + j*lda].
              * Use SHMEM transposition for coalesced reads AND writes.       */
@@ -1634,29 +1599,6 @@ oz2_scale_B_N_kernel(const double* __restrict__ B,
             if(k_local == 0 && col < n) s_sft[l_local] = sftB[col];
             __syncthreads();
 
-<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation.cpp
-            /* Write: k_write varies fast → COALESCED writes */
-            const int k_write = t % TILE_K;
-            const int l_write = t / TILE_K;
-            const int64_t j_out   = static_cast<int64_t>(blockIdx.x) * TILE_K + k_write;
-            const int64_t col_out = n_base + l_write;
-            if(col_out < n && j_out < k) {
-                const double val  = shmem[k_write][l_write];
-                const double ival = trunc(ldexp(val, static_cast<int>(s_sft[l_write])));
-                const size_t stride = ldb8i * static_cast<size_t>(n);
-                const size_t offset = static_cast<size_t>(j_out) + static_cast<size_t>(col_out) * ldb8i;
-                #pragma unroll
-                for(unsigned t_local = 0; t_local < T_COUNT; ++t_local) {
-                    const unsigned tidx = t_start + t_local;
-                    const double  r  = fma(cNegMod[tidx], rint(ival * cInvMod[tidx]), ival);
-                    const float   rf = static_cast<float>(r);
-                    const float  rf2 = fmaf(rintf(rf * cInvModF[tidx]),
-                                            static_cast<float>(cNegMod[tidx]), rf);
-                    __builtin_nontemporal_store(static_cast<int8_t>(static_cast<int32_t>(rf2)),
-                                                B8i + t_local * stride + offset);
-                }
-            }
-=======
     shmem[k_local][l_local] = (col < n && j < k) ? B[col + j * ldb] : 0.0; /* COALESCED */
     if(k_local == 0 && col < n) s_sft[l_local] = sftB[col];
     __syncthreads();
@@ -1678,7 +1620,6 @@ oz2_scale_B_N_kernel(const double* __restrict__ B,
             const float  rf2 = fmaf(rintf(rf * oz2_inv_mod_f(tidx)), static_cast<float>(oz2_neg_mod(tidx)), rf);
             __builtin_nontemporal_store(static_cast<int8_t>(static_cast<int32_t>(rf2)),
                                         B8i + t_local * stride + offset);
->>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/fp64_emulation.cpp
         }
     }
 }
@@ -1852,7 +1793,80 @@ static const char* oz2_profile_file()
 }
 
 /* =========================================================================
- * fp64EmulatedGemm
+ * oz2_native_dgemm_fallback — run a plain FP64 hipblasLtMatmul for a
+ * sub-block.  Used by the split path in fp64EmulatedGemmImpl when the
+ * second half's emulation fails after the first half has already written D,
+ * so that D is fully correct without corrupting the first half's output.
+ *
+ * A fresh hipblasLtHandle is created with emulation explicitly disabled
+ * (emulation.enabled=0) so that HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 in
+ * the environment does not cause this call to re-enter emulation recursively.
+ * The default enabled=-1 means "check env var", which would re-trigger it.
+ * ========================================================================= */
+static rocblaslt_status
+oz2_native_dgemm_fallback(const _rocblaslt_handle* h,
+                           hipblasOperation_t opA, hipblasOperation_t opB,
+                           int64_t m, int64_t n, int64_t k,
+                           const double* alpha, const double* A, int64_t lda,
+                           const double* B,     int64_t ldb,
+                           const double* beta,  const double* C, int64_t ldc,
+                           double* D, int64_t ldd,
+                           hipStream_t stream)
+{
+    hipblasLtHandle_t       fp64_handle = nullptr;
+    hipblasLtMatrixLayout_t layoutA     = nullptr;
+    hipblasLtMatrixLayout_t layoutB     = nullptr;
+    hipblasLtMatrixLayout_t layoutC     = nullptr;
+    hipblasLtMatrixLayout_t layoutD     = nullptr;
+    hipblasLtMatmulDesc_t   desc        = nullptr;
+
+    auto cleanup = [&]() noexcept {
+        if(desc)        (void)hipblasLtMatmulDescDestroy(desc);
+        if(layoutD)     (void)hipblasLtMatrixLayoutDestroy(layoutD);
+        if(layoutC)     (void)hipblasLtMatrixLayoutDestroy(layoutC);
+        if(layoutB)     (void)hipblasLtMatrixLayoutDestroy(layoutB);
+        if(layoutA)     (void)hipblasLtMatrixLayoutDestroy(layoutA);
+        if(fp64_handle) (void)hipblasLtDestroy(fp64_handle);
+    };
+
+    if(hipblasLtCreate(&fp64_handle) != HIPBLAS_STATUS_SUCCESS)
+        return rocblaslt_status_internal_error;
+
+    /* Explicitly disable emulation on this fresh handle.  The default
+     * enabled=-1 means "check env var"; 0 means "force off" regardless of
+     * HIPBLASLT_EMULATE_DOUBLE_PRECISION, preventing recursive re-entry. */
+    reinterpret_cast<_rocblaslt_handle*>(fp64_handle)->emulation.enabled = 0;
+
+    /* Physical (stored) matrix dimensions for column-major layout:
+     *   opA=N → A is m×k; opA=T → A is k×m (transposed in matmulDesc).
+     *   opB=N → B is k×n; opB=T → B is n×k.                             */
+    const uint64_t rows_A = (opA == HIPBLAS_OP_N) ? static_cast<uint64_t>(m) : static_cast<uint64_t>(k);
+    const uint64_t cols_A = (opA == HIPBLAS_OP_N) ? static_cast<uint64_t>(k) : static_cast<uint64_t>(m);
+    const uint64_t rows_B = (opB == HIPBLAS_OP_N) ? static_cast<uint64_t>(k) : static_cast<uint64_t>(n);
+    const uint64_t cols_B = (opB == HIPBLAS_OP_N) ? static_cast<uint64_t>(n) : static_cast<uint64_t>(k);
+
+    hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_64F, rows_A, cols_A, lda);
+    hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_64F, rows_B, cols_B, ldb);
+    hipblasLtMatrixLayoutCreate(&layoutC, HIP_R_64F, static_cast<uint64_t>(m), static_cast<uint64_t>(n), ldc);
+    hipblasLtMatrixLayoutCreate(&layoutD, HIP_R_64F, static_cast<uint64_t>(m), static_cast<uint64_t>(n), ldd);
+    hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F);
+    hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
+    hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
+
+    const hipblasStatus_t st =
+        hipblasLtMatmul(fp64_handle, desc,
+                        alpha, A, layoutA,
+                        B,        layoutB,
+                        beta,  C, layoutC,
+                        D,        layoutD,
+                        nullptr, nullptr, 0, stream);
+    cleanup();
+    return (st == HIPBLAS_STATUS_SUCCESS) ? rocblaslt_status_success
+                                          : rocblaslt_status_internal_error;
+}
+
+/* =========================================================================
+ * fp64EmulatedGemm — profiling accumulator + implementation
  * ========================================================================= */
 
 /* Aggregates per-component GPU times across all leaf sub-GEMMs and counts
@@ -1901,14 +1915,6 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
         return rocblaslt_status_invalid_value;
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
-<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation.cpp
-    if(settings.dynamic_mode)
-        fp64EmulationWarnDynamicTemporary();
-    if(oz2_init_constants(num_moduli) != hipSuccess)
-        return rocblaslt_status_internal_error;
-
-=======
->>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/fp64_emulation.cpp
     {
         const unsigned chunk_sz = oz2_compute_chunk_size(m, n, k, num_moduli);
         const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
@@ -1936,17 +1942,34 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
                     if(st != rocblaslt_status_success) return st;
                 }
 
-                /* Second half: rows half_m..m-1 or cols half_n..n-1. */
-                if(split_m)
-                    return fp64EmulatedGemmImpl(h, opA, opB, m - m / 2, n, k, alpha,
-                                                tA ? A + half_m * lda : A + half_m, lda,
-                                                B, ldb, beta, C + half_m, ldc, D + half_m, ldd,
-                                                stream, settings, prof);
-                else
-                    return fp64EmulatedGemmImpl(h, opA, opB, m, n - n / 2, k, alpha,
-                                                A, lda, tB ? B + half_n : B + half_n * ldb, ldb,
-                                                beta, C + half_n * ldc, ldc, D + half_n * ldd, ldd,
-                                                stream, settings, prof);
+                /* Second half: rows half_m..m-1 or cols half_n..n-1.
+                 * CORRECTNESS NOTE: the first half has already written D[0..half_m-1]
+                 * (or the first half_n columns of D) with emulation output.  If we
+                 * propagate a second-half failure to the caller, it would run whole-matrix
+                 * native DGEMM which reads D as C (corrupting beta*C when C==D in-place).
+                 * Instead, on second-half failure recover with a targeted native DGEMM for
+                 * that sub-block only, keeping the full D output correct.             */
+                const double* const A2 = split_m ? (tA ? A + half_m * lda : A + half_m) : A;
+                const double* const B2 = split_m ? B : (tB ? B + half_n : B + half_n * ldb);
+                const double* const C2 = split_m ? C + half_m : C + half_n * ldc;
+                double*       const D2 = split_m ? D + half_m : D + half_n * ldd;
+                const rocblaslt_status st2 =
+                    fp64EmulatedGemmImpl(h, opA, opB, m2, n2, k, alpha,
+                                         A2, lda, B2, ldb, beta, C2, ldc, D2, ldd,
+                                         stream, settings, prof);
+                if(st2 != rocblaslt_status_success) {
+                    /* First half already committed emulation output to D; fall back to
+                     * native DGEMM for the second half only so D remains fully correct. */
+                    std::fprintf(stderr,
+                        "[hipBLASLt FP64 emulation] WARNING: second-half emulation failed "
+                        "(m=%lld, n=%lld, k=%lld, st=%d). "
+                        "Running native DGEMM for second half to preserve first-half output.\n",
+                        (long long)m2, (long long)n2, (long long)k, (int)st2);
+                    return oz2_native_dgemm_fallback(h, opA, opB, m2, n2, k,
+                                                     alpha, A2, lda, B2, ldb,
+                                                     beta, C2, ldc, D2, ldd, stream);
+                }
+                return rocblaslt_status_success;
             }
         }
     }
