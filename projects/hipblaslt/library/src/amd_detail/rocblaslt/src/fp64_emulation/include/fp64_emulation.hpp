@@ -23,7 +23,29 @@
 #include "rocblaslt.h"
 #include <hip/hip_runtime_api.h>
 
+<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/include/fp64_emulation.hpp
 
+=======
+/* =========================================================================
+ * General emulation constants (shared by all translation units)
+ * ========================================================================= */
+
+/* Maximum number of moduli supported (s = 2..OZ2_S_MAX). */
+inline constexpr unsigned OZ2_S_MAX = 18;
+
+/* Alignment for INT8 arrays (128 bytes = 128 INT8 elements). */
+inline constexpr size_t OZ2_ALIGN = 128;
+
+/* Round n up to the nearest multiple of OZ2_ALIGN. */
+inline __host__ __device__ size_t oz2_pad(size_t n)
+{
+    return (n + OZ2_ALIGN - 1) / OZ2_ALIGN * OZ2_ALIGN;
+}
+
+/* =========================================================================
+ * Environment variable parsing infrastructure
+ * ========================================================================= */
+>>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/include/fp64_emulation.hpp
 enum Fp64EmulationEnvState {
     FP64_EMULATION_ENV_UNSET = 0,
     FP64_EMULATION_ENV_VALID = 1,

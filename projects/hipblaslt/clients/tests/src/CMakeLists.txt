@@ -29,7 +29,7 @@ set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/fp64_emulation_gtest.cpp
     TARGET_DIRECTORY hipblaslt-test
     PROPERTIES INCLUDE_DIRECTORIES
-        "${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/include;${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/include"
+        "${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/include;${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/include;${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/fp64_emulation/include"
 )
 
 # NOTE: secure_env_gtest.cpp (ROCM-26729) intentionally includes the header-only

@@ -41,6 +41,8 @@
  */
 
 #include "fp64_emulation.hpp"
+#include "fp64_emulation_fused.hpp"
+#include "fp64_emulation_tables.hpp"
 #include "handle.h"   /* _rocblaslt_handle */
 
 #include "hipblaslt/hipblaslt.h"
@@ -65,27 +67,12 @@
 /* =========================================================================
  * Tuning constants
  * ========================================================================= */
-/* Maximum number of moduli supported (s = 2..OZ2_S_MAX).
- * Capped at 18 (log2(M) ≈ 140 bits, far more than needed for any practical
- * FP64 input).  This keeps the symmetric modular reduction to 2 FP32
- * refinement passes for both A and B, matching the GEMMul8 reference
- * implementation, and eliminates the runtime-fallback scale kernel.          */
-static constexpr unsigned OZ2_S_MAX = 18;
-
-/* Alignment for INT8 arrays (128 bytes = 128 INT8 elements) */
-static constexpr size_t OZ2_ALIGN = 128;
-
 /* Workspace reserved for the INT8 GEMM algorithms (preliminary and batch).
  * Passing a non-null workspace allows hipBLASLt to select algorithms that
  * require workspace, which is necessary for very large k values where no
  * zero-workspace INT8 GEMM algorithm is available.
  * 128 MiB matches the default value of HIPBLASLT_TUNING_USER_MAX_WORKSPACE. */
 static constexpr size_t OZ2_INT8_GEMM_WS_BYTES = 128ull << 20;  /* 128 MiB */
-
-static __host__ __device__ size_t oz2_pad(size_t n)
-{
-    return (n + OZ2_ALIGN - 1) / OZ2_ALIGN * OZ2_ALIGN;
-}
 
 /* Total workspace budget per modulus (A8i + B8i + C32i simultaneously resident).
  * chunk × (mn4 + slc) ≤ OZ2_CHUNK_TARGET_BYTES constrains the combined allocation. */
@@ -109,17 +96,21 @@ static unsigned oz2_compute_chunk_size(int64_t m, int64_t n, int64_t k, unsigned
     return static_cast<unsigned>(std::max(size_t(1u), chunk));
 }
 
-/* =========================================================================
- * GPU-side constant memory
- * ========================================================================= */
-static __constant__ double cNegMod[OZ2_S_MAX];
-static __constant__ double cInvMod[OZ2_S_MAX];
-static __constant__ float  cInvModF[OZ2_S_MAX];
-static __constant__ double cQpiHi[OZ2_S_MAX];
-static __constant__ double cQpiLo[OZ2_S_MAX];
-static __constant__ double cP_hi;
-static __constant__ double cP_lo;
-static __constant__ double cInvP;
+/* Fused-kernel variant: the fused kernel accumulates INT32 products in GPU
+ * registers (no C32i workspace required).  Only A8i + B8i per modulus need
+ * to fit in the budget, so the INT32 output term (mn4) is excluded.
+ * A larger chunk (up to s) is achievable, potentially fitting all S moduli
+ * in a single scale pass and eliminating the need for binary M/N halving.  */
+static unsigned oz2_compute_chunk_size_fused(int64_t m, int64_t n, int64_t k, unsigned s)
+{
+    const size_t lda8i  = oz2_pad(static_cast<size_t>(k));
+    const size_t cola8i = oz2_pad(static_cast<size_t>(m));
+    const size_t slc    = lda8i * cola8i + lda8i * static_cast<size_t>(n);  /* A8i + B8i per modulus */
+    size_t chunk = s;
+    if(slc > 0u)
+        chunk = std::min(chunk, OZ2_CHUNK_TARGET_BYTES / slc);
+    return static_cast<unsigned>(std::max(size_t(1u), chunk));
+}
 
 /* =========================================================================
  * Host-side tables (source: GEMMul8/GEMMul8/src/table.hpp)
@@ -130,110 +121,6 @@ static __constant__ double cInvP;
  *
  * All arrays indexed by table_idx = s - 2  (s = number of moduli, 2..18).
  * ========================================================================= */
-static const double h_neg_mod[OZ2_S_MAX] = {
-    -256.0, -255.0, -253.0, -251.0, -247.0, -241.0, -239.0,
-    -233.0, -229.0, -227.0, -223.0, -217.0, -211.0, -199.0,
-    -197.0, -193.0, -191.0, -181.0
-};
-static const double h_inv_mod[OZ2_S_MAX] = {
-    0x1.0000000000000p-8,   /* 1/256 */
-    0x1.0101010101010p-8,   /* 1/255 */
-    0x1.03091b51f5e1ap-8,   /* 1/253 */
-    0x1.05197f7d73404p-8,   /* 1/251 */
-    0x1.0953f39010954p-8,   /* 1/247 */
-    0x1.0fef010fef011p-8,   /* 1/241 */
-    0x1.12358e75d3033p-8,   /* 1/239 */
-    0x1.19453808ca29cp-8,   /* 1/233 */
-    0x1.1e2ef3b3fb874p-8,   /* 1/229 */
-    0x1.20b470c67c0d9p-8,   /* 1/227 */
-    0x1.25e22708092f1p-8,   /* 1/223 */
-    0x1.2e025c04b8097p-8,   /* 1/217 */
-    0x1.3698df3de0748p-8,   /* 1/211 */
-    0x1.49539e3b2d067p-8,   /* 1/199 */
-    0x1.4cab88725af6ep-8,   /* 1/197 */
-    0x1.5390948f40febp-8,   /* 1/193 */
-    0x1.571ed3c506b3ap-8,   /* 1/191 */
-    0x1.6a13cd1537290p-8    /* 1/181 */
-};
-static const float h_inv_mod_f[OZ2_S_MAX] = {
-    0x1.000000p-8F,   /* 1/256  (exact) */
-    0x1.010102p-8F,   /* 1/255  */
-    0x1.03091cp-8F,   /* 1/253  */
-    0x1.051980p-8F,   /* 1/251  */
-    0x1.0953f4p-8F,   /* 1/247  */
-    0x1.0fef02p-8F,   /* 1/241  */
-    0x1.12358ep-8F,   /* 1/239  */
-    0x1.194538p-8F,   /* 1/233  */
-    0x1.1e2ef4p-8F,   /* 1/229  */
-    0x1.20b470p-8F,   /* 1/227  */
-    0x1.25e228p-8F,   /* 1/223  */
-    0x1.2e025cp-8F,   /* 1/217  */
-    0x1.3698e0p-8F,   /* 1/211  */
-    0x1.49539ep-8F,   /* 1/199  */
-    0x1.4cab88p-8F,   /* 1/197  */
-    0x1.539094p-8F,   /* 1/193  */
-    0x1.571ed4p-8F,   /* 1/191  */
-    0x1.6a13cep-8F    /* 1/181  */
-};
-
-/* -M (high part) for s = 2..18 */
-static const double h_P_hi_all[OZ2_S_MAX - 1] = {
-    -6.5280000000000000e+04,     /* s=2  */
-    -1.6515840000000000e+07,     /* s=3  */
-    -4.1454758400000000e+09,     /* s=4  */
-    -1.0239325324800000e+12,     /* s=5  */
-    -2.4676774032768000e+14,     /* s=6  */
-    -5.8977489938315520e+16,     /* s=7  */
-    -1.3741755155627516e+19,     /* s=8  */
-    -3.1468619306387012e+21,     /* s=9  */
-    -7.1433765825498518e+23,     /* s=10 */
-    -1.5929729779086169e+26,     /* s=11 */
-    -3.4567513620616985e+28,     /* s=12 */
-    -7.2937453739501847e+30,     /* s=13 */
-    -1.4514553294160867e+33,     /* s=14 */
-    -2.8593669989496909e+35,     /* s=15 */
-    -5.5185783079729035e+37,     /* s=16 */
-    -1.0540484568228245e+40,     /* s=17 */
-    -1.9078277068493124e+42,     /* s=18 */
-};
-static const double h_P_lo_all[OZ2_S_MAX - 1] = {
-     0.0,                        /* s=2  */
-     0.0,                        /* s=3  */
-     0.0,                        /* s=4  */
-     0.0,                        /* s=5  */
-     0.0,                        /* s=6  */
-     0.0,                        /* s=7  */
-    -2.5600000000000000e+02,     /* s=8  */
-     3.1488000000000000e+04,     /* s=9  */
-     4.5263360000000000e+06,     /* s=10 */
-    -2.6145057280000000e+09,     /* s=11 */
-    -2.0448164928000000e+12,     /* s=12 */
-     3.3380381295129600e+14,     /* s=13 */
-     1.0131963435176704e+16,     /* s=14 */
-     1.7272206732770533e+19,     /* s=15 */
-     3.2597489231298749e+21,     /* s=16 */
-    -2.5574812149594794e+23,     /* s=17 */
-     4.6796878119559867e+25,     /* s=18 */
-};
-static const double h_inv_P_all[OZ2_S_MAX - 1] = {
-    1.5318627450980392e-05,      /* s=2  */
-    6.0547934588855299e-08,      /* s=3  */
-    2.4122683103129606e-10,      /* s=4  */
-    9.7662684628055072e-13,      /* s=5  */
-    4.0523935530313311e-15,      /* s=6  */
-    1.6955621560800549e-17,      /* s=7  */
-    7.2770907986268441e-20,      /* s=8  */
-    3.1777689076973120e-22,      /* s=9  */
-    1.3998981972234855e-24,      /* s=10 */
-    6.2775703911367061e-27,      /* s=11 */
-    2.8928895811689891e-29,      /* s=12 */
-    1.3710377161938337e-31,      /* s=13 */
-    6.8896367647931339e-34,      /* s=14 */
-    3.4972775455802713e-36,      /* s=15 */
-    1.8120609044457363e-38,      /* s=16 */
-    9.4872298662080431e-41,      /* s=17 */
-    5.2415634619933945e-43,      /* s=18 */
-};
 /* log2P values for the shift-refinement formula:
  *   sft_delta = floor(-0.5 * log2(amax) + log2P)
  *
@@ -272,207 +159,6 @@ static const float h_accu_log2P_all[OZ2_S_MAX - 1] = {
     6.49765319e+01F,   /* s=17 — fast */
     6.87264480e+01F,   /* s=18 — fast */
 };
-
-static const double h_qpi_hi_all[OZ2_S_MAX - 1][OZ2_S_MAX] = {
-    /* s=2  (qPi_1[0]) */
-    {0x1.fc02000000000p+15, 0x1.0000000000000p+8,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=3  (qPi_1[1]) */
-    {0x1.50ac020000000p+23, 0x1.f60c000000000p+22, 0x1.a45a000000000p+23,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=4  (qPi_1[2]) */
-    {0x1.0688601000000p+28, 0x1.f01e000000000p+28, 0x1.4826900000000p+28,
-     0x1.6654440000000p+31,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=5  (qPi_1[3]) */
-    {0x1.99c1435808000p+37, 0x1.d553914600000p+39, 0x1.cf9d0d8400000p+38,
-     0x1.2ff09e4000000p+38, 0x1.dae0172c00000p+39,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=6  (qPi_1[4]) */
-    {0x1.24d0f0aa6c020p+47, 0x1.00ffb685c4000p+47, 0x1.7820600df8000p+45,
-     0x1.b28fb528de000p+47, 0x1.765c060a1c000p+47, 0x1.56b441a210000p+47,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=7  (qPi_1[5]) */
-    {0x1.49071d4742060p+55, 0x1.5fae947039b40p+55, 0x1.42fdb9e1948e0p+55,
-     0x1.187c8ee783700p+55, 0x1.e89ef222a1c00p+52, 0x1.0316493fe27a0p+55,
-     0x1.1f8e561d65780p+53,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=8  (qPi_2[0]) */
-    {0x1.4f3952ae32400p+63, 0x1.f094cf17cf000p+61, 0x1.0f5bef8d36400p+63,
-     0x1.e02e9274c5000p+62, 0x1.a403bd5c1a000p+61, 0x1.a1cf7b99c2800p+62,
-     0x1.a54e8a8f42000p+60, 0x1.787fdcb9fa000p+62,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=9  (qPi_2[1]) */
-    {0x1.9a7c80fe96000p+69, 0x1.43ca2f89db000p+71, 0x1.40f4871424000p+70,
-     0x1.2c6790ef15000p+71, 0x1.24d66e4d76000p+70, 0x1.459c5b1ee5800p+71,
-     0x1.d43c2b2519000p+70, 0x1.ab93da2aca000p+70, 0x1.dfbe1fda93000p+70,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=10 (qPi_2[2]) */
-    {0x1.1ba01a9548000p+75, 0x1.b499060d20000p+76, 0x1.8d00367a82000p+77,
-     0x1.348f721e1e000p+77, 0x1.09c9ed1acf000p+79, 0x1.6988bc8c28000p+75,
-     0x1.4e2df779b8000p+77, 0x1.54302cc6b7000p+78, 0x1.675767107c000p+76,
-     0x1.1fdfa04826000p+77,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=11 (qPi_2[3]) */
-    {0x1.ae4dbe76d7000p+86, 0x1.258185fdee000p+86, 0x1.76fdabbf54000p+85,
-     0x1.73ade1f823000p+86, 0x1.0cdeb7fb80000p+85, 0x1.0671178918000p+87,
-     0x1.c416fd0741000p+86, 0x1.5350d862f8000p+86, 0x1.52567e0ff5000p+86,
-     0x1.d0611c1cae000p+85, 0x1.814201f9be000p+86,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=12 (qPi_2[4]) */
-    {0x1.42dd4f0c25000p+94, 0x1.71af2232d1000p+94, 0x1.b5f1f25063000p+93,
-     0x1.0e8e8784ac000p+93, 0x1.0477c23ba5000p+93, 0x1.ac3c7c8760800p+94,
-     0x1.507ba57edc000p+92, 0x1.2b20ca473f000p+93, 0x1.5f2d33fd22000p+92,
-     0x1.ab17cae65c800p+94, 0x1.408e48b610000p+90, 0x1.32c582e2cf000p+94,
-     0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=13 (qPi_2[5]) */
-    {0x1.187ecea5a8800p+102, 0x1.71af223280000p+94,  0x1.5a685a078a000p+102,
-     0x1.48a0e93cba000p+102, 0x1.6d422253da000p+102, 0x1.ec015f50a0000p+101,
-     0x1.27d31b1920000p+99,  0x1.7b4d942fe0000p+100, 0x1.68332a1fe8000p+101,
-     0x1.7859de7afc000p+99,  0x1.317d98db46800p+102, 0x1.08b9be1306800p+102,
-     0x1.411e88bd34000p+100, 0.0,0.0,0.0,0.0,0.0},
-    /* s=14 (qPi_2[6]) */
-    {0x1.4af9bb23b8000p+107, 0x1.e0730f7df3000p+109, 0x1.9e197740a0000p+109,
-     0x1.11b44daf38000p+106, 0x1.959dba1ed5000p+109, 0x1.d3f9c70059000p+109,
-     0x1.c71fc39610000p+108, 0x1.6e1a9ef495000p+109, 0x1.067fc962e0800p+110,
-     0x1.81de6aed04000p+109, 0x1.086d6ad9bc800p+110, 0x1.66ccfaf43f000p+109,
-     0x1.d2ae54e567000p+109, 0x1.98842ba66f000p+109,
-     0.0,0.0,0.0,0.0},
-    /* s=15 (qPi_2[7]) */
-    {0x1.8334edf0c0800p+117, 0x1.d9618469e1000p+116, 0x1.4c97d49af8800p+117,
-     0x1.3db0f47816800p+117, 0x1.ac11e30d56000p+116, 0x1.d3f9c70000000p+109,
-     0x1.0210da6024000p+117, 0x1.2e86f6e52b000p+116, 0x1.f43197eee2000p+115,
-     0x1.e913152bf0000p+115, 0x1.775c686f24000p+116, 0x1.44d556f611000p+116,
-     0x1.90e2677038000p+115, 0x1.1b5f498bca000p+117, 0x1.9702ab51fa000p+116,
-     0.0,0.0,0.0},
-    /* s=16 (qPi_2[8]) */
-    {0x1.568442b104000p+122, 0x1.23c286bfdb000p+125, 0x1.fffd89ae2f000p+124,
-     0x1.9f80a3facf000p+124, 0x1.6b10abb2b0000p+124, 0x1.b90322c900000p+119,
-     0x1.ff687bb9b9000p+124, 0x1.494950989a000p+125, 0x1.5c176f9414000p+122,
-     0x1.6dca3fa2e7000p+124, 0x1.951e4290e0000p+122, 0x1.a671255128000p+123,
-     0x1.b2745cf9ae000p+124, 0x1.2c6cfd90da000p+123, 0x1.a57e7d4e8e000p+124,
-     0x1.8f40d0ef24000p+124,
-     0.0,0.0},
-    /* s=17 (qPi_2[9]) */
-    {0x1.e01f9407c4000p+129, 0x1.e201959d63000p+131, 0x1.31982160c4000p+132,
-     0x1.7f0fe22eef000p+132, 0x1.00d5bf9f80000p+126, 0x1.8ad801f1a0000p+129,
-     0x1.2a9c662802000p+130, 0x1.d836977997000p+131, 0x1.85903a5f3c000p+132,
-     0x1.a3320451ba800p+132, 0x1.ce462d2242000p+132, 0x1.d67cf11ca9800p+132,
-     0x1.add7c7ba40000p+132, 0x1.57b0afae95000p+131, 0x1.e30840c0e8000p+128,
-     0x1.5aabc9d4bf800p+132, 0x1.82a0ee308b800p+132,
-     0.0},
-    /* s=18 (qPi_2[10]) */
-    {0x1.06cf388320000p+134, 0x1.a1bf2dfdc0000p+136, 0x1.bb35a9d83c000p+137,
-     0x1.b0c7cfa209000p+139, 0x1.4921eae073800p+140, 0x1.172ab95fd6000p+139,
-     0x1.68acfd38e8000p+139, 0x1.f34ce4f4e8000p+138, 0x1.01123dfc72000p+140,
-     0x1.9db3f73893000p+139, 0x1.f6d5907a7e000p+138, 0x1.e7abc6d98b000p+139,
-     0x1.8e92d65018000p+136, 0x1.1d42b11e83800p+140, 0x1.0579b3ad70800p+140,
-     0x1.0cb5cec87c000p+138, 0x1.2009162ca2800p+140, 0x1.3d803cbad1800p+140},
-};
-
-static const double h_qpi_lo_all[OZ2_S_MAX - 1][OZ2_S_MAX] = {
-    /* s=2..7: lo = 0 */
-    {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=8  (qPi_2[0]) */
-    {0x1.16f0100000000p+20, 0x1.89a0000000000p+19, 0x1.8880000000000p+19,
-     0x1.d740000000000p+19, 0x1.0b80000000000p+19, 0x1.2880000000000p+19,
-     0x1.bcf0000000000p+20, 0x1.2d80000000000p+17,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=9  (qPi_2[1]) */
-    {0x1.008cc04000000p+26, 0x1.eca4600000000p+28, 0x1.9a00780000000p+29,
-     0x1.e855180000000p+29, 0x1.e9c7f00000000p+29, 0x1.38caf00000000p+29,
-     0x1.d6d0600000000p+29, 0x1.e459400000000p+27, 0x1.9cd8200000000p+27,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=10 (qPi_2[2]) */
-    {0x1.c6c29fa008000p+37, 0x1.4ddc380000000p+30, 0x1.5e72640800000p+37,
-     0x1.5939d00000000p+34, 0x1.acce161000000p+36, 0x1.d3148d7000000p+37,
-     0x1.1bca621000000p+37, 0x1.be65b8a000000p+35, 0x1.43b8ee6000000p+36,
-     0x1.940b60e000000p+36,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=11 (qPi_2[3]) */
-    {0x1.c311739de0100p+44, 0x1.3f5c901690000p+45, 0x1.de7087e210000p+45,
-     0x1.6bfc28bd30000p+44, 0x1.de9bee2d48000p+45, 0x1.5646b56780000p+45,
-     0x1.5ee3b89260000p+43, 0x1.77449328c0000p+43, 0x1.2e0367d338000p+45,
-     0x1.c1e3b22c60000p+45, 0x1.4dba603168000p+45,
-     0.0,0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=12 (qPi_2[4]) */
-    {0x1.f5cc036fee804p+50, 0x1.9502088c71500p+52, 0x1.f27fe97ac8c00p+52,
-     0x1.6a7fd4fb91000p+50, 0x1.9f4e1d77bb800p+52, 0x1.541aed8de8f00p+52,
-     0x1.cad9eee787600p+51, 0x1.b754bf1ae1c00p+51, 0x1.d1793fc3ce200p+51,
-     0x1.f0f2278772b00p+52, 0x1.59f94c68de600p+52, 0x1.f1f52b3aa8500p+52,
-     0.0,0.0,0.0,0.0,0.0,0.0},
-    /* s=13 (qPi_2[5]) */
-    {0x1.2a800bf67755ap+60, 0x1.459502088c715p+60, 0x1.73141ccb58410p+57,
-     0x1.956a7a15d56e0p+60, 0x1.c5f9191e4aa91p+60, 0x1.c69660c475d7bp+60,
-     0x1.1a2f5dd7b0278p+60, 0x1.f7e2f13271df4p+60, 0x1.008e6afbfbd20p+59,
-     0x1.45eaf7cf70b15p+60, 0x1.b2d9a1321591ap+59, 0x1.2a3c04a60a8a8p+59,
-     0x1.25d2c634e54f0p+57, 0.0,0.0,0.0,0.0,0.0},
-    /* s=14 (qPi_2[6]) */
-    {0x1.ed366131bfd87p+61, 0x1.2a2b688425b37p+67, 0x1.ea31249d190dbp+66,
-     0x1.57f8ce0e05580p+65, 0x1.34d662a4fdd1cp+66, 0x1.5013290076958p+67,
-     0x1.3e7351822d438p+66, 0x1.1ebdf25941f8bp+67, 0x1.89ef93ae85687p+67,
-     0x1.84d8fc60d93d4p+68, 0x1.1340b8f1c34bfp+67, 0x1.590ded2a35e12p+68,
-     0x1.34cf70f07ae33p+67, 0x1.d80e799d28f38p+68,
-     0.0,0.0,0.0,0.0},
-    /* s=15 (qPi_2[7]) */
-    {0x1.a4b62a6fdb1e1p+75, 0x1.c75bd2f612d0fp+75, 0x1.3f90fd4ad5142p+74,
-     0x1.9e3c7f45d92bfp+75, 0x1.c9413fbd969ffp+75, 0x1.6550132900769p+75,
-     0x1.a05bb4379a4c1p+75, 0x1.dae820f5ffc00p+74, 0x1.6405781ac87d9p+75,
-     0x1.175dbeffba9cdp+75, 0x1.fe04b43a93e73p+71, 0x1.67335f8e813b8p+73,
-     0x1.1bfe09769edb0p+75, 0x1.f1ee6037f1f5dp+71, 0x1.0c08e68bbfe9cp+75,
-     0.0,0.0,0.0},
-    /* s=16 (qPi_2[8]) */
-    {0x1.195bce21a4a4cp+82, 0x1.d368142940c54p+83, 0x1.6961d82d67d29p+81,
-     0x1.19861fe645aefp+78, 0x1.4aa2ee5f58c0cp+82, 0x1.42e6d8398ebf0p+83,
-     0x1.09590940ec246p+83, 0x1.4ed69939f54a5p+83, 0x1.bccd986816af6p+83,
-     0x1.38fff5b887f40p+83, 0x1.8c2bed86953acp+81, 0x1.2544a485cce86p+81,
-     0x1.c88c3ec2fb90fp+83, 0x1.a84f9682c93f7p+83, 0x1.0beb05e6abcdfp+81,
-     0x1.aeb1b1661a570p+81,
-     0.0,0.0},
-    /* s=17 (qPi_2[9]) */
-    {0x1.1e87e3b708c22p+90, 0x1.4160efcbeef78p+90, 0x1.4480003b19f81p+89,
-     0x1.0b25d1ed6a121p+87, 0x1.747bf6c0d8b31p+90, 0x1.bcbc193dd346cp+88,
-     0x1.fddf745f1ee5ap+88, 0x1.d1f525311dabfp+90, 0x1.1660b883eb1a4p+90,
-     0x1.41dedd270b797p+88, 0x1.79125e4f2418ap+90, 0x1.0272e6220fc37p+90,
-     0x1.d2e0f92de9773p+87, 0x1.ea083b704edc0p+90, 0x1.eba48f8e2a378p+90,
-     0x1.a977e531befa8p+90, 0x1.2ed72602864a3p+88,
-     0.0},
-    /* s=18 (qPi_2[10]) */
-    {0x1.928222f7c81d9p+98, 0x1.7691a1e475ec2p+97, 0x1.50297632195fep+97,
-     0x1.08e60e4fc6baep+96, 0x1.3586f9a06cbf4p+98, 0x1.7a70fdd8b6610p+98,
-     0x1.5e172302320e2p+98, 0x1.1c4557a753b6cp+98, 0x1.4622df275a365p+95,
-     0x1.cf7c96f698830p+95, 0x1.ebd8e9c0e37a5p+97, 0x1.f1a79e989b457p+97,
-     0x1.1c8ffe978c39ep+98, 0x1.c0c39f95f19abp+92, 0x1.f55e10b41e4a2p+97,
-     0x1.a546c43a54205p+98, 0x1.c22d132ce1471p+97, 0x1.6f3d636bc541bp+95},
-};
-
-/* =========================================================================
- * One-time constant-memory initialisation
- * ========================================================================= */
-static hipError_t oz2_init_constants(unsigned num_moduli)
-{
-    static unsigned done_for = 0u;
-    if(done_for == num_moduli) return hipSuccess;
-    const unsigned idx = num_moduli - 2;
-#define OZ2_CHECK(expr) do { hipError_t _e=(expr); if(_e!=hipSuccess){done_for=0u;return _e;} } while(0)
-    OZ2_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(cNegMod),  h_neg_mod,   sizeof(h_neg_mod)));
-    OZ2_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(cInvMod),  h_inv_mod,   sizeof(h_inv_mod)));
-    OZ2_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(cInvModF), h_inv_mod_f, sizeof(h_inv_mod_f)));
-    OZ2_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(cQpiHi), h_qpi_hi_all[idx], num_moduli*sizeof(double)));
-    OZ2_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(cQpiLo), h_qpi_lo_all[idx], num_moduli*sizeof(double)));
-    OZ2_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(cP_hi),  &h_P_hi_all[idx],  sizeof(double)));
-    OZ2_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(cP_lo),  &h_P_lo_all[idx],  sizeof(double)));
-    OZ2_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(cInvP),  &h_inv_P_all[idx], sizeof(double)));
-#undef OZ2_CHECK
-    done_for = num_moduli;
-    return hipSuccess;
-}
-
 /* =========================================================================
  * Host-side emulation control functions
  * ========================================================================= */
@@ -589,26 +275,6 @@ bool fp64EmulationPerformanceCheck(int64_t m, int64_t n, int64_t k, unsigned num
               : std::optional<Oz2PerfModelParams>{};
     }
     return *entry;
-}
-
-/* HIPBLASLT_EMULATION_FUSED controls whether the fused MFMA+CRT kernel is used:
- *   "on"  / "force"      → always use fused (bypasses performance model)
- *   "off" / "never"      → never  use fused (forces non-fused path)
- *   "auto"/ "performant" → performance model decides
- *   unset (default)      → OFF — fused kernel disabled until production-ready */
-enum class Oz2FusedMode { AUTO, ON, OFF };
-static Oz2FusedMode oz2_fused_mode()
-{
-    static const Oz2FusedMode v = []() -> Oz2FusedMode {
-        const char* e = std::getenv("HIPBLASLT_EMULATION_FUSED");
-        if (e == nullptr) return Oz2FusedMode::OFF;   /* disabled by default */
-        if (std::strcmp(e, "on") == 0 || std::strcmp(e, "force") == 0)
-            return Oz2FusedMode::ON;
-        if (std::strcmp(e, "off") == 0 || std::strcmp(e, "never") == 0)
-            return Oz2FusedMode::OFF;
-        return Oz2FusedMode::AUTO;   /* "auto", "performant", or unrecognized */
-    }();
-    return v;
 }
 
 /* =========================================================================
@@ -1708,6 +1374,7 @@ static constexpr unsigned OZ2_SCALE_TILE_M = 4;
 
 template <unsigned T_COUNT, bool TRANS_A, bool TRANS_B>
 __global__ static void
+<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation.cpp
 oz2_scaleAB_kernel(const double* __restrict__ A,
                    int64_t m, int64_t lda,
                    int8_t*  __restrict__       A8i, size_t lda8i, size_t cola8i,
@@ -1717,6 +1384,73 @@ oz2_scaleAB_kernel(const double* __restrict__ A,
                    int8_t*  __restrict__       B8i, size_t ldb8i,
                    const int16_t* __restrict__ sftB,
                    int64_t k, unsigned t_start, unsigned m_y_blocks)
+=======
+oz2_scale_A_T_kernel(const double* __restrict__ A,
+                     int64_t m, int64_t lda,
+                     int8_t* __restrict__ A8i, size_t lda8i, size_t cola8i,
+                     const int16_t* __restrict__ sftA,
+                     int64_t k, unsigned t_start)
+{
+    static constexpr int TILE_K = static_cast<int>(OZ2_SCALE_TILE_K);   /* 64 */
+    static constexpr int TILE_M = static_cast<int>(OZ2_SCALE_COALESC_TILE_M); /* 8 */
+    const int t = static_cast<int>(threadIdx.x);
+    const int64_t m_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
+    /* j0 is always even → the double2 load is 16-byte aligned when lda is even. */
+    const int64_t j0 = static_cast<int64_t>(blockIdx.x) * (TILE_K * 2)
+                       + static_cast<int64_t>(t % TILE_K) * 2;
+    const int64_t j1 = j0 + 1;          /* adjacent element */
+    const int64_t i  = m_base + (t / TILE_K);
+    if(i >= m || j0 >= k) return;
+    const int  sft    = static_cast<int>(sftA[i]);
+    const bool valid1 = (j1 < k);
+    double ival0, ival1;
+    if(valid1) {
+        /* 128-bit load: reads j0 and j0+1 in one instruction (j0 is even → aligned). */
+        const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0);
+        ival0 = trunc(ldexp(vv.x, sft));
+        ival1 = trunc(ldexp(vv.y, sft));
+    } else {
+        ival0 = trunc(ldexp(A[i * lda + j0], sft));
+        ival1 = 0.0;
+    }
+    const size_t stride   = lda8i * cola8i;
+    const size_t off_base = static_cast<size_t>(i) * lda8i;
+    const size_t off0 = static_cast<size_t>(j0) + off_base; /* always even → uint16_t aligned */
+    #pragma unroll
+    for(unsigned t_local = 0; t_local < T_COUNT; ++t_local) {
+        const unsigned tidx    = t_start + t_local;
+        const double  neg_mod  = oz2_neg_mod(tidx);
+        const double  inv_mod  = oz2_inv_mod(tidx);
+        const float   inv_modf = oz2_inv_mod_f(tidx);
+        const double  r0   = fma(neg_mod, rint(ival0 * inv_mod), ival0);
+        const float   rf0  = static_cast<float>(r0);
+        const auto    b0   = static_cast<int8_t>(static_cast<int32_t>(
+                                 fmaf(rintf(rf0 * inv_modf), static_cast<float>(neg_mod), rf0)));
+        if(valid1) {
+            /* Pack INT8[j0] and INT8[j0+1] into one 16-bit NT store. */
+            const double  r1   = fma(neg_mod, rint(ival1 * inv_mod), ival1);
+            const float   rf1  = static_cast<float>(r1);
+            const auto    b1   = static_cast<int8_t>(static_cast<int32_t>(
+                                     fmaf(rintf(rf1 * inv_modf), static_cast<float>(neg_mod), rf1)));
+            const uint16_t packed = static_cast<uint8_t>(b0)
+                                  | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
+            __builtin_nontemporal_store(packed,
+                reinterpret_cast<uint16_t*>(A8i + t_local * stride + off0));
+        } else {
+            __builtin_nontemporal_store(b0, A8i + t_local * stride + off0);
+        }
+    }
+}
+
+/* ── A_N: TRANS_A=false, SHMEM transposition, blockDim=1024, TILE_M=16 ── */
+template <unsigned T_COUNT>
+__global__ static void
+oz2_scale_A_N_kernel(const double* __restrict__ A,
+                     int64_t m, int64_t lda,
+                     int8_t* __restrict__ A8i, size_t lda8i, size_t cola8i,
+                     const int16_t* __restrict__ sftA,
+                     int64_t k, unsigned t_start)
+>>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/fp64_emulation.cpp
 {
     static constexpr int TILE_K = static_cast<int>(OZ2_SCALE_TILE_K);
     static constexpr int TILE_M = static_cast<int>(OZ2_SCALE_TILE_M);
@@ -1732,6 +1466,7 @@ oz2_scaleAB_kernel(const double* __restrict__ A,
         /* ── A block ─────────────────────────────────────────────────────── */
         const int64_t m_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
 
+<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation.cpp
         if constexpr (TRANS_A) {
             /* Coalesced: A stored k×m, A[i,j] = A[j + i*lda].
              * j = t%TILE_K varies fast within warp → stride-1 reads.       */
@@ -1752,6 +1487,81 @@ oz2_scaleAB_kernel(const double* __restrict__ A,
                 __builtin_nontemporal_store(static_cast<int8_t>(static_cast<int32_t>(rf2)),
                                             A8i + t_local * stride + offset);
             }
+=======
+    const int k_write = t % TILE_K;
+    const int m_write = t / TILE_K;
+    const int64_t j_out = static_cast<int64_t>(blockIdx.x) * TILE_K + k_write;
+    const int64_t i_out = m_base + m_write;
+    if(i_out < m && j_out < k) {
+        const double val  = shmem[k_write][m_write];
+        const double ival = trunc(ldexp(val, static_cast<int>(s_sft[m_write])));
+        const size_t stride = lda8i * cola8i;
+        const size_t offset = static_cast<size_t>(j_out) + static_cast<size_t>(i_out) * lda8i;
+        #pragma unroll
+        for(unsigned t_local = 0; t_local < T_COUNT; ++t_local) {
+            const unsigned tidx = t_start + t_local;
+            const double  r  = fma(oz2_neg_mod(tidx), rint(ival * oz2_inv_mod(tidx)), ival);
+            const float   rf = static_cast<float>(r);
+            const float  rf2 = fmaf(rintf(rf * oz2_inv_mod_f(tidx)), static_cast<float>(oz2_neg_mod(tidx)), rf);
+            __builtin_nontemporal_store(static_cast<int8_t>(static_cast<int32_t>(rf2)),
+                                        A8i + t_local * stride + offset);
+        }
+    }
+}
+
+/* ── B_N: TRANS_B=false, j-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=2 ──
+ * Mirrors oz2_scale_A_T_kernel: double2 load + uint16_t packed store. */
+template <unsigned T_COUNT>
+__global__ static void
+oz2_scale_B_N_kernel(const double* __restrict__ B,
+                     int64_t n, int64_t ldb,
+                     int8_t* __restrict__ B8i, size_t ldb8i,
+                     const int16_t* __restrict__ sftB,
+                     int64_t k, unsigned t_start)
+{
+    static constexpr int TILE_K = static_cast<int>(OZ2_SCALE_TILE_K);   /* 64 */
+    static constexpr int TILE_M = static_cast<int>(OZ2_SCALE_COALESC_TILE_M); /* 8 */
+    const int t = static_cast<int>(threadIdx.x);
+    const int64_t n_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
+    const int64_t j0  = static_cast<int64_t>(blockIdx.x) * (TILE_K * 2)
+                        + static_cast<int64_t>(t % TILE_K) * 2;
+    const int64_t j1  = j0 + 1;         /* adjacent element */
+    const int64_t col = n_base + (t / TILE_K);
+    if(col >= n || j0 >= k) return;
+    const int  sft    = static_cast<int>(sftB[col]);
+    const bool valid1 = (j1 < k);
+    double ival0, ival1;
+    if(valid1) {
+        const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0);
+        ival0 = trunc(ldexp(vv.x, sft));
+        ival1 = trunc(ldexp(vv.y, sft));
+    } else {
+        ival0 = trunc(ldexp(B[col * ldb + j0], sft));
+        ival1 = 0.0;
+    }
+    const size_t stride   = ldb8i * static_cast<size_t>(n);
+    const size_t off_base = static_cast<size_t>(col) * ldb8i;
+    const size_t off0 = static_cast<size_t>(j0) + off_base; /* always even → uint16_t aligned */
+    #pragma unroll
+    for(unsigned t_local = 0; t_local < T_COUNT; ++t_local) {
+        const unsigned tidx    = t_start + t_local;
+        const double  neg_mod  = oz2_neg_mod(tidx);
+        const double  inv_mod  = oz2_inv_mod(tidx);
+        const float   inv_modf = oz2_inv_mod_f(tidx);
+        const double  r0   = fma(neg_mod, rint(ival0 * inv_mod), ival0);
+        const float   rf0  = static_cast<float>(r0);
+        const auto    b0   = static_cast<int8_t>(static_cast<int32_t>(
+                                 fmaf(rintf(rf0 * inv_modf), static_cast<float>(neg_mod), rf0)));
+        if(valid1) {
+            const double  r1   = fma(neg_mod, rint(ival1 * inv_mod), ival1);
+            const float   rf1  = static_cast<float>(r1);
+            const auto    b1   = static_cast<int8_t>(static_cast<int32_t>(
+                                     fmaf(rintf(rf1 * inv_modf), static_cast<float>(neg_mod), rf1)));
+            const uint16_t packed = static_cast<uint8_t>(b0)
+                                  | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
+            __builtin_nontemporal_store(packed,
+                reinterpret_cast<uint16_t*>(B8i + t_local * stride + off0));
+>>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/fp64_emulation.cpp
         } else {
             /* Non-coalesced load: A stored m×k, A[i,j] = A[i + j*lda].
              * Use SHMEM transposition for coalesced reads AND writes.       */
@@ -1824,6 +1634,7 @@ oz2_scaleAB_kernel(const double* __restrict__ A,
             if(k_local == 0 && col < n) s_sft[l_local] = sftB[col];
             __syncthreads();
 
+<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation.cpp
             /* Write: k_write varies fast → COALESCED writes */
             const int k_write = t % TILE_K;
             const int l_write = t / TILE_K;
@@ -1845,6 +1656,29 @@ oz2_scaleAB_kernel(const double* __restrict__ A,
                                                 B8i + t_local * stride + offset);
                 }
             }
+=======
+    shmem[k_local][l_local] = (col < n && j < k) ? B[col + j * ldb] : 0.0; /* COALESCED */
+    if(k_local == 0 && col < n) s_sft[l_local] = sftB[col];
+    __syncthreads();
+
+    const int k_write = t % TILE_K;
+    const int l_write = t / TILE_K;
+    const int64_t j_out   = static_cast<int64_t>(blockIdx.x) * TILE_K + k_write;
+    const int64_t col_out = n_base + l_write;
+    if(col_out < n && j_out < k) {
+        const double val  = shmem[k_write][l_write];
+        const double ival = trunc(ldexp(val, static_cast<int>(s_sft[l_write])));
+        const size_t stride = ldb8i * static_cast<size_t>(n);
+        const size_t offset = static_cast<size_t>(j_out) + static_cast<size_t>(col_out) * ldb8i;
+        #pragma unroll
+        for(unsigned t_local = 0; t_local < T_COUNT; ++t_local) {
+            const unsigned tidx = t_start + t_local;
+            const double  r  = fma(oz2_neg_mod(tidx), rint(ival * oz2_inv_mod(tidx)), ival);
+            const float   rf = static_cast<float>(r);
+            const float  rf2 = fmaf(rintf(rf * oz2_inv_mod_f(tidx)), static_cast<float>(oz2_neg_mod(tidx)), rf);
+            __builtin_nontemporal_store(static_cast<int8_t>(static_cast<int32_t>(rf2)),
+                                        B8i + t_local * stride + offset);
+>>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/fp64_emulation.cpp
         }
     }
 }
@@ -1932,7 +1766,7 @@ template <bool HAS_LO, unsigned CHUNK_SIZE, bool IS_FIRST_CHUNK>
 __global__ static void
 oz2_chunk_accum_kernel(const int32_t* __restrict__ C32i_batch,
                        double* __restrict__ Zhi, double* __restrict__ Zlo,
-                       int64_t m, int64_t n, size_t ldc32i, unsigned chunk_start)
+                       int64_t m, int64_t n, size_t ldc32i, unsigned chunk_start, unsigned effective_s)
 {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t l = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
@@ -1944,12 +1778,12 @@ oz2_chunk_accum_kernel(const int32_t* __restrict__ C32i_batch,
     for(unsigned t_local = 0; t_local < CHUNK_SIZE; ++t_local) {
         const unsigned t    = chunk_start + t_local;
         const double dc_raw = static_cast<double>(C32i_batch[t_local * slice_stride + idx]);
-        const double dc     = fma(cNegMod[t], rint(dc_raw * cInvMod[t]), dc_raw);
-        const double hi     = dc * cQpiHi[t];
+        const double dc     = fma(oz2_neg_mod(t), rint(dc_raw * oz2_inv_mod(t)), dc_raw);
+        const double hi     = dc * oz2_qpi_hi(effective_s - 2, t);
         const double new_hi = local_hi + hi;
         const double err    = hi - (new_hi - local_hi);
         local_hi = new_hi;
-        if constexpr (HAS_LO) local_lo = fma(dc, cQpiLo[t], local_lo + err);
+        if constexpr (HAS_LO) local_lo = fma(dc, oz2_qpi_lo(effective_s - 2, t), local_lo + err);
         else                   local_lo += err;
     }
     if constexpr (IS_FIRST_CHUNK) {
@@ -1971,7 +1805,7 @@ oz2_accum_finalize_kernel(const int32_t* __restrict__ C32i_batch,
                           int64_t m, int64_t n, size_t ldc32i, int64_t ldc, int64_t ldd,
                           double alpha, double beta,
                           const int16_t* __restrict__ sftA, const int16_t* __restrict__ sftB,
-                          unsigned chunk_start)
+                          unsigned chunk_start, unsigned effective_s)
 {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t l = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
@@ -1983,12 +1817,12 @@ oz2_accum_finalize_kernel(const int32_t* __restrict__ C32i_batch,
     for(unsigned t_local = 0; t_local < CHUNK_SIZE; ++t_local) {
         const unsigned t    = chunk_start + t_local;
         const double dc_raw = static_cast<double>(C32i_batch[t_local * slice_stride + idx]);
-        const double dc     = fma(cNegMod[t], rint(dc_raw * cInvMod[t]), dc_raw);
-        const double hi     = dc * cQpiHi[t];
+        const double dc     = fma(oz2_neg_mod(t), rint(dc_raw * oz2_inv_mod(t)), dc_raw);
+        const double hi     = dc * oz2_qpi_hi(effective_s - 2, t);
         const double new_hi = local_hi + hi;
         const double err    = hi - (new_hi - local_hi);
         local_hi = new_hi;
-        if constexpr (HAS_LO) local_lo = fma(dc, cQpiLo[t], local_lo + err);
+        if constexpr (HAS_LO) local_lo = fma(dc, oz2_qpi_lo(effective_s - 2, t), local_lo + err);
         else                   local_lo += err;
     }
     double Zh, Zl;
@@ -1999,8 +1833,8 @@ oz2_accum_finalize_kernel(const int32_t* __restrict__ C32i_batch,
         const double err    = local_hi - (s_hi - old_hi);
         Zh = s_hi; Zl = Zlo_in[idx] + err + local_lo;
     }
-    const double q = rint((Zh + Zl) * cInvP);
-    const double X = fma(cP_lo, q, fma(cP_hi, q, Zh) + Zl);
+    const double q = rint((Zh + Zl) * oz2_inv_P(effective_s - 2));
+    const double X = fma(oz2_P_lo(effective_s - 2), q, fma(oz2_P_hi(effective_s - 2), q, Zh) + Zl);
     const int inv_sft = -(static_cast<int>(sftA[i]) + static_cast<int>(sftB[l]));
     const size_t d_idx = static_cast<size_t>(i) + static_cast<size_t>(l) * static_cast<size_t>(ldd);
     double d_val = alpha * ldexp(X, inv_sft);
@@ -2009,687 +1843,6 @@ oz2_accum_finalize_kernel(const int32_t* __restrict__ C32i_batch,
         d_val += beta * C[c_idx];
     }
     __builtin_nontemporal_store(d_val, D + d_idx);
-}
-
-/* =========================================================================
- * Fused TN kernel — unified template supporting three macrotile sizes:
- *
- *   TILE=16, WM=4, WN=4 → 64×64   macrotile, 1024 threads (default)
- *   TILE=32, WM=4, WN=2 → 128×64  macrotile,  512 threads (m ≥ n preferred)
- *   TILE=32, WM=2, WN=4 → 64×128  macrotile,  512 threads (m < n preferred)
- *
- * MFMA instructions used:
- *   TILE=16: v_mfma_i32_16x16x32_i8 (gfx94x) / v_mfma_i32_16x16x64_i8 (gfx95x)
- *   TILE=32: v_mfma_i32_32x32x16_i8 (gfx94x) / v_mfma_i32_32x32x32_i8 (gfx95x)
- *
- * Output thread layout (same formula for TILE=16 and TILE=32):
- *   col = lane % TILE
- *   row = (TILE/4)*(lane/TILE) + 8*(e/4) + (e%4)   for e = 0..NREG-1
- *
- * Changes from prior revision:
- *   • Moduli pairing dropped: one modulus per k-loop iteration (simpler code,
- *     halved LDS usage from 32KB→16KB for TILE=16 config).
- *   • WM, WN, TILE are template parameters → one kernel for all three variants.
- *   • Separate A_STEPS / B_STEPS for asymmetric WM≠WN cooperative loads.
- *
- * NOTE: The MFMA output thread layout is based on the AMD CDNA3 ISA and
- * should be validated on hardware before production use.
- * ========================================================================= */
-
-/* Swizzle factor (super-tile column grouping for L2 locality) */
-static constexpr int OZ2_FUSED_SWIZZLE = 4;
-
-/* Default (64×64) macrotile configuration — retained for legacy references */
-static constexpr unsigned OZ2_FUSED_WM   = 4u;
-static constexpr unsigned OZ2_FUSED_WN   = 4u;
-static constexpr unsigned OZ2_FUSED_TILE = 16u;
-
-/* Per-architecture MFMA K-block sizes.
- * TILE=16: K_BLOCK = 32 (gfx94x) or 64 (gfx95x)
- * TILE=32: K_BLOCK = 16 (gfx94x) or 32 (gfx95x)                           */
-#if defined(__gfx950__)
-static constexpr unsigned OZ2_KBLK_16 = 64u;
-static constexpr unsigned OZ2_KBLK_32 = 32u;
-#else
-static constexpr unsigned OZ2_KBLK_16 = 32u;
-static constexpr unsigned OZ2_KBLK_32 = 16u;
-#endif
-/* Maximum KBLK_LOAD across all kernel variants AND all supported architectures —
- * used for the workspace-zero guard in fp64EmulatedGemmImpl (HOST-side).
- * gfx942: TILE=16, K_UNROLL=4, KBLK_16=32 → KBLK_LOAD = 128
- * gfx950: TILE=16, K_UNROLL=4, KBLK_16=64 → KBLK_LOAD = 256
- * Must be the architecture-independent maximum (256) to ensure the workspace is
- * correctly zeroed on gfx950, where host code does not see __gfx950__.           */
-static constexpr unsigned OZ2_FUSED_KBLK_LOAD_MAX = 256u;
-
-/* MFMA output vector types */
-typedef int v4i32  __attribute__((ext_vector_type(4)));
-typedef int v16i32 __attribute__((ext_vector_type(16)));
-
-/* TILE=16 MFMA source type and instruction wrapper */
-#if defined(__gfx950__)
-typedef long oz2_mfma_src16_t __attribute__((ext_vector_type(2)));
-__device__ __forceinline__ v4i32
-oz2_do_mfma_16(oz2_mfma_src16_t a, oz2_mfma_src16_t b, v4i32 c) noexcept
-{ return __builtin_amdgcn_mfma_i32_16x16x64_i8(a, b, c, 0, 0, 0); }
-#else
-typedef int64_t oz2_mfma_src16_t;
-__device__ __forceinline__ v4i32
-oz2_do_mfma_16(int64_t a, int64_t b, v4i32 c) noexcept
-{ return __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, c, 0, 0, 0); }
-#endif
-
-/* TILE=32 MFMA source type and instruction wrapper.
- * The source register size for v_mfma_i32_32x32x16_i8 is KBLK*TILE/64 = 8 bytes
- * (int64_t on gfx94x) — the same as for v_mfma_i32_16x16x32_i8.
- * For gfx95x (v_mfma_i32_32x32x32_i8): KBLK*TILE/64 = 16 bytes (long2), also
- * identical to the TILE=16 source type.  So oz2_mfma_src32_t = oz2_mfma_src16_t. */
-typedef oz2_mfma_src16_t oz2_mfma_src32_t;
-#if defined(__gfx950__)
-__device__ __forceinline__ v16i32
-oz2_do_mfma_32(oz2_mfma_src32_t a, oz2_mfma_src32_t b, v16i32 c) noexcept
-{ return __builtin_amdgcn_mfma_i32_32x32x32_i8(a, b, c, 0, 0, 0); }
-#else
-__device__ __forceinline__ v16i32
-oz2_do_mfma_32(oz2_mfma_src32_t a, oz2_mfma_src32_t b, v16i32 c) noexcept
-{ return __builtin_amdgcn_mfma_i32_32x32x16_i8(a, b, c, 0, 0, 0); }
-#endif
-
-/* ── Architecture-specific MFMA source load helper ─────────────────────────
- * On gfx95x (K_A_BYTES=16, KBLK_STRIDE=136): two 8-byte loads give 2-way LDS
- * bank conflicts instead of 4-way from a single 16-byte load.
- * On gfx94x (K_A_BYTES=8): single 8-byte load is always conflict-free.       */
-#if defined(__gfx950__)
-__device__ __forceinline__ oz2_mfma_src16_t
-oz2_load_mfma_src16(const int8_t* __restrict__ ptr) noexcept {
-    oz2_mfma_src16_t v;
-    v[0] = *reinterpret_cast<const long*>(ptr);
-    v[1] = *reinterpret_cast<const long*>(ptr + 8);
-    return v;
-}
-#else
-__device__ __forceinline__ oz2_mfma_src16_t
-oz2_load_mfma_src16(const int8_t* __restrict__ ptr) noexcept {
-    return *reinterpret_cast<const oz2_mfma_src16_t*>(ptr);
-}
-#endif
-/* Same helper for TILE=32 source (oz2_mfma_src32_t == oz2_mfma_src16_t). */
-__device__ __forceinline__ oz2_mfma_src32_t
-oz2_load_mfma_src32(const int8_t* __restrict__ ptr) noexcept {
-    return oz2_load_mfma_src16(ptr);
-}
-
-/* ── oz2_fused_TN_kernel ─────────────────────────────────────────────────── */
-/*
- * Template parameters:
- *   S    – number of moduli (2..OZ2_S_MAX)
- *   HAS_LO – true when S > 7 (double-double CRT accumulation)
- *   WM   – wavefronts in M direction (default 4)
- *   WN   – wavefronts in N direction (default 4)
- *   TILE – MFMA tile: 16 (16×16 MFMA) or 32 (32×32 MFMA)
- *
- * Macrotile = (WM×TILE) × (WN×TILE).   blockDim = WM×WN×64 threads.
- *
- * Prerequisite: A8i/B8i workspace zero-padded to OZ2_FUSED_KBLK_LOAD_MAX
- * alignment (ensured by the hipMemsetAsync in fp64EmulatedGemmImpl).
- */
-template <unsigned S, bool HAS_LO, unsigned WM = 4u, unsigned WN = 4u, unsigned TILE = 16u>
-__global__ static void
-oz2_fused_TN_kernel(
-    const int8_t*  __restrict__ A8i,   /* [S × lda8i × cola8i] INT8 A  */
-    size_t         stride_A_s,          /* lda8i × cola8i               */
-    size_t         lda8i,               /* padded k                      */
-    const int8_t*  __restrict__ B8i,   /* [S × ldb8i × n]  INT8 B      */
-    size_t         stride_B_s,          /* ldb8i × n                    */
-    size_t         ldb8i,               /* padded k                      */
-    const double*  __restrict__ C,
-    double*        __restrict__ D,
-    int64_t m, int64_t n, int64_t k,
-    int64_t ldc, int64_t ldd,
-    double alpha, double beta,
-    const int16_t* __restrict__ sftA,
-    const int16_t* __restrict__ sftB,
-    int            num_xccs)            /* number of XCCs on this device */
-{
-    /* ── Derived compile-time constants ────────────────────────────────────── */
-    static constexpr unsigned NREG      = TILE * TILE / 64u;    /* 4 (TILE=16) or 16 (TILE=32) */
-    static constexpr unsigned KBLK      = (TILE == 16u) ? OZ2_KBLK_16 : OZ2_KBLK_32;
-    /* K-loop unroll factor (analogous to DepthU in TensiteLite):
-     * K_UNROLL=4 doubles KBLK_LOAD, halves k-loop __syncthreads count, and
-     * provides 4 back-to-back MFMAs per barrier interval for better ILP.
-     *   gfx94x (MI300): K_UNROLL=4 — measured scratch=108B ✓
-     *   gfx95x (MI350): K_UNROLL=2 — KBLK is doubled vs gfx94x, so K_UNROLL=4
-     *     would double A_STEPS/B_STEPS giving the same register pressure as
-     *     gfx94x K_UNROLL=8 (scratch=388B, 2.5× slower). Confirmed on hardware:
-     *     K_UNROLL=4 → scratch=424B ✗  K_UNROLL=2 → scratch=104B ✓          */
-    /* Architecture-specific LDS budget per CU:
-     *   gfx95x (MI350): 160 KB — allows larger macrotiles and looser padding
-     *   gfx94x (MI300): 64 KB                                                 */
-#if defined(__gfx950__)
-    static constexpr size_t   LDS_BUDGET  = 159u * 1024u;
-#else
-    static constexpr size_t   LDS_BUDGET  = 63u * 1024u;
-#endif
-    static constexpr size_t   LDS_MFMA_K4 = 2u * (WM * TILE * (KBLK * 4u)
-                                                  + WN * TILE * (KBLK * 4u));
-    static constexpr size_t   LDS_SFT     = static_cast<size_t>((WM + WN) * TILE * 2u);
-#if defined(__gfx950__)
-    /* TILE=32: K_UNROLL=2 — KBLK=32 doubled; A_STEPS≤4 validated (scratch=104B).
-     * TILE=16: K_UNROLL=4 — KBLK=64; A_STEPS=4 at boundary (scratch=8B, acceptable).
-     * Note: the launcher dispatches TILE=16 for ALL sizes on gfx950, so the TILE=32
-     * branch is a compile-time fallback retained for correctness if ever dispatched.  */
-    static constexpr unsigned K_UNROLL = (TILE == 32u) ? 2u : 4u;
-#else
-    static constexpr unsigned K_UNROLL = (LDS_MFMA_K4 + LDS_SFT <= LDS_BUDGET) ? 4u : 2u;
-#endif
-    static constexpr unsigned KBLK_LOAD   = KBLK * K_UNROLL;
-    /* Source register size (bytes): KBLK × TILE / 64.
-     * Equals sizeof(oz2_mfma_src16_t) on each architecture.
-     *   gfx94x: TILE=16 → 32×16/64=8, TILE=32 → 16×32/64=8  (int64_t)
-     *   gfx95x: TILE=16 → 64×16/64=16, TILE=32 → 32×32/64=16 (long2)  */
-    static constexpr unsigned K_A_BYTES = KBLK * TILE / 64u;
-    /* KBLK_PAD must be a multiple of K_A_BYTES (= the MFMA source read width in
-     * bytes) to keep every LDS row naturally aligned for ds_read_b64 / ds_read_b128.
-     * Using exactly K_A_BYTES is the minimum aligned padding that also breaks the
-     * power-of-two row stride and eliminates LDS bank conflicts:
-     *
-     *   TILE=32 gfx94x: stride 32→40, GCD(10,64)=2, period 32 = wavefront half → 0 conflicts
-     *   TILE=16 gfx94x: stride 64→72, GCD(18,64)=2, period 32 ≥ TILE=16       → 0 conflicts
-     *   TILE=32 gfx95x: stride 64→80, GCD(20,64)=4, period 16 → 2-way (acceptable)
-     *   TILE=16 gfx95x: skip (LDS budget, see guard below)
-     *
-     * The padding is suppressed when it would push the block's LDS usage above 63 KB. */
-    /* On gfx95x (K_A_BYTES=16), use 8-byte LDS padding unit instead of 16.
-     * KBLK_STRIDE=KBLK_LOAD+8 gives bank-stride/4=34, GCD(34,64)=2 → 2-way
-     * conflicts for ds_read_b64, vs 4-way for ds_read_b128 with PAD=16.
-     * MFMA source reads are split into two int64_t loads (see apply_mfma).   */
-    static constexpr unsigned KBLK_PAD_UNIT = (K_A_BYTES == 16u) ? 8u : K_A_BYTES;
-    static constexpr size_t   LDS_BYTES_OLD = 2u * (WM * TILE * KBLK_LOAD
-                                                   + WN * TILE * KBLK_LOAD);
-    static constexpr unsigned KBLK_PAD    = (LDS_BYTES_OLD + KBLK_PAD_UNIT * TILE * (WM + WN) * 2u
-                                             <= LDS_BUDGET) ? KBLK_PAD_UNIT : 0u;
-    static constexpr unsigned KBLK_STRIDE = KBLK_LOAD + KBLK_PAD;
-    static constexpr unsigned BLK_THR   = WM * WN * 64u;
-    static constexpr unsigned K4DIM     = KBLK_LOAD / 4u;
-    /* Cooperative-load steps per thread (A and B differ for asymmetric WM≠WN) */
-    static constexpr unsigned A_STEPS = (WM * TILE * K4DIM) / BLK_THR;
-    static constexpr unsigned B_STEPS = (WN * TILE * K4DIM) / BLK_THR;
-    static_assert(A_STEPS >= 1u && B_STEPS >= 1u, "cooperative load steps must be positive");
-
-    /* ── Static LDS (double-buffered, no paired-moduli dimension) ─────────────
-     * LDS sizes with K_UNROLL (gfx94x, KBLK_PAD=K_A_BYTES=8):
-     *   TILE=32, WM=4,WN=2, K_UNROLL=8: A=[2][4][32][136]=34KB  B=[2][2][32][136]=17KB → 51KB
-     *   TILE=16, WM=WN=4,   K_UNROLL=4: A=[2][4][16][136]=17KB  B=17KB               → 34KB
-     * (KBLK_PAD=K_A_BYTES per row restores alignment and eliminates bank conflicts) */
-    __shared__ int8_t  A8i_lds[2][WM][TILE][KBLK_STRIDE];
-    __shared__ int8_t  B8i_lds[2][WN][TILE][KBLK_STRIDE];
-    /* Per-block scale shifts cached in LDS — loaded cooperatively at kernel start
-     * to eliminate global memory reads from the latency-critical finalize step.
-     * Size: (WM+WN)*TILE int16_t ≤ 384 bytes (TILE=32 case), negligible.       */
-    __shared__ int16_t sftA_lds[WM * TILE];
-    __shared__ int16_t sftB_lds[WN * TILE];
-
-    /* ── Thread decomposition ───────────────────────────────────────────────── */
-    const int wid  = static_cast<int>(threadIdx.x) / 64;
-    const int wm   = wid / static_cast<int>(WN);
-    const int wn   = wid % static_cast<int>(WN);
-    const int lane = static_cast<int>(threadIdx.x) % 64;
-    const int k_int = static_cast<int>(k);
-
-    /* ── XCC-aware block tile mapping ────────────────────────────────────────
-     * MI300X / MI350X dispatch blocks strictly round-robin across XCCs
-     * (verified via HW_REG_XCC_ID, register 20):  XCC_ID = blockIdx.x % num_xccs.
-     *
-     * The 1D grid partitions m_tiles across XCCs so each XCC owns a contiguous
-     * slice → blocks on the same XCC reuse A8i for their m_tiles via concurrent
-     * HBM read merging across all n_tile passes.
-     *
-     * Within each XCC, swizzle_eff consecutive intra-XCC blocks share the same
-     * n_tile → B8i concurrent HBM merge (swizzle_eff reads → 1 HBM fetch).
-     *
-     * Measured optima (m=n=16K, 128×64 tile, gfx942):
-     *   swizzle=4: best for small k (memory-bound); balances A8i and B8i merge
-     *   swizzle=1: best for large k (compute-bound); maximizes A8i merge (38×)
-     *              → set HIPBLASLT_EMULATION_FUSED_SWIZZLE=1 for large-k workloads */
-    static constexpr int SWIZZLE_B8i_PREF = 4;  /* empirically optimal for k~1024 */
-
-    const int m_tiles_total   = (static_cast<int>(m) + static_cast<int>(WM * TILE) - 1)
-                                / static_cast<int>(WM * TILE);
-    const int n_tiles_total   = (static_cast<int>(n) + static_cast<int>(WN * TILE) - 1)
-                                / static_cast<int>(WN * TILE);
-    const int m_tiles_per_xcc = (m_tiles_total + num_xccs - 1) / num_xccs;
-    const int tiles_per_xcc   = m_tiles_per_xcc * n_tiles_total;
-
-    const int swizzle_eff = (SWIZZLE_B8i_PREF > m_tiles_per_xcc) ? m_tiles_per_xcc : SWIZZLE_B8i_PREF;
-
-    /* Read the hardware XCC ID: HW_REG_XCC_ID = register 20, CDNA3/CDNA4 ISA Table 19. */
-    uint32_t hw_xcc_id = 0u;
-    asm volatile("s_getreg_b32 %0, hwreg(20)" : "=s"(hw_xcc_id));
-
-    const int linear_block = static_cast<int>(blockIdx.x);
-    const int xcc_id       = static_cast<int>(hw_xcc_id);
-    const int intra_xcc    = linear_block / num_xccs;
-
-    /* Guard: extra blocks beyond total_tiles return early.                      */
-    if (intra_xcc >= tiles_per_xcc) return;
-
-    /* Within XCC: SWIZZLE_eff blocks share n_tile (B8i merge).
-     * m_group steps through the XCC's m_tiles in groups of swizzle_eff.        */
-    const int swizzle_group = intra_xcc / swizzle_eff;
-    const int m_local       = intra_xcc % swizzle_eff;
-    const int n_tile        = swizzle_group % n_tiles_total;
-    const int m_group       = swizzle_group / n_tiles_total;
-    const int m_tile        = xcc_id * m_tiles_per_xcc + m_group * swizzle_eff + m_local;
-
-    if (m_tile >= m_tiles_total) return;   /* guard for uneven XCC boundary     */
-
-    const int block_m_base = m_tile * static_cast<int>(WM * TILE);
-    const int block_n_base = n_tile * static_cast<int>(WN * TILE);
-    const int m_base = block_m_base + wm * static_cast<int>(TILE);
-    const int n_base = block_n_base + wn * static_cast<int>(TILE);
-
-    /* Per-lane output coordinates (constant throughout the S-loop).
-     * MFMA output layout:
-     *   col = lane % TILE   (N_cols per wavefront = TILE)
-     *   row = NREG*(lane/TILE) + e   for e = 0..NREG-1
-     *
-     * Derivation: N_lane_groups = 64/TILE, each covering TILE rows/group.
-     * NREG = TILE²/64 = TILE/N_lane_groups rows per group (= M_per_group).
-     *   TILE=16: NREG=4,  4*(lane/16)  → groups covering rows {0..3},{4..7},{8..11},{12..15}
-     *   TILE=32: NREG=16, 16*(lane/32) → groups covering rows {0..15},{16..31}              */
-    const int col_val       = n_base + (lane % static_cast<int>(TILE));
-    const int lane_row_base = m_base + 4 * (lane / static_cast<int>(TILE));
-
-    /* CRT accumulators (persist across all S moduli) */
-    double Zhi[NREG] = {};
-    double Zlo[NREG] = {};
-
-    /* ── Cooperative-load position tables ──────────────────────────────────────
-     * A: covers WM × TILE × K4DIM positions; A_STEPS per thread.
-     * B: covers WN × TILE × K4DIM positions; B_STEPS per thread.
-     * For symmetric WM=WN: A_STEPS=B_STEPS; for asymmetric (128×64 / 64×128): differ. */
-    unsigned wm_A[A_STEPS]; int ml_A[A_STEPS], k4_A[A_STEPS], mi_A[A_STEPS];
-    #pragma unroll
-    for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-        const int flat     = static_cast<int>(threadIdx.x + ls * BLK_THR);
-        const int tile_dim = static_cast<int>(TILE * K4DIM);
-        wm_A[ls] = static_cast<unsigned>(flat / tile_dim);
-        ml_A[ls] = (flat % tile_dim) / static_cast<int>(K4DIM);
-        k4_A[ls] = (flat % tile_dim) % static_cast<int>(K4DIM);
-        mi_A[ls] = block_m_base + static_cast<int>(wm_A[ls]) * static_cast<int>(TILE) + ml_A[ls];
-    }
-    unsigned wn_B[B_STEPS]; int nl_B[B_STEPS], k4_B[B_STEPS], ni_B[B_STEPS];
-    #pragma unroll
-    for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-        const int flat     = static_cast<int>(threadIdx.x + ls * BLK_THR);
-        const int tile_dim = static_cast<int>(TILE * K4DIM);
-        wn_B[ls] = static_cast<unsigned>(flat / tile_dim);
-        nl_B[ls] = (flat % tile_dim) / static_cast<int>(K4DIM);
-        k4_B[ls] = (flat % tile_dim) % static_cast<int>(K4DIM);
-        ni_B[ls] = block_n_base + static_cast<int>(wn_B[ls]) * static_cast<int>(TILE) + nl_B[ls];
-    }
-
-    /* ── Boundary-safe 4-byte load helpers (prologue only) ─────────────────── */
-    auto cond_load_a = [&](const int8_t* As, unsigned ls, int ki) -> int32_t {
-        int32_t v = 0;
-        const int mi = mi_A[ls];
-        if (mi < static_cast<int>(m)) {
-            if (ki + 3 < k_int)
-                v = *reinterpret_cast<const int32_t*>(As + static_cast<size_t>(mi) * lda8i + ki);
-            else if (ki < k_int) {
-                const int8_t* p = As + static_cast<size_t>(mi) * lda8i + ki;
-                for (int b = 0; b < 4 && ki + b < k_int; ++b)
-                    reinterpret_cast<int8_t*>(&v)[b] = p[b];
-            }
-        }
-        return v;
-    };
-    auto cond_load_b = [&](const int8_t* Bs, unsigned ls, int ki) -> int32_t {
-        int32_t v = 0;
-        const int ni = ni_B[ls];
-        if (ni < static_cast<int>(n)) {
-            if (ki + 3 < k_int)
-                v = *reinterpret_cast<const int32_t*>(Bs + static_cast<size_t>(ni) * ldb8i + ki);
-            else if (ki < k_int) {
-                const int8_t* p = Bs + static_cast<size_t>(ni) * ldb8i + ki;
-                for (int b = 0; b < 4 && ki + b < k_int; ++b)
-                    reinterpret_cast<int8_t*>(&v)[b] = p[b];
-            }
-        }
-        return v;
-    };
-
-    /* ── Cooperative load of sftA/sftB into LDS ────────────────────────────────
-     * Thread t < WM*TILE loads sftA_lds[t]; WM*TILE ≤ t < (WM+WN)*TILE loads sftB.
-     * Remaining threads are idle.  These reads are small (≤192 int16_t values)
-     * and are in flight here; they complete before the __syncthreads below.     */
-    if (threadIdx.x < WM * TILE) {
-        const int mi = block_m_base + static_cast<int>(threadIdx.x);
-        sftA_lds[threadIdx.x] = (mi < static_cast<int>(m)) ? sftA[mi] : 0;
-    } else if (threadIdx.x < (WM + WN) * TILE) {
-        const int ni = block_n_base + static_cast<int>(threadIdx.x - WM * TILE);
-        sftB_lds[threadIdx.x - WM * TILE] = (ni < static_cast<int>(n)) ? sftB[ni] : 0;
-    }
-
-    /* ── Pre-fetch modulus s=0 prologue into registers ─────────────────────────
-     * Issuing these global loads BEFORE the __syncthreads below hides their
-     * ~100-cycle HBM latency behind the barrier wait.                           */
-    int32_t rA_pro[A_STEPS] = {};
-    int32_t rB_pro[B_STEPS] = {};
-    if (k_int > 0) {
-        #pragma unroll
-        for (unsigned ls = 0; ls < A_STEPS; ++ls)
-            rA_pro[ls] = cond_load_a(A8i, ls, k4_A[ls] * 4);
-        #pragma unroll
-        for (unsigned ls = 0; ls < B_STEPS; ++ls)
-            rB_pro[ls] = cond_load_b(B8i, ls, k4_B[ls] * 4);
-    }
-    /* Barrier: (1) ensures sftA/B LDS writes above are visible to all threads;
-     *          (2) acts as the first per-modulus sync for s=0 (no previous
-     *              epilogue MFMA exists, so it is correct to merge them).       */
-    __syncthreads();
-
-    /* ── MFMA helper: K_UNROLL=2 MFMAs from one LDS ping-pong slot ────────────
-     * A_wm_slot = &A8i_lds[cur][wm][0][0], B_wn_slot = &B8i_lds[cur][wn][0][0].
-     * LDS layout: [TILE][KBLK_LOAD] → stride KBLK_LOAD per row, 1 byte per k.
-     * MFMA source accessed as: slot + (lane%TILE)*KBLK_LOAD + K_A_BYTES*(lane/TILE) + ku*KBLK */
-    auto apply_mfma = [&](const int8_t* A_wm_slot, const int8_t* B_wn_slot,
-                          int32_t (&C32)[NREG]) __attribute__((always_inline)) {
-        const int m_col  = lane % static_cast<int>(TILE);
-        const int k_base = static_cast<int>(K_A_BYTES) * (lane / static_cast<int>(TILE));
-        if constexpr (TILE == 16u) {
-            v4i32 vx;
-            for (unsigned e = 0; e < NREG; ++e) vx[static_cast<int>(e)] = C32[e];
-            for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-                const int kab = k_base + static_cast<int>(ku * KBLK);
-                const int off_A = m_col * static_cast<int>(KBLK_STRIDE) + kab;
-                const int off_B = m_col * static_cast<int>(KBLK_STRIDE) + kab;
-                /* Use KBLK_STRIDE as the LDS row stride (accounts for KBLK_PAD).
-                 * On gfx95x (K_A_BYTES=16): two 64-bit loads → 2-way LDS conflicts
-                 * instead of 4-way from a single 128-bit load.                  */
-                /* oz2_load_mfma_src16: on gfx95x uses two 64-bit loads (2-way
-                 * LDS conflicts); on gfx94x uses one 64-bit load (0 conflicts). */
-                const auto sa = oz2_load_mfma_src16(A_wm_slot + off_A);
-                const auto sb = oz2_load_mfma_src16(B_wn_slot + off_B);
-                vx = oz2_do_mfma_16(sa, sb, vx);
-            }
-            for (unsigned e = 0; e < NREG; ++e) C32[e] = vx[static_cast<int>(e)];
-        } else {
-            v16i32 vx;
-            for (unsigned e = 0; e < NREG; ++e) vx[static_cast<int>(e)] = C32[e];
-            for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-                const int kab = k_base + static_cast<int>(ku * KBLK);
-                const int off_A = m_col * static_cast<int>(KBLK_STRIDE) + kab;
-                const int off_B = m_col * static_cast<int>(KBLK_STRIDE) + kab;
-                const auto sa = oz2_load_mfma_src32(A_wm_slot + off_A);
-                const auto sb = oz2_load_mfma_src32(B_wn_slot + off_B);
-                vx = oz2_do_mfma_32(sa, sb, vx);
-            }
-            for (unsigned e = 0; e < NREG; ++e) C32[e] = vx[static_cast<int>(e)];
-        }
-    };
-
-    /* ── CRT helper: accumulate one modulus's contribution into Zhi/Zlo ──────── */
-    auto crt_update = [&](const int32_t* C32x, unsigned sidx) __attribute__((always_inline)) {
-        const double nm = cNegMod[sidx], im = cInvMod[sidx];
-        for (unsigned e = 0; e < NREG; ++e) {
-            const double dc_raw = static_cast<double>(C32x[e]);
-            const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-            const double hi     = dc * cQpiHi[sidx];
-            const double new_hi = Zhi[e] + hi;
-            const double err    = hi - (new_hi - Zhi[e]);
-            Zhi[e] = new_hi;
-            if constexpr (HAS_LO) Zlo[e] = fma(dc, cQpiLo[sidx], Zlo[e] + err);
-            else                  Zlo[e] += err;
-        }
-    };
-
-    /* ── Main loop: one modulus per iteration (no paired-moduli) ───────────────
-     * __syncthreads() at the top of each iteration ensures the previous
-     * modulus's epilogue MFMA (which reads LDS) has completed before we
-     * overwrite LDS with the next modulus's prologue data.                     */
-    for (unsigned s = 0; s < S; ++s) {
-        const int8_t* A8i_s = A8i + static_cast<size_t>(s) * stride_A_s;
-        const int8_t* B8i_s = B8i + static_cast<size_t>(s) * stride_B_s;
-        int32_t C32[NREG] = {};
-
-        if (k_int > 0) {
-            __syncthreads(); /* separate from previous modulus's LDS usage */
-
-            /* Prologue: write pre-fetched first k-block (rA_pro/rB_pro) to LDS slot 0.
-             * These registers were loaded from global memory BEFORE the __syncthreads
-             * above, so their ~100-cycle HBM latency is fully hidden.            */
-            #pragma unroll
-            for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                *reinterpret_cast<int32_t*>(&A8i_lds[0][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA_pro[ls];
-            #pragma unroll
-            for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                *reinterpret_cast<int32_t*>(&B8i_lds[0][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB_pro[ls];
-
-            /* Pre-fetch modulus (s+1)'s first k-block into registers NOW, while the
-             * LDS writes above are completing.  The ~100-cycle HBM latency will be
-             * hidden behind __syncthreads [2] below and the start of the k-loop.  */
-            if (s + 1 < S) {
-                #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    rA_pro[ls] = cond_load_a(A8i + static_cast<size_t>(s + 1) * stride_A_s, ls, k4_A[ls] * 4);
-                #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    rB_pro[ls] = cond_load_b(B8i + static_cast<size_t>(s + 1) * stride_B_s, ls, k4_B[ls] * 4);
-            }
-
-            __syncthreads(); /* [2] wait for prologue LDS writes to complete */
-
-            /* Precompute per-modulus base pointers for the ping-pong prefetch */
-            const int8_t* A_base[A_STEPS];
-            const int8_t* B_base[B_STEPS];
-            #pragma unroll
-            for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                A_base[ls] = A8i_s + static_cast<size_t>(mi_A[ls]) * lda8i
-                           + static_cast<size_t>(k4_A[ls]) * 4u;
-            #pragma unroll
-            for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                B_base[ls] = B8i_s + static_cast<size_t>(ni_B[ls]) * ldb8i
-                           + static_cast<size_t>(k4_B[ls]) * 4u;
-
-            int32_t rA[A_STEPS], rB[B_STEPS];
-            int cur = 0;
-
-            /* ── Double-buffered k-loop ──────────────────────────────────── */
-            for (int k_off = 0; k_off + static_cast<int>(KBLK_LOAD) < k_int;
-                 k_off += static_cast<int>(KBLK_LOAD)) {
-                const int nxt   = 1 - cur;
-                const int nxt_k = k_off + static_cast<int>(KBLK_LOAD);
-                /* Prefetch next k-block into registers */
-                #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    rA[ls] = *reinterpret_cast<const int32_t*>(A_base[ls] + nxt_k);
-                #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    rB[ls] = *reinterpret_cast<const int32_t*>(B_base[ls] + nxt_k);
-                /* Compute from current LDS slot */
-                apply_mfma(&A8i_lds[cur][wm][0][0], &B8i_lds[cur][wn][0][0], C32);
-                /* Write prefetch to next LDS slot */
-                #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    *reinterpret_cast<int32_t*>(
-                        &A8i_lds[nxt][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA[ls];
-                #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    *reinterpret_cast<int32_t*>(
-                        &B8i_lds[nxt][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB[ls];
-                __syncthreads();
-                cur = nxt;
-            }
-            /* Epilogue: last k-block */
-            apply_mfma(&A8i_lds[cur][wm][0][0], &B8i_lds[cur][wn][0][0], C32);
-        }
-
-        /* CRT accumulation for modulus s */
-        crt_update(C32, s);
-    } /* end moduli loop */
-
-    /* ── Finalize: CRT range-reduction + inverse scale + write D ─────────────
-     * ISA-verified output layout (AMD CDNA3, Sec. 7.1.4.2):
-     *   col = lane % TILE
-     *   row = 4*(lane/TILE) + 8*(e/4) + (e%4)   for e = 0..NREG-1
-     * i.e. lane_row_base = m_base + 4*(lane/TILE), then:
-     *   TILE=16, NREG=4 : 8*(e/4)=0 always → ri = lane_row_base + e        ✓
-     *   TILE=32, NREG=16: ri = lane_row_base + 8*(e/4) + (e%4)              ✓ */
-    #pragma unroll
-    for (unsigned e = 0; e < NREG; ++e) {
-        const int ri = lane_row_base + static_cast<int>(8u * (e / 4u) + (e % 4u));
-        const int ci = col_val;
-        if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
-        const double q = rint((Zhi[e] + Zlo[e]) * cInvP);
-        const double X = fma(cP_lo, q, fma(cP_hi, q, Zhi[e]) + Zlo[e]);
-        /* Read scale shifts from LDS (loaded at kernel start) — avoids global reads
-         * after the s-loop has likely evicted sftA/sftB from L1.
-         * ri - block_m_base ∈ [0, WM*TILE) and ci - block_n_base ∈ [0, WN*TILE)
-         * are guaranteed for all non-skipped (ri, ci) pairs.                    */
-        const int inv_sft = -(static_cast<int>(sftA_lds[ri - block_m_base])
-                             + static_cast<int>(sftB_lds[ci - block_n_base]));
-        const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
-        double d_val = alpha * ldexp(X, inv_sft);
-        /* beta is a uniform scalar — the compiler lowers this to a scalar branch
-         * (s_cmp + s_cbranch), skipping the C load for all lanes simultaneously
-         * when beta == 0.  No per-lane divergence.                              */
-        if (beta != 0.0) {
-            const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
-            d_val += beta * C[c_idx];
-        }
-        /* NT store: D is write-only from this kernel's perspective.  Bypassing
-         * L2 prevents D write-allocate RFOs from evicting A8i/B8i lines that
-         * concurrent blocks depend on for cross-n-tile L2 reuse.               */
-        __builtin_nontemporal_store(d_val, D + d_idx);
-    }
-}
-
-/* ── Host-side launcher for the fused TN kernel ─────────────────────────── */
-/* Selects the appropriate macrotile variant based on output aspect ratio:
- *   m ≥ n and (m ≥ 128 or n ≥ 64): WM=4, WN=2, TILE=32 → 128×64 macrotile
- *   m < n and (m ≥ 64 or n ≥ 128): WM=2, WN=4, TILE=32 → 64×128 macrotile
- *   otherwise:                     WM=4, WN=4, TILE=16 → 64×64 macrotile (default)
- */
-static rocblaslt_status
-oz2_launch_fused_TN(const int8_t*  A8i,    /* workspace INT8 A (all S moduli stacked) */
-                    const int8_t*  B8i,    /* workspace INT8 B (all S moduli stacked) */
-                    size_t         lda8i,  /* padded k, leading dim of A8i per modulus */
-                    size_t         cola8i, /* padded m                                 */
-                    size_t         ldb8i,  /* padded k, leading dim of B8i per modulus */
-                    const double*  C,
-                    double*        D,
-                    int64_t m, int64_t n, int64_t k,
-                    int64_t ldc, int64_t ldd,
-                    double alpha, double beta,
-                    const int16_t* sftA, const int16_t* sftB,
-                    unsigned num_moduli, hipStream_t stream)
-{
-    if (oz2_init_constants(num_moduli) != hipSuccess)
-        return rocblaslt_status_internal_error;
-
-    const size_t stride_A_s = lda8i * cola8i;
-    const size_t stride_B_s = ldb8i * static_cast<size_t>(n);
-    const bool   has_lo     = (num_moduli > 7u);
-
-    /* Select macrotile variant based on output shape.
-     * VGPR occupancy check for WM=4,WN=4,TILE=32 (blockDim=1024, 16 wf/block):
-     *   SIMD needs 4 wf → max VGPRs = 512/4 = 128
-     *   Estimated kernel VGPRs ≈ 208 (Zhi[16]+Zlo[16]=64, C32[16]=16, tables+misc)
-     *   4×208 = 832 > 512 → block cannot be scheduled on any CU (CDNA4 ISA §3.6.4)
-     * WM=4,WN=2 and WM=2,WN=4 use blockDim=512 (8 wf, 2 wf/SIMD): 2×192=384≤512 ✓
-     *
-     * gfx950 override: always use TILE=16 (64×64 macrotile) with K_UNROLL=4.
-     * On gfx950, TILE=16/K_UNROLL=4 and TILE=32/K_UNROLL=2 do equal compute per
-     * barrier, but TILE=16/K_UNROLL=4 has 1.7× fewer total barriers (4× fewer k-loop
-     * iterations per block, 2× more blocks → net 1.7× reduction). Measured 2.5× fused
-     * slowdown on MI355 with TILE=32/K_UNROLL=2 makes TILE=16 the better default.     */
-    /* Query current device once; used for both XCC count and gfx950 detection. */
-    int cur_dev = 0;
-    (void)hipGetDevice(&cur_dev);
-
-    /* On gfx950, use TILE=16 (K_UNROLL=4) for all sizes — fewer total barriers. */
-    int is_gfx950 = 0;
-    {
-        int gfx950_chip_id = 0;
-        (void)hipDeviceGetAttribute(&gfx950_chip_id, hipDeviceAttributePciChipId, cur_dev);
-        const uint32_t pci_id = static_cast<uint32_t>(gfx950_chip_id) & 0xFFFFu;
-        is_gfx950 = (pci_id == 0x75a3u || pci_id == 0x75b3u) ? 1 : 0;
-    }
-    const bool use_tile32 = !is_gfx950 && (m >= 64 && n >= 64) && (m >= 128 || n >= 128);
-    const bool use_128x64 = use_tile32 && (m >= n);
-
-    /* Query number of XCCs (Graphics Compute Dies) on the current device.
-     * MI300X and MI350X both have 8 XCCs.  The XCC mapping partitions m_tiles
-     * across XCCs to ensure A8i L2 reuse per-XCC (up to 8× HBM traffic reduction).  */
-    int num_xccs = 1;
-    {
-        (void)hipDeviceGetAttribute(&num_xccs, hipDeviceAttributeNumberOfXccs, cur_dev);
-        if (num_xccs <= 0) num_xccs = 1;
-    }
-
-    /* Compute 1D grid for a given (wm_v, wn_v, tile_v) macrotile.
-     * With XCC mapping, total_blocks = m_tiles_per_xcc × n_tiles × num_xccs.
-     * The kernel maps blockIdx.x → (XCC, intra-XCC tile) → (m_tile, n_tile).  */
-    auto make_grid = [&](unsigned wm_v, unsigned wn_v, unsigned tile_v) -> dim3 {
-        const int mt = static_cast<int>(
-            (m + static_cast<int64_t>(wm_v * tile_v) - 1) / static_cast<int64_t>(wm_v * tile_v));
-        const int nt = static_cast<int>(
-            (n + static_cast<int64_t>(wn_v * tile_v) - 1) / static_cast<int64_t>(wn_v * tile_v));
-        const int m_per_xcc    = (mt + num_xccs - 1) / num_xccs;
-        const int total_blocks = m_per_xcc * nt * num_xccs;
-        return dim3(static_cast<unsigned>(total_blocks), 1u);
-    };
-
-#define OZ2_FUSED_LAUNCH(S_V, HL, WM_V, WN_V, TILE_V) \
-    hipLaunchKernelGGL((oz2_fused_TN_kernel<(S_V),(HL),(WM_V),(WN_V),(TILE_V)>), \
-                       make_grid((WM_V),(WN_V),(TILE_V)), \
-                       dim3((WM_V)*(WN_V)*64u), 0, stream, \
-                       A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i, \
-                       C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, \
-                       num_xccs)
-
-#define OZ2_DISPATCH_SHAPE(S_V) \
-    do { \
-        if (use_tile32) { \
-            if (use_128x64) { \
-                if (has_lo) OZ2_FUSED_LAUNCH((S_V), true,  4u, 2u, 32u); \
-                else        OZ2_FUSED_LAUNCH((S_V), false, 4u, 2u, 32u); \
-            } else { \
-                if (has_lo) OZ2_FUSED_LAUNCH((S_V), true,  2u, 4u, 32u); \
-                else        OZ2_FUSED_LAUNCH((S_V), false, 2u, 4u, 32u); \
-            } \
-        } else { \
-            if (has_lo) OZ2_FUSED_LAUNCH((S_V), true,  4u, 4u, 16u); \
-            else        OZ2_FUSED_LAUNCH((S_V), false, 4u, 4u, 16u); \
-        } \
-    } while(0)
-
-    switch (num_moduli) {
-        case  2: OZ2_DISPATCH_SHAPE( 2); break;
-        case  3: OZ2_DISPATCH_SHAPE( 3); break;
-        case  4: OZ2_DISPATCH_SHAPE( 4); break;
-        case  5: OZ2_DISPATCH_SHAPE( 5); break;
-        case  6: OZ2_DISPATCH_SHAPE( 6); break;
-        case  7: OZ2_DISPATCH_SHAPE( 7); break;
-        case  8: OZ2_DISPATCH_SHAPE( 8); break;
-        case  9: OZ2_DISPATCH_SHAPE( 9); break;
-        case 10: OZ2_DISPATCH_SHAPE(10); break;
-        case 11: OZ2_DISPATCH_SHAPE(11); break;
-        case 12: OZ2_DISPATCH_SHAPE(12); break;
-        case 13: OZ2_DISPATCH_SHAPE(13); break;
-        case 14: OZ2_DISPATCH_SHAPE(14); break;
-        case 15: OZ2_DISPATCH_SHAPE(15); break;
-        case 16: OZ2_DISPATCH_SHAPE(16); break;
-        case 17: OZ2_DISPATCH_SHAPE(17); break;
-        case 18: OZ2_DISPATCH_SHAPE(18); break;
-        default: return rocblaslt_status_invalid_value;
-    }
-
-#undef OZ2_DISPATCH_SHAPE
-#undef OZ2_FUSED_LAUNCH
-
-    return rocblaslt_status_success;
 }
 
 static const char* oz2_profile_file()
@@ -2748,11 +1901,14 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
         return rocblaslt_status_invalid_value;
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
+<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation.cpp
     if(settings.dynamic_mode)
         fp64EmulationWarnDynamicTemporary();
     if(oz2_init_constants(num_moduli) != hipSuccess)
         return rocblaslt_status_internal_error;
 
+=======
+>>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/fp64_emulation.cpp
     {
         const unsigned chunk_sz = oz2_compute_chunk_size(m, n, k, num_moduli);
         const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
@@ -3076,11 +2232,7 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
         }
 
         if(effective_s != num_moduli) {
-            if(oz2_init_constants(effective_s) != hipSuccess) {
-                oz2_cleanup();
-                return rocblaslt_status_internal_error;
             }
-        }
     }
 
     /* Apply shift-refinement delta using the correct log2P for effective_s.
@@ -3263,8 +2415,8 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
         const bool is_last  = (chunk_start + actual >= effective_s);
         const bool has_lo   = (effective_s > 7u);
         _pstart();
-#define OZ2_FARGS C32i_batch, Zhi, Zlo, C, D, m, n, ldc32i, ldc, ldd, *alpha, *beta, sftA, sftB, chunk_start
-#define OZ2_AARGS C32i_batch, Zhi, Zlo, m, n, ldc32i, chunk_start
+#define OZ2_FARGS C32i_batch, Zhi, Zlo, C, D, m, n, ldc32i, ldc, ldd, *alpha, *beta, sftA, sftB, chunk_start, effective_s
+#define OZ2_AARGS C32i_batch, Zhi, Zlo, m, n, ldc32i, chunk_start, effective_s
 #define OZ2_FINALIZE(HL, CS) \
         do { if(is_first) hipLaunchKernelGGL((oz2_accum_finalize_kernel<(HL),(CS),true>),  grid_acc, blk_acc, 0, stream, OZ2_FARGS); \
              else         hipLaunchKernelGGL((oz2_accum_finalize_kernel<(HL),(CS),false>), grid_acc, blk_acc, 0, stream, OZ2_FARGS); } while(0)

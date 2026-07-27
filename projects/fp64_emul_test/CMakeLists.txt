@@ -16,10 +16,11 @@
 cmake_minimum_required(VERSION 3.25)
 
 # HIP must be listed in LANGUAGES so CMake sets up CMAKE_HIP_* variables
-# and GPU architecture detection.  GPU arch defaults to gfx942 (MI300X) but
-# can be overridden via -DCMAKE_HIP_ARCHITECTURES=gfx...
+# and GPU architecture detection.  Default includes both MI300X and MI350 so
+# fused_kernel_tune runs on either device without a rebuild.
+# Override with -DCMAKE_HIP_ARCHITECTURES=gfx942 or gfx950 if desired.
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-    set(CMAKE_HIP_ARCHITECTURES "gfx942" CACHE STRING "HIP GPU architectures")
+    set(CMAKE_HIP_ARCHITECTURES "gfx942;gfx950" CACHE STRING "HIP GPU architectures")
 endif()
 
 project(fp64_emul_accuracy LANGUAGES CXX HIP)
@@ -154,5 +155,37 @@ target_include_directories(fp64_emul_correctness
 target_compile_features(fp64_emul_correctness PRIVATE cxx_std_17)
 
 set_target_properties(fp64_emul_correctness PROPERTIES
+    BUILD_RPATH  "${HIPBLASLT_BUILD_DIR}/library"
+    INSTALL_RPATH "${HIPBLASLT_BUILD_DIR}/library")
+
+# ── fused_kernel_tune ────────────────────────────────────────────────────────
+# Sweeps 11 fused MFMA+CRT kernel configurations across three GEMM shapes
+# (M,N>>K; M,K>>N; N,K>>M), reports correctness and GFLOP/s for each.
+# Builds for both gfx942 (MI300X) and gfx950 (MI350) by default.
+#
+# Build:
+#   cmake -B build -DCMAKE_HIP_ARCHITECTURES="gfx942;gfx950" \
+#         -DHIPBLASLT_BUILD_DIR=../hipblaslt/build/release
+#   cmake --build build -j32 --target fused_kernel_tune
+# Run:
+#   ./build/fused_kernel_tune [--warmup N] [--iters N]
+add_executable(fused_kernel_tune src/fused_kernel_tune.cpp)
+set_source_files_properties(src/fused_kernel_tune.cpp PROPERTIES LANGUAGE HIP)
+target_link_libraries(fused_kernel_tune PRIVATE hipblaslt_bt hip::device)
+target_include_directories(fused_kernel_tune PRIVATE "/opt/rocm/include")
+target_compile_features(fused_kernel_tune PRIVATE cxx_std_17)
+set_target_properties(fused_kernel_tune PROPERTIES
+    BUILD_RPATH  "${HIPBLASLT_BUILD_DIR}/library"
+    INSTALL_RPATH "${HIPBLASLT_BUILD_DIR}/library")
+
+# ── fused_prof — minimal single-shape profiling harness ──────────────────────
+# Single warmup + 1 kernel launch for rocprof counter collection.
+# Usage: OZ2_FUSED_SHAPE_OVERRIDE="4 4 1 1 16" rocprof ... ./build/fused_prof
+add_executable(fused_prof src/fused_prof.cpp)
+set_source_files_properties(src/fused_prof.cpp PROPERTIES LANGUAGE HIP)
+target_link_libraries(fused_prof PRIVATE hipblaslt_bt hip::device)
+target_include_directories(fused_prof PRIVATE "/opt/rocm/include")
+target_compile_features(fused_prof PRIVATE cxx_std_17)
+set_target_properties(fused_prof PROPERTIES
     BUILD_RPATH  "${HIPBLASLT_BUILD_DIR}/library"
     INSTALL_RPATH "${HIPBLASLT_BUILD_DIR}/library")
