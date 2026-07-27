@@ -266,9 +266,9 @@ static const Shape SHAPES[] = {
     // { 4096,  256, 4096, "tall     (M,K>>N)" },
     // {  256, 4096, 4096, "wide     (N,K>>M)" },
 
-    { 32768, 32768,  32768, "large_sq (M,N>>K)" },
-    //{ 32768,  256, 32768, "tall     (M,K>>N)" },
-    //{  256, 32768, 32768, "wide     (N,K>>M)" },
+    { 32768, 32768,  1024, "large_sq (M,N>>K)" },
+    { 32768,  256, 32768, "tall     (M,K>>N)" },
+    {  256, 32768, 32768, "wide     (N,K>>M)" },
 };
 static const int NUM_SHAPES = static_cast<int>(sizeof(SHAPES) / sizeof(SHAPES[0]));
 
