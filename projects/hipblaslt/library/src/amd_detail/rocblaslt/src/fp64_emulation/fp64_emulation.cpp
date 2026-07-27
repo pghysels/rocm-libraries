@@ -661,7 +661,14 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
      * (m, n) workspace, which is larger than max(WS(half), WS(half)), resulting in
      * the workspace being under-allocated and a buffer overflow at runtime.           */
     const unsigned split_num_moduli = fp64EmulationEffectiveNumModuli(h);
-    const unsigned chunk_sz = oz2_compute_chunk_size(m, n, k, split_num_moduli);
+    /* When the fused kernel is forced (HIPBLASLT_EMULATION_FUSED=on/force), use the
+     * fused chunk formula (excludes C32i from workspace budget).  This eliminates
+     * binary-halving for all practical shapes, avoiding per-leaf pipeline overhead.
+     * Consistent with the split decision in fp64EmulatedGemmImpl.              */
+    const bool fused_on_ws = (oz2_fused_mode() == Oz2FusedMode::ON);
+    const unsigned chunk_sz = fused_on_ws
+        ? oz2_compute_chunk_size_fused(m, n, k, split_num_moduli)
+        : oz2_compute_chunk_size(m, n, k, split_num_moduli);
     const unsigned n_chunks = (split_num_moduli + chunk_sz - 1u) / chunk_sz;
 
     if(n_chunks > 1u) {
@@ -690,15 +697,25 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
     const size_t ldc32i = cola8i;
     const size_t padn   = oz2_pad(static_cast<size_t>(n));
     const size_t szC32i = ldc32i * static_cast<size_t>(n);
-    const unsigned chunk_ws = oz2_compute_chunk_size(m, n, k, num_moduli);
+    /* Fused path: no C32i workspace needed for production (registers hold it).
+     * Non-fused path: standard chunk formula (includes C32i in budget).        */
+    const unsigned chunk_ws = fused_on_ws
+        ? oz2_compute_chunk_size_fused(m, n, k, num_moduli)
+        : oz2_compute_chunk_size(m, n, k, num_moduli);
 
     /* Zhi/Zlo accumulators are only needed when there are multiple passes
      * (chunk_ws < num_moduli).  Single-pass finalize writes D directly.  */
     const size_t szZhi_ws = (chunk_ws < num_moduli) ? szC32i : 0u;
 
+    /* C32i production slots:
+     *   Fused path: C32i is accumulated in registers — only 1 slot needed for
+     *               the preliminary GEMM result.
+     *   Non-fused:  chunk_ws slots for the batched INT8 GEMMs.                */
+    const size_t n_c32i_ws = fused_on_ws ? 1u : static_cast<size_t>(chunk_ws);
+
     return   chunk_ws * lda8i * cola8i * sizeof(int8_t)
            + chunk_ws * ldb8i * static_cast<size_t>(n) * sizeof(int8_t)
-           + chunk_ws * szC32i * sizeof(int32_t)
+           + n_c32i_ws * szC32i * sizeof(int32_t)
            + szZhi_ws * sizeof(double) * 2
            + cola8i * sizeof(int16_t)
            + padn   * sizeof(int16_t)
@@ -1916,7 +1933,15 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
     const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= OZ2_S_MAX)
                                     ? settings.num_moduli : fp64EmulationNumModuli();
     {
-        const unsigned chunk_sz = oz2_compute_chunk_size(m, n, k, num_moduli);
+        /* When fused mode is active (HIPBLASLT_EMULATION_FUSED=on/force), use the
+         * fused chunk formula (no C32i in workspace budget): chunk_size = S for all
+         * practical shapes → n_chunks = 1 → no binary-halving split.
+         * Eliminates per-leaf pipeline overhead that caused uniform ~42 TFLOP/s for
+         * all macrotile configs on small-K shapes (shape1: M=N=32768, K=1024).  */
+        const bool fused_forced = (oz2_fused_mode() == Oz2FusedMode::ON);
+        const unsigned chunk_sz = fused_forced
+            ? oz2_compute_chunk_size_fused(m, n, k, num_moduli)
+            : oz2_compute_chunk_size(m, n, k, num_moduli);
         const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
 
         if(n_chunks > 1u) {
@@ -1988,14 +2013,21 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
         }
     };
 
-    /* In dynamic (ADP) mode the workspace was allocated for OZ2_S_MAX=18 moduli,
-     * so use OZ2_S_MAX for the chunk-size calculation.  This ensures:
-     *  - layout_moduli ≥ effective_s for any ADP-chosen effective_s
-     *  - chunk_size ≥ effective_s, so all moduli are processed in a single
-     *    scale pass + single GEMM pass regardless of effective_s (no 16+2 split)
-     *  - buffer layout is consistent with the workspace allocation             */
-    const unsigned layout_moduli = settings.dynamic_mode ? OZ2_S_MAX : num_moduli;
-    const unsigned chunk_size    = oz2_compute_chunk_size(m, n, k, layout_moduli);
+    /* Fused-forced path (HIPBLASLT_EMULATION_FUSED=on/force):
+     *   Use the fused chunk formula (no C32i in budget) → chunk_size = num_moduli
+     *   for all practical shapes → fused_single_pass = true → always fused.
+     *   C32i workspace holds only 1 slot (prelim GEMM); production C32i is in
+     *   registers.  Workspace layout is consistent with fp64EmulationWorkspaceSize.
+     * Non-fused / auto path:
+     *   In dynamic (ADP) mode use OZ2_S_MAX to ensure layout covers all effective_s.
+     *   Standard oz2_compute_chunk_size (includes C32i in budget).             */
+    const bool fused_forced = (oz2_fused_mode() == Oz2FusedMode::ON);
+    const unsigned layout_moduli = fused_forced
+        ? num_moduli
+        : (settings.dynamic_mode ? OZ2_S_MAX : num_moduli);
+    const unsigned chunk_size = fused_forced
+        ? oz2_compute_chunk_size_fused(m, n, k, layout_moduli)
+        : oz2_compute_chunk_size(m, n, k, layout_moduli);
 
     const size_t lda8i  = oz2_pad(static_cast<size_t>(k));
     const size_t cola8i = oz2_pad(static_cast<size_t>(m));
@@ -2009,6 +2041,10 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
     /* Zhi/Zlo needed when there are multiple passes (chunk_size < layout_moduli). */
     const size_t szZhi   = (chunk_size < layout_moduli) ? szC32i : 0u;
     const size_t szZlo   = szZhi;
+    /* C32i production slots:
+     *   Fused: C32i accumulated in registers — only 1 slot needed (prelim GEMM).
+     *   Non-fused: chunk_size slots for the batched INT8 GEMMs.               */
+    const size_t n_c32i_slots = fused_forced ? 1u : static_cast<size_t>(chunk_size);
     const size_t szSftA  = cola8i;
     const size_t szSftB  = padn;
     const size_t szNanFlag = 1;
@@ -2038,7 +2074,7 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
     int8_t*   const A8i        = reinterpret_cast<int8_t*>(ws);
     int8_t*   const B8i        = A8i + szA8i;
     int32_t*  const C32i_batch = reinterpret_cast<int32_t*>(B8i + szB8i);
-    double*   const Zhi        = reinterpret_cast<double*>(C32i_batch + chunk_size * szC32i);
+    double*   const Zhi        = reinterpret_cast<double*>(C32i_batch + n_c32i_slots * szC32i);
     double*   const Zlo        = Zhi + szZhi;
     int16_t*  const sftA       = reinterpret_cast<int16_t*>(Zlo + szZlo);
     int16_t*  const sftB       = sftA + szSftA;

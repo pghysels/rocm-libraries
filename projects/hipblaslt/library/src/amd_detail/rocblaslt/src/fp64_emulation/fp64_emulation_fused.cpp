@@ -669,20 +669,22 @@ oz2_fused_TN_kernel(
 }
 
 /* =========================================================================
- * oz2_fused_mode — cached env-var reader
+ * oz2_fused_mode — env-var reader (re-read each call, not cached)
+ *
+ * Not cached so that callers can change HIPBLASLT_EMULATION_FUSED at
+ * runtime (e.g. between the split-decision check and the monolithic GEMM
+ * launch) and still observe the correct mode.  The overhead is a single
+ * getenv() call per GEMM invocation — negligible vs hundreds-of-ms GEMMs.
  * ========================================================================= */
 Oz2FusedMode oz2_fused_mode()
 {
-    static const Oz2FusedMode v = []() -> Oz2FusedMode {
-        const char* e = std::getenv("HIPBLASLT_EMULATION_FUSED");
-        if(e == nullptr) return Oz2FusedMode::OFF;   /* disabled by default */
-        if(std::strcmp(e, "on") == 0 || std::strcmp(e, "force") == 0)
-            return Oz2FusedMode::ON;
-        if(std::strcmp(e, "off") == 0 || std::strcmp(e, "never") == 0)
-            return Oz2FusedMode::OFF;
-        return Oz2FusedMode::AUTO;   /* "auto", "performant", or unrecognized */
-    }();
-    return v;
+    const char* e = std::getenv("HIPBLASLT_EMULATION_FUSED");
+    if(e == nullptr) return Oz2FusedMode::OFF;   /* disabled by default */
+    if(std::strcmp(e, "on") == 0 || std::strcmp(e, "force") == 0)
+        return Oz2FusedMode::ON;
+    if(std::strcmp(e, "off") == 0 || std::strcmp(e, "never") == 0)
+        return Oz2FusedMode::OFF;
+    return Oz2FusedMode::AUTO;   /* "auto", "performant", or unrecognized */
 }
 
 /* =========================================================================
