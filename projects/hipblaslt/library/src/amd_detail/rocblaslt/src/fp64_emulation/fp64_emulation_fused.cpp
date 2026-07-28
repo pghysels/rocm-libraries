@@ -268,11 +268,6 @@ oz2_fused_TN_kernel(
                                 / static_cast<int>(WM * WaveM * TILE);
     const int n_tiles_total   = (static_cast<int>(n) + static_cast<int>(WN * WaveN * TILE) - 1)
                                 / static_cast<int>(WN * WaveN * TILE);
-    const int m_tiles_per_xcc = (m_tiles_total + num_xccs - 1) / num_xccs;
-    const int tiles_per_xcc   = m_tiles_per_xcc * n_tiles_total;
-
-    const int swizzle_eff = (SWIZZLE_B8i_PREF > m_tiles_per_xcc) ? m_tiles_per_xcc : SWIZZLE_B8i_PREF;
-
     uint32_t hw_xcc_id = 0u;
     asm volatile("s_getreg_b32 %0, hwreg(20)" : "=s"(hw_xcc_id));
 
@@ -280,15 +275,32 @@ oz2_fused_TN_kernel(
     const int xcc_id       = static_cast<int>(hw_xcc_id);
     const int intra_xcc    = linear_block / num_xccs;
 
-    if (intra_xcc >= tiles_per_xcc) return;
-
-    const int swizzle_group = intra_xcc / swizzle_eff;
-    const int m_local       = intra_xcc % swizzle_eff;
-    const int n_tile        = swizzle_group % n_tiles_total;
-    const int m_group       = swizzle_group / n_tiles_total;
-    const int m_tile        = xcc_id * m_tiles_per_xcc + m_group * swizzle_eff + m_local;
-
-    if (m_tile >= m_tiles_total) return;
+    int m_tile, n_tile;
+    if (n <= static_cast<int64_t>(m)) {
+        /* Tall / square: swizzle M — B8i L2 reuse (groups of swizzle_eff M-tiles
+         * share the same N-range, keeping B8i hot in L2).                      */
+        const int m_tiles_per_xcc = (m_tiles_total + num_xccs - 1) / num_xccs;
+        const int swizzle_eff     = (SWIZZLE_B8i_PREF < m_tiles_per_xcc) ? SWIZZLE_B8i_PREF : m_tiles_per_xcc;
+        const int tiles_per_xcc   = m_tiles_per_xcc * n_tiles_total;
+        if (intra_xcc >= tiles_per_xcc) return;
+        const int swizzle_group = intra_xcc / swizzle_eff;
+        const int m_local       = intra_xcc % swizzle_eff;
+        n_tile = swizzle_group % n_tiles_total;
+        m_tile = xcc_id * m_tiles_per_xcc + (swizzle_group / n_tiles_total) * swizzle_eff + m_local;
+        if (m_tile >= m_tiles_total) return;
+    } else {
+        /* Wide: swizzle N — A8i L2 reuse (groups of swizzle_eff N-tiles
+         * share the same M-range, keeping A8i hot in L2).                      */
+        const int n_tiles_per_xcc = (n_tiles_total + num_xccs - 1) / num_xccs;
+        const int swizzle_eff     = (SWIZZLE_B8i_PREF < n_tiles_per_xcc) ? SWIZZLE_B8i_PREF : n_tiles_per_xcc;
+        const int tiles_per_xcc   = m_tiles_total * n_tiles_per_xcc;
+        if (intra_xcc >= tiles_per_xcc) return;
+        const int swizzle_group = intra_xcc / swizzle_eff;
+        const int n_local       = intra_xcc % swizzle_eff;
+        m_tile = swizzle_group % m_tiles_total;
+        n_tile = xcc_id * n_tiles_per_xcc + (swizzle_group / m_tiles_total) * swizzle_eff + n_local;
+        if (n_tile >= n_tiles_total) return;
+    }
 
     const int block_m_base = m_tile * static_cast<int>(WM * WaveM * TILE);
     const int block_n_base = n_tile * static_cast<int>(WN * WaveN * TILE);
@@ -784,8 +796,16 @@ rocblaslt_status oz2_launch_fused_TN(
         const int nt = static_cast<int>(
             (n + static_cast<int64_t>(wn_v * wn_wave_v * tile_v) - 1)
             / static_cast<int64_t>(wn_v * wn_wave_v * tile_v));
-        const int m_per_xcc    = (mt + num_xccs - 1) / num_xccs;
-        const int total_blocks = m_per_xcc * nt * num_xccs;
+        /* Match the kernel's swizzle dimension: M for tall/square, N for wide.
+         * This ensures no excess idle blocks are launched.                      */
+        int total_blocks;
+        if (n <= m) {
+            const int m_per_xcc = (mt + num_xccs - 1) / num_xccs;
+            total_blocks = m_per_xcc * nt * num_xccs;
+        } else {
+            const int n_per_xcc = (nt + num_xccs - 1) / num_xccs;
+            total_blocks = mt * n_per_xcc * num_xccs;
+        }
         return dim3(static_cast<unsigned>(total_blocks), 1u);
     };
 
