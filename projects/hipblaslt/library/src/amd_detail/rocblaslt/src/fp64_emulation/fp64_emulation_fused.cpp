@@ -376,13 +376,11 @@ oz2_fused_TN_kernel(
     /* ── Cooperative load of sftA/sftB into LDS ────────────────────────────── */
     /* Loop-stride pattern so any BLK_THR covers all entries, even when
      * BLK_THR < (WM*WaveM + WN*WaveN)*TILE (e.g., WM=WN=1, WaveM=WaveN=4). */
-    for (unsigned si = static_cast<unsigned>(threadIdx.x);
-         si < WM * WaveM * TILE; si += BLK_THR) {
+    for (unsigned si = threadIdx.x; si < WM * WaveM * TILE; si += BLK_THR) {
         const int mi = block_m_base + static_cast<int>(si);
         sftA_lds[si] = (mi < static_cast<int>(m)) ? sftA[mi] : 0;
     }
-    for (unsigned si = static_cast<unsigned>(threadIdx.x);
-         si < WN * WaveN * TILE; si += BLK_THR) {
+    for (unsigned si = threadIdx.x; si < WN * WaveN * TILE; si += BLK_THR) {
         const int ni = block_n_base + static_cast<int>(si);
         sftB_lds[si] = (ni < static_cast<int>(n)) ? sftB[ni] : 0;
     }
@@ -791,11 +789,9 @@ rocblaslt_status oz2_launch_fused_TN(
     auto make_grid = [&](unsigned wm_v, unsigned wn_v, unsigned tile_v,
                          unsigned wm_wave_v = 1u, unsigned wn_wave_v = 1u) -> dim3 {
         const int mt = static_cast<int>(
-            (m + static_cast<int64_t>(wm_v * wm_wave_v * tile_v) - 1)
-            / static_cast<int64_t>(wm_v * wm_wave_v * tile_v));
+            (m + wm_v * wm_wave_v * tile_v - 1) / (wm_v * wm_wave_v * tile_v));
         const int nt = static_cast<int>(
-            (n + static_cast<int64_t>(wn_v * wn_wave_v * tile_v) - 1)
-            / static_cast<int64_t>(wn_v * wn_wave_v * tile_v));
+            (n + wn_v * wn_wave_v * tile_v - 1) / (wn_v * wn_wave_v * tile_v));
         /* Match the kernel's swizzle dimension: M for tall/square, N for wide.
          * This ensures no excess idle blocks are launched.                      */
         int total_blocks;
@@ -1012,21 +1008,25 @@ rocblaslt_status oz2_launch_fused_TN(
 
 #define OZ2_DISPATCH_SHAPE(S_V) \
     do { \
-        /* Shape heuristic (MI300X gfx942, S=16; measurements with full workspace \
-         *   pre-allocated — eliminating hipMalloc overhead from timing):         \
-         *   Tall (m >= 4n): WM4WN4Wm4Wn2T16 KU=1 — 256×128 tile, 16219 GFLOP/s.\
-         *     256×128 gives n_tiles=2 for N=256; large WaveM amortizes per-block \
-         *     overhead; KU=1 reduces per-barrier KBLK_LOAD for large K.          \
-         *   Wide (n >= 4m): WM2WN4Wm1Wn2T16 KU=2 — 32×128 (TILE=16), 10734 G/s.\
-         *     WaveN=2, KU=2 with TILE=16 beats TILE=32 by 3.3% on gfx942.       \
-         *   Square: WM4WN4Wm1Wn2T16 KU=4 — 64×128 tile, 24771 GFLOP/s.         \
-         *     Slightly better than 128×64 (24233) for square with small K.       */ \
-        if (m >= n * static_cast<int64_t>(4)) { \
-            _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,false);  /* WM4WN4Wm4Wn2T16: 256×128 macrotile, K_UNROLL=1 */ \
-        } else if (n >= m * static_cast<int64_t>(4)) { \
-            _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,2u,false);  /* WM2WN4Wm1Wn2T16: 32×128 (TILE=16), K_UNROLL=2 */ \
+        /* Shape heuristic — two architectures, one macro.                        \
+         *                                                                        \
+         * gfx942 (MI300X): WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) is best across  \
+         *   all shapes (directional M/N-swizzle for tall/wide L2 reuse):        \
+         *   square K=32768: 31878 GFLOP/s   square K=1024: 27381 GFLOP/s       \
+         *   tall M>>N:      15633 GFLOP/s   wide N>>M:     14812 GFLOP/s       \
+         *                                                                        \
+         * gfx950 (MI355X): same 128×128 KU=2 is best for small-K / tall / wide.\
+         *   But for large symmetric shapes (M,N,K ≥ 8192) the 256×256 KU=1     \
+         *   config is +23% better:                                               \
+         *   square K=32768: 76472 GFLOP/s (256×256) vs 61999 (128×128)         \
+         *   square K=1024:  best with 128×128 (256×256 gives only 8436)         \
+         *   tall / wide:    best with 128×128                                    \
+         * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256,       \
+         * keeping all CUs occupied.                                              */ \
+        if (is_gfx950 && m >= 8192 && n >= 8192 && k >= 8192) { \
+            _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1 */ \
         } else { \
-            _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,4u,false);  /* WM4WN4Wm1Wn2T16: 64×128 macrotile, K_UNROLL=4 */ \
+            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 */ \
         } \
     } while(0)
 
