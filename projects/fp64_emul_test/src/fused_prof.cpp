@@ -37,8 +37,13 @@
 int main(int argc, char** argv)
 {
     int warmup = 2;
-    for (int i = 1; i < argc; ++i)
+    int64_t M = 32768, N = 32768, K = 32768;
+    for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--warmup") && i+1 < argc) warmup = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--m") && i+1 < argc) M = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "--n") && i+1 < argc) N = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "--k") && i+1 < argc) K = std::atoll(argv[++i]);
+    }
 
     /* Mandatory env vars */
     setenv("HIPBLASLT_EMULATE_DOUBLE_PRECISION", "1", 1);
@@ -47,8 +52,6 @@ int main(int argc, char** argv)
     const char* cfg = std::getenv("OZ2_FUSED_SHAPE_OVERRIDE");
     std::fprintf(stderr, "OZ2_FUSED_SHAPE_OVERRIDE=%s\n", cfg ? cfg : "(not set, using launcher default)");
 
-    /* Shape: cube — M=N=K */
-    const int64_t M = 32768, N = 32768, K = 32768;
     std::fprintf(stderr, "Shape: M=%ld N=%ld K=%ld  warmup=%d  profiled_iters=1\n",
                  (long)M, (long)N, (long)K, warmup);
 

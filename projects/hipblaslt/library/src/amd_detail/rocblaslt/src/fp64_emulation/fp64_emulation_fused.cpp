@@ -1042,19 +1042,19 @@ rocblaslt_status oz2_launch_fused_TN(
                     num_moduli);
                 std::abort();
             }
-            /* Dispatch WM4WN4Wm1Wn2T16ku4 (square heuristic) with NO_CRT=true.
-             * WaveN=2, KU=4 matches the production kernel for large square shapes
-             * so that OZ2_NO_CRT=1 isolates MFMA overhead for exactly that config. */
+            /* Dispatch production WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) with NO_CRT=true.
+             * This is identical to the normal production dispatch except NO_CRT=true,
+             * so OZ2_NO_CRT=1 isolates pure MFMA+prefetch overhead for that exact config. */
             if (has_lo)
                 hipLaunchKernelGGL(
-                    (oz2_fused_TN_kernel<16u, true,  4u, 4u, 16u, 1u, 2u, 4u, false, true>),
-                    make_grid(4u, 4u, 16u, 1u, 2u), dim3(4u * 4u * 64u), 0, stream,
+                    (oz2_fused_TN_kernel<16u, true,  4u, 4u, 16u, 2u, 2u, 2u, false, true>),
+                    make_grid(4u, 4u, 16u, 2u, 2u), dim3(4u * 4u * 64u), 0, stream,
                     A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i,
                     C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, num_xccs);
             else
                 hipLaunchKernelGGL(
-                    (oz2_fused_TN_kernel<16u, false, 4u, 4u, 16u, 1u, 2u, 4u, false, true>),
-                    make_grid(4u, 4u, 16u, 1u, 2u), dim3(4u * 4u * 64u), 0, stream,
+                    (oz2_fused_TN_kernel<16u, false, 4u, 4u, 16u, 2u, 2u, 2u, false, true>),
+                    make_grid(4u, 4u, 16u, 2u, 2u), dim3(4u * 4u * 64u), 0, stream,
                     A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i,
                     C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, num_xccs);
             return rocblaslt_status_success;
