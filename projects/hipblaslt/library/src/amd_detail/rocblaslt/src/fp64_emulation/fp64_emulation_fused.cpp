@@ -376,15 +376,19 @@ oz2_fused_TN_kernel(
     }
 
     /* ── Pre-fetch modulus s=0 prologue into registers ─────────────────────── */
-    int32_t rA_pro[A_STEPS_SAFE] = {};
-    int32_t rB_pro[B_STEPS_SAFE] = {};
+    /* rA/rB serve dual purpose: K-loop double-buffer AND cross-modulus prologue.
+     * Declaring at kernel scope (outside both S-loop and K-loop) lets the compiler
+     * allocate them once, saving A_STEPS+B_STEPS VGPRs vs the old rA_pro/rB_pro
+     * design where both were simultaneously live during the K-loop.            */
+    int32_t rA[A_STEPS_SAFE] = {};
+    int32_t rB[B_STEPS_SAFE] = {};
     if (k_int > 0) {
         #pragma unroll
         for (unsigned ls = 0; ls < A_STEPS; ++ls)
-            rA_pro[ls] = cond_load_a(A8i, ls, k4_A[ls] * 4);
+            rA[ls] = cond_load_a(A8i, ls, k4_A[ls] * 4);
         #pragma unroll
         for (unsigned ls = 0; ls < B_STEPS; ++ls)
-            rB_pro[ls] = cond_load_b(B8i, ls, k4_B[ls] * 4);
+            rB[ls] = cond_load_b(B8i, ls, k4_B[ls] * 4);
     }
     if constexpr (!VALID_CONFIG) return; /* no-op on wrong arch */
     __syncthreads();
@@ -450,19 +454,12 @@ oz2_fused_TN_kernel(
 
             #pragma unroll
             for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                *reinterpret_cast<int32_t*>(&A8i_lds[0][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA_pro[ls];
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA[ls];
             #pragma unroll
             for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                *reinterpret_cast<int32_t*>(&B8i_lds[0][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB_pro[ls];
-
-            if (s + 1 < S) {
-                #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    rA_pro[ls] = cond_load_a(A8i + static_cast<size_t>(s + 1) * stride_A_s, ls, k4_A[ls] * 4);
-                #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    rB_pro[ls] = cond_load_b(B8i + static_cast<size_t>(s + 1) * stride_B_s, ls, k4_B[ls] * 4);
-            }
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB[ls];
+            /* Cross-modulus prologue prefetch moved to after the last MFMA (below),
+             * where rA/rB are dead and CRT provides latency-hiding compute.    */
 
             __syncthreads();
 
@@ -477,7 +474,7 @@ oz2_fused_TN_kernel(
                 B_base[ls] = B8i_s + static_cast<size_t>(ni_B[ls]) * ldb8i
                            + static_cast<size_t>(k4_B[ls]) * 4u;
 
-            int32_t rA[A_STEPS_SAFE], rB[B_STEPS_SAFE];
+            /* rA/rB from outer scope used here for K-block double buffering. */
             int cur = 0;
 
             for (int k_off = 0; k_off + static_cast<int>(KBLK_LOAD) < k_int;
@@ -503,6 +500,19 @@ oz2_fused_TN_kernel(
                 cur = nxt;
             }
             apply_mfma(&A8i_lds[cur][wm * WaveM][0][0], &B8i_lds[cur][wn * WaveN][0][0], C32);
+
+            /* After the last MFMA, rA/rB are dead (last K-block written to LDS).
+             * Reuse them to preload the next modulus's first K-block from HBM.
+             * The global loads overlap with the CRT FP64 work below, hiding
+             * KBLK_LOAD = K_UNROLL × KBLK bytes of latency per A and B.      */
+            if (s + 1 < S) {
+                #pragma unroll
+                for (unsigned ls = 0; ls < A_STEPS; ++ls)
+                    rA[ls] = cond_load_a(A8i + static_cast<size_t>(s + 1) * stride_A_s, ls, k4_A[ls] * 4);
+                #pragma unroll
+                for (unsigned ls = 0; ls < B_STEPS; ++ls)
+                    rB[ls] = cond_load_b(B8i + static_cast<size_t>(s + 1) * stride_B_s, ls, k4_B[ls] * 4);
+            }
         }
 
         /* ── CRT update ── (skipped when NO_CRT=true for MFMA-isolation experiment) */
