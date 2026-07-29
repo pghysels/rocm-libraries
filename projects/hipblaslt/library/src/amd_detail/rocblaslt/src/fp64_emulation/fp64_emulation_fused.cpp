@@ -211,14 +211,17 @@ oz2_fused_TN_kernel(
     static constexpr unsigned KBLK_PAD_UNIT = (K_A_BYTES == 16u) ? 8u : K_A_BYTES;
     static constexpr size_t   LDS_BYTES_OLD = 2u * (WM * WaveM * TILE * KBLK_LOAD
                                                    + WN * WaveN * TILE * KBLK_LOAD);
-    /* DTL requires a flat, unpadded LDS tile so that each wave's 64
-     * global_load_lds writes land in 64 CONTIGUOUS LDS dwords (the builtin
-     * writes lane L -> base + L*4 from a wave-uniform base).  With KBLK_PAD=0
-     * the cooperative-load LDS byte offset equals exactly 4*flat, which is
-     * wave-contiguous.  The register path keeps its bank-conflict padding.   */
-    static constexpr unsigned KBLK_PAD    = USE_DTL ? 0u
-                                          : ((LDS_BYTES_OLD + KBLK_PAD_UNIT * TILE * (WM * WaveM + WN * WaveN) * 2u
-                                             <= LDS_BUDGET) ? KBLK_PAD_UNIT : 0u);
+    /* Both paths use the SAME padded LDS stride (KBLK_STRIDE = KBLK_LOAD +
+     * KBLK_PAD_UNIT) so that apply_mfma's 64-lane reads at m_col*KBLK_STRIDE
+     * land on distinct LDS banks (conflict-free).  The DTL path writes each
+     * padded row with a per-row global_load_lds: a wave-UNIFORM LDS base
+     * (the padded row start &A8i_lds[buf][r/TILE][r%TILE][0]) with a per-lane
+     * global source and an exec-mask guard (lane < K4DIM), so lane L writes
+     * column L (dword) of that row — exactly the padded slot apply_mfma reads.
+     * The register path keeps its identical bank-conflict padding.           */
+    static constexpr unsigned KBLK_PAD    = (USE_DTL
+                                          || (LDS_BYTES_OLD + KBLK_PAD_UNIT * TILE * (WM * WaveM + WN * WaveN) * 2u
+                                              <= LDS_BUDGET)) ? KBLK_PAD_UNIT : 0u;
     static constexpr unsigned KBLK_STRIDE = KBLK_LOAD + KBLK_PAD;
     static constexpr unsigned BLK_THR   = WM * WN * 64u;
     static constexpr unsigned K4DIM     = KBLK_LOAD / 4u;
@@ -482,70 +485,113 @@ oz2_fused_TN_kernel(
              * full-dword loads are always in-range → no boundary guard needed.
              * The cross-modulus prefetch is dropped (each modulus's own
              * prologue loads its first K-block).                              */
-            /* DTL global→LDS with the CORRECT global_load_lds contract
+            /* DTL PER-ROW padded loads with the CORRECT global_load_lds contract
              * (verified on gfx942 via dtl_microtest.cpp):
              *   - LDS destination MUST be a wave-UNIFORM base pointer; the
              *     hardware writes lane L -> base + L*4 (wave-contiguous).
              *   - Global source is per-lane.
-             * With KBLK_PAD=0 the register path's LDS byte offset for thread
-             * `tid`, step `ls` equals exactly 4*flat (flat = tid + ls*BLK_THR).
-             * Since flat = wave_id*64 + lane + ls*BLK_THR, the wave-uniform base
-             * dword index is (flat - lane) = wave_id*64 + ls*BLK_THR, and the
-             * hardware's +lane*4 reproduces 4*flat — i.e. exactly the register
-             * path's per-lane scatter destination.  A8i_lds is flat/contiguous
-             * (KBLK_PAD=0) so this base indexing is valid.                     */
-            const int8_t* A_curd[A_STEPS_SAFE];
-            const int8_t* B_curd[B_STEPS_SAFE];
-            uint32_t*     A_dst0[A_STEPS_SAFE];   /* wave-uniform LDS base per step, buffer 0 */
-            uint32_t*     B_dst0[B_STEPS_SAFE];
-            uint32_t* const A_lds_base = reinterpret_cast<uint32_t*>(&A8i_lds[0][0][0][0]);
-            uint32_t* const B_lds_base = reinterpret_cast<uint32_t*>(&B8i_lds[0][0][0][0]);
+             *   - The exec mask IS honored: guarding with `if(lane < K4DIM)`
+             *     makes only lanes 0..K4DIM-1 write, one dword each.
+             * For each logical A-row r (0..NROWS_A-1), we issue ONE per-row
+             * load into the PADDED LDS row start &A8i_lds[buf][r/TILE][r%TILE][0]
+             * (wave-uniform) with per-lane source A8i_s + mi(r)*lda8i +
+             * (k_off + lane*4).  Lane L then writes column L*4 (dword L) of that
+             * row — exactly the padded slot apply_mfma reads at
+             * m_col*KBLK_STRIDE + k_base + ku*KBLK.  Because the LDS destination
+             * carries the KBLK_PAD padding while each row's valid data stays
+             * contiguous (K4DIM dwords), apply_mfma's 64-lane reads hit distinct
+             * banks (conflict-free) with NO change to apply_mfma.
+             * Rows are distributed across the block's `num_waves = BLK_THR/64`
+             * waves (row r handled by wave r % num_waves) so all waves cooperate.
+             * Boundary safety rests on the library's zero-padded A8i/B8i (padded
+             * lda8i/ldb8i) — the same basis the register path relies on. */
+            static constexpr unsigned NROWS_A   = WM * WaveM * TILE;
+            static constexpr unsigned NROWS_B   = WN * WaveN * TILE;
+            static constexpr unsigned NUM_WAVES = BLK_THR / 64u;
+
+            /* Per-row global source cursors (advanced by KBLK_LOAD each K-block).
+             * Each wave owns rows {wid, wid+NUM_WAVES, ...}; the number of rows
+             * per wave is ceil(NROWS/NUM_WAVES).  NROWS is always a multiple of
+             * NUM_WAVES for valid gfx942 configs (NROWS_A = WM*WaveM*TILE,
+             * NUM_WAVES = WM*WN), but we guard the loop with `< NROWS` anyway. */
+            static constexpr unsigned A_ROWS_PER_WAVE = (NROWS_A + NUM_WAVES - 1u) / NUM_WAVES;
+            static constexpr unsigned B_ROWS_PER_WAVE = (NROWS_B + NUM_WAVES - 1u) / NUM_WAVES;
+            const int8_t* A_rsrc[A_ROWS_PER_WAVE];
+            const int8_t* B_rsrc[B_ROWS_PER_WAVE];
+            uint32_t*     A_rdst0[A_ROWS_PER_WAVE];  /* padded LDS row base, buffer 0 */
+            uint32_t*     B_rdst0[B_ROWS_PER_WAVE];
             static constexpr unsigned A_BUF_DWORDS = (WM * WaveM * TILE * KBLK_STRIDE) / 4u;
             static constexpr unsigned B_BUF_DWORDS = (WN * WaveN * TILE * KBLK_STRIDE) / 4u;
             #pragma unroll
-            for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-                A_curd[ls] = A8i_s + static_cast<size_t>(mi_A[ls]) * lda8i
-                           + static_cast<size_t>(k4_A[ls]) * 4u;
-                /* wave-uniform base dword = flat - lane = wave_id*64 + ls*BLK_THR */
-                A_dst0[ls] = A_lds_base + (static_cast<unsigned>(wid) * 64u + ls * BLK_THR);
+            for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
+                const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
+                if (r < NROWS_A) {
+                    const int mi = block_m_base + static_cast<int>(r);
+                    A_rsrc[ri]  = A8i_s + static_cast<size_t>(mi) * lda8i
+                                + static_cast<size_t>(lane) * 4u;
+                    A_rdst0[ri] = reinterpret_cast<uint32_t*>(
+                                    &A8i_lds[0][r / TILE][r % TILE][0]);
+                } else {
+                    A_rsrc[ri]  = A8i_s + static_cast<size_t>(lane) * 4u;  /* unused */
+                    A_rdst0[ri] = reinterpret_cast<uint32_t*>(&A8i_lds[0][0][0][0]);
+                }
             }
             #pragma unroll
-            for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-                B_curd[ls] = B8i_s + static_cast<size_t>(ni_B[ls]) * ldb8i
-                           + static_cast<size_t>(k4_B[ls]) * 4u;
-                B_dst0[ls] = B_lds_base + (static_cast<unsigned>(wid) * 64u + ls * BLK_THR);
+            for (unsigned ri = 0; ri < B_ROWS_PER_WAVE; ++ri) {
+                const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
+                if (r < NROWS_B) {
+                    const int ni = block_n_base + static_cast<int>(r);
+                    B_rsrc[ri]  = B8i_s + static_cast<size_t>(ni) * ldb8i
+                                + static_cast<size_t>(lane) * 4u;
+                    B_rdst0[ri] = reinterpret_cast<uint32_t*>(
+                                    &B8i_lds[0][r / TILE][r % TILE][0]);
+                } else {
+                    B_rsrc[ri]  = B8i_s + static_cast<size_t>(lane) * 4u;  /* unused */
+                    B_rdst0[ri] = reinterpret_cast<uint32_t*>(&B8i_lds[0][0][0][0]);
+                }
             }
 
             __syncthreads();
-            /* Prologue: DTL first K-block into buffer 0 (wave-uniform LDS base). */
+            /* Prologue: first K-block into buffer 0 via per-row padded loads. */
             #pragma unroll
-            for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                __builtin_amdgcn_global_load_lds(
-                    reinterpret_cast<const uint32_t*>(A_curd[ls]), A_dst0[ls], 4u, 0u, 0u);
+            for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
+                const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
+                if (r < NROWS_A && lane < static_cast<int>(K4DIM))
+                    __builtin_amdgcn_global_load_lds(
+                        reinterpret_cast<const uint32_t*>(A_rsrc[ri]), A_rdst0[ri], 4u, 0u, 0u);
+            }
             #pragma unroll
-            for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                __builtin_amdgcn_global_load_lds(
-                    reinterpret_cast<const uint32_t*>(B_curd[ls]), B_dst0[ls], 4u, 0u, 0u);
+            for (unsigned ri = 0; ri < B_ROWS_PER_WAVE; ++ri) {
+                const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
+                if (r < NROWS_B && lane < static_cast<int>(K4DIM))
+                    __builtin_amdgcn_global_load_lds(
+                        reinterpret_cast<const uint32_t*>(B_rsrc[ri]), B_rdst0[ri], 4u, 0u, 0u);
+            }
             __syncthreads();
 
             int curd = 0;
             for (int k_off = 0; k_off + static_cast<int>(KBLK_LOAD) < k_int;
                  k_off += static_cast<int>(KBLK_LOAD)) {
                 const int nxt = 1 - curd;
-                /* nxt buffer's flat LDS base = base + nxt*(buffer dwords). */
+                /* Load nxt buffer: advance each row cursor by one K-block and
+                 * write into the nxt buffer's padded row (offset by BUF_DWORDS). */
                 #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-                    A_curd[ls] += KBLK_LOAD;
-                    __builtin_amdgcn_global_load_lds(
-                        reinterpret_cast<const uint32_t*>(A_curd[ls]),
-                        A_dst0[ls] + static_cast<unsigned>(nxt) * A_BUF_DWORDS, 4u, 0u, 0u);
+                for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
+                    const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
+                    A_rsrc[ri] += KBLK_LOAD;
+                    if (r < NROWS_A && lane < static_cast<int>(K4DIM))
+                        __builtin_amdgcn_global_load_lds(
+                            reinterpret_cast<const uint32_t*>(A_rsrc[ri]),
+                            A_rdst0[ri] + static_cast<unsigned>(nxt) * A_BUF_DWORDS, 4u, 0u, 0u);
                 }
                 #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-                    B_curd[ls] += KBLK_LOAD;
-                    __builtin_amdgcn_global_load_lds(
-                        reinterpret_cast<const uint32_t*>(B_curd[ls]),
-                        B_dst0[ls] + static_cast<unsigned>(nxt) * B_BUF_DWORDS, 4u, 0u, 0u);
+                for (unsigned ri = 0; ri < B_ROWS_PER_WAVE; ++ri) {
+                    const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
+                    B_rsrc[ri] += KBLK_LOAD;
+                    if (r < NROWS_B && lane < static_cast<int>(K4DIM))
+                        __builtin_amdgcn_global_load_lds(
+                            reinterpret_cast<const uint32_t*>(B_rsrc[ri]),
+                            B_rdst0[ri] + static_cast<unsigned>(nxt) * B_BUF_DWORDS, 4u, 0u, 0u);
                 }
                 apply_mfma(&A8i_lds[curd][wm * WaveM][0][0], &B8i_lds[curd][wn * WaveN][0][0], C32);
                 __syncthreads();
@@ -1119,6 +1165,30 @@ rocblaslt_status oz2_launch_fused_TN(
                 else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1 && is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,1u,1u,1u); \
                 else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2 && is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,1u,1u); \
                 else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1 && is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,1u,1u); \
+                /* ── TILE=32 DTL=1 (gfx950 only): KBLK=64 → near/full-64-lane per-row loads. \
+                 *    Mainstream WaveM=WaveN=1 (64×64/128×64/64×128) + larger WaveM×WaveN \
+                 *    (128×128/256×256/256×128/128×256).  fva0=LDS-accum, fva1=VGPR-accum. \
+                 *    All gfx950-gated; on gfx942 these compile but never dispatch.        */ \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,2u,0u,1u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,2u,0u,1u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,2u,0u,1u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,4u,0u,1u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,0u,1u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,4u,0u,1u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,2u,1u,1u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,2u,1u,1u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,2u,1u,1u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,4u,1u,1u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,1u,1u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,4u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,32u,1u,1u,2u,0u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,32u,1u,1u,2u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==32&&_ku==1&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,32u,2u,2u,1u,0u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==32&&_ku==1&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,32u,2u,2u,1u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,32u,2u,1u,1u,0u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,32u,2u,1u,1u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==32&&_ku==1&&is_gfx950&&_fva==0&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,32u,1u,2u,1u,0u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==32&&_ku==1&&is_gfx950&&_fva==1&&_dtl==1) _OV_DISPATCH((S_V),4u,4u,32u,1u,2u,1u,1u,1u); \
                 else { return rocblaslt_status_invalid_value; } \
                 return rocblaslt_status_success; \
             } \

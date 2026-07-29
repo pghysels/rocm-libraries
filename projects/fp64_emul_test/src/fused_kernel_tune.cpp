@@ -98,6 +98,32 @@ static const KernelConfig CONFIGS[] = {
     { 4, 4, 2, 2, 16, 2, true, true, true, "WM4WN4Wm2Wn2T16ku2fva1dtl1" },
     { 4, 4, 4, 4, 16, 1, true, true, true, "WM4WN4Wm4Wn4T16ku1fva1dtl1" },
 
+    /* ── TILE=32 DTL=1 (gfx950 only) — KBLK=64 gives near/full-64-lane per-row
+     *    loads, the regime where DTL's per-row cost is lowest.  Mainstream
+     *    WaveM=WaveN=1 (64×64/128×64/64×128 in T32) + larger WaveM×WaveN
+     *    (128×128/256×256/256×128/128×256).  fva0=LDS-accum, fva1=VGPR-accum.
+     *    gfx950_only=true → auto-skipped on gfx942.                            */
+    { 4, 2, 1, 1, 32, 2, true, false, true, "WM4WN2Wm1Wn1T32ku2dtl1" },
+    { 2, 4, 1, 1, 32, 2, true, false, true, "WM2WN4Wm1Wn1T32ku2dtl1" },
+    { 2, 2, 1, 1, 32, 2, true, false, true, "WM2WN2Wm1Wn1T32ku2dtl1" },
+    { 4, 2, 1, 1, 32, 4, true, false, true, "WM4WN2Wm1Wn1T32ku4dtl1" },
+    { 2, 4, 1, 1, 32, 4, true, false, true, "WM2WN4Wm1Wn1T32ku4dtl1" },
+    { 2, 2, 1, 1, 32, 4, true, false, true, "WM2WN2Wm1Wn1T32ku4dtl1" },
+    { 4, 2, 1, 1, 32, 2, true, true,  true, "WM4WN2Wm1Wn1T32ku2fva1dtl1" },
+    { 2, 4, 1, 1, 32, 2, true, true,  true, "WM2WN4Wm1Wn1T32ku2fva1dtl1" },
+    { 2, 2, 1, 1, 32, 2, true, true,  true, "WM2WN2Wm1Wn1T32ku2fva1dtl1" },
+    { 4, 2, 1, 1, 32, 4, true, true,  true, "WM4WN2Wm1Wn1T32ku4fva1dtl1" },
+    { 2, 4, 1, 1, 32, 4, true, true,  true, "WM2WN4Wm1Wn1T32ku4fva1dtl1" },
+    { 2, 2, 1, 1, 32, 4, true, true,  true, "WM2WN2Wm1Wn1T32ku4fva1dtl1" },
+    { 4, 4, 1, 1, 32, 2, true, false, true, "WM4WN4Wm1Wn1T32ku2dtl1" },
+    { 4, 4, 1, 1, 32, 2, true, true,  true, "WM4WN4Wm1Wn1T32ku2fva1dtl1" },
+    { 4, 4, 2, 2, 32, 1, true, false, true, "WM4WN4Wm2Wn2T32ku1dtl1" },
+    { 4, 4, 2, 2, 32, 1, true, true,  true, "WM4WN4Wm2Wn2T32ku1fva1dtl1" },
+    { 4, 4, 2, 1, 32, 1, true, false, true, "WM4WN4Wm2Wn1T32ku1dtl1" },
+    { 4, 4, 2, 1, 32, 1, true, true,  true, "WM4WN4Wm2Wn1T32ku1fva1dtl1" },
+    { 4, 4, 1, 2, 32, 1, true, false, true, "WM4WN4Wm1Wn2T32ku1dtl1" },
+    { 4, 4, 1, 2, 32, 1, true, true,  true, "WM4WN4Wm1Wn2T32ku1fva1dtl1" },
+
     /* WM, WN, WaveM, WaveN, TILE, KU, gfx950_only, force_vgpr_accum, use_dtl, label */
     /* KU=0/auto removed throughout — all entries use explicit KU=1/2/4.
      * KU_AUTO on gfx942: =4 when WM×WaveM+WN×WaveN ≤ 15, else =2.
