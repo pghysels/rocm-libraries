@@ -148,11 +148,9 @@ oz2_load_mfma_src32(const int8_t* __restrict__ ptr) noexcept {
  * ========================================================================= */
 /* KU_PARAM=0 means "auto-select K_UNROLL from LDS budget" (the default).
  * Set KU_PARAM=1,2,4 via OZ2_FUSED_SHAPE_OVERRIDE to override for tuning. */
-/* NO_CRT=true skips both the CRT accumulation and the finalize/D-write sections.
- * Results are garbage but kernel time isolates pure MFMA+prefetch overhead.   */
 template <unsigned S, bool HAS_LO, unsigned WM = 4u, unsigned WN = 4u, unsigned TILE = 16u,
           unsigned WaveM = 1u, unsigned WaveN = 1u, unsigned KU_PARAM = 0u,
-          bool FORCE_VGPR_ACCUM = false, bool NO_CRT = false>
+          bool FORCE_VGPR_ACCUM = false>
 __global__ static void
 oz2_fused_TN_kernel(
     const int8_t*  __restrict__ A8i,   /* [S × lda8i × cola8i] INT8 A  */
@@ -544,8 +542,6 @@ oz2_fused_TN_kernel(
             }
         }
 
-        /* ── CRT update ── (skipped when NO_CRT=true for MFMA-isolation experiment) */
-        if constexpr (!NO_CRT) {
         /* ── CRT update: one (wm_w, wn_w) tile × one NREG_sub chunk at a time ─
          * The outer (wm_w, wn_w) loop covers WaveM×WaveN MFMA tiles.
          * The inner sub loop splits NREG_single into NREG_sub_iters passes of
@@ -630,11 +626,8 @@ oz2_fused_TN_kernel(
                 }
             }
         }  /* end CRT update for this (wm_w, wn_w) */
-        }  /* end NO_CRT constexpr guard */
     }
 
-    /* ── Finalize ── (skipped when NO_CRT=true for MFMA-isolation experiment) */
-    if constexpr (!NO_CRT) {
     /* ── Finalize: CRT range-reduction + inverse scale + write D ─────────────
      * ISA-verified output layout (AMD CDNA3, Sec. 7.1.4.2) per MFMA tile:
      *   col = lane % TILE
@@ -704,7 +697,6 @@ oz2_fused_TN_kernel(
             } /* end USE_LDS_ACCUM else */
         }
     }
-    } /* end NO_CRT constexpr guard for finalize */
 }
 
 /* =========================================================================
@@ -1048,37 +1040,6 @@ rocblaslt_status oz2_launch_fused_TN(
             _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 */ \
         } \
     } while(0)
-
-    /* ── OZ2_NO_CRT=1 experiment: dispatch MFMA-only kernel (no CRT/finalize) ──
-     * Results are garbage but the kernel duration isolates pure MFMA+prefetch
-     * overhead and reveals the true CRT cost (28ms_full - X_mfma_only = CRT). */
-    {
-        const char* _no_crt_env = std::getenv("OZ2_NO_CRT");
-        if (_no_crt_env && std::strcmp(_no_crt_env, "1") == 0) {
-            if (num_moduli != 16u) {
-                std::fprintf(stderr,
-                    "[oz2_launch_fused_TN] OZ2_NO_CRT=1 requires num_moduli=16 (got %u)\n",
-                    num_moduli);
-                std::abort();
-            }
-            /* Dispatch production WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) with NO_CRT=true.
-             * This is identical to the normal production dispatch except NO_CRT=true,
-             * so OZ2_NO_CRT=1 isolates pure MFMA+prefetch overhead for that exact config. */
-            if (has_lo)
-                hipLaunchKernelGGL(
-                    (oz2_fused_TN_kernel<16u, true,  4u, 4u, 16u, 2u, 2u, 2u, false, true>),
-                    make_grid(4u, 4u, 16u, 2u, 2u), dim3(4u * 4u * 64u), 0, stream,
-                    A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i,
-                    C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, num_xccs);
-            else
-                hipLaunchKernelGGL(
-                    (oz2_fused_TN_kernel<16u, false, 4u, 4u, 16u, 2u, 2u, 2u, false, true>),
-                    make_grid(4u, 4u, 16u, 2u, 2u), dim3(4u * 4u * 64u), 0, stream,
-                    A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i,
-                    C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, num_xccs);
-            return rocblaslt_status_success;
-        }
-    }
 
     /* Shape override: always dispatches oz2_fused_TN_kernel<16,...>.
      * If OZ2_FUSED_SHAPE_OVERRIDE is set, returns here before the switch so
