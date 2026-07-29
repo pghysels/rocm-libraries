@@ -412,8 +412,14 @@ oz2_fused_TN_kernel(
      * single-tile case.                                                        */
     auto apply_mfma = [&](const int8_t* A_wm_base, const int8_t* B_wn_base,
                           int32_t (&C32)[NREG]) __attribute__((always_inline)) {
-        const int m_col  = lane % static_cast<int>(TILE);
-        const int k_base = static_cast<int>(K_A_BYTES) * (lane / static_cast<int>(TILE));
+        const int m_col   = lane % static_cast<int>(TILE);
+        const int k_base  = static_cast<int>(K_A_BYTES) * (lane / static_cast<int>(TILE));
+        /* base_off: byte offset to this lane's K-slice within any LDS row.
+         * m_col * KBLK_STRIDE selects the row; k_base selects the lane's
+         * starting K-byte within that row.  Hoisted outside the ku loop so
+         * the compiler can fold ku*KBLK as a compile-time constant into the
+         * LDS instruction's 16-bit offset field.                              */
+        const int base_off = m_col * static_cast<int>(KBLK_STRIDE) + k_base;
         /* Stride (in bytes) between consecutive M-rows of the LDS A tile. */
         static constexpr int A_ROW_STRIDE = static_cast<int>(TILE * KBLK_STRIDE);
         static constexpr int B_ROW_STRIDE = static_cast<int>(TILE * KBLK_STRIDE);
@@ -427,24 +433,25 @@ oz2_fused_TN_kernel(
                 if constexpr (TILE == 16u) {
                     v4i32 vx;
                     for (unsigned e = 0; e < NREG_single; ++e) vx[static_cast<int>(e)] = C32[reg_off + e];
+                    #pragma unroll
                     for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-                        const int kab   = k_base + static_cast<int>(ku * KBLK);
-                        const int off_A = m_col * static_cast<int>(KBLK_STRIDE) + kab;
-                        const int off_B = m_col * static_cast<int>(KBLK_STRIDE) + kab;
-                        const auto sa = oz2_load_mfma_src16(A_wm_slot + off_A);
-                        const auto sb = oz2_load_mfma_src16(B_wn_slot + off_B);
+                        /* ku*KBLK is a compile-time constant after unroll; adding
+                         * it to base_off lets the compiler fold the result into
+                         * the LDS DS instruction's constant offset field.       */
+                        const int off = base_off + static_cast<int>(ku * KBLK);
+                        const auto sa = oz2_load_mfma_src16(A_wm_slot + off);
+                        const auto sb = oz2_load_mfma_src16(B_wn_slot + off);
                         vx = oz2_do_mfma_16(sa, sb, vx);
                     }
                     for (unsigned e = 0; e < NREG_single; ++e) C32[reg_off + e] = vx[static_cast<int>(e)];
                 } else {
                     v16i32 vx;
                     for (unsigned e = 0; e < NREG_single; ++e) vx[static_cast<int>(e)] = C32[reg_off + e];
+                    #pragma unroll
                     for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-                        const int kab   = k_base + static_cast<int>(ku * KBLK);
-                        const int off_A = m_col * static_cast<int>(KBLK_STRIDE) + kab;
-                        const int off_B = m_col * static_cast<int>(KBLK_STRIDE) + kab;
-                        const auto sa = oz2_load_mfma_src32(A_wm_slot + off_A);
-                        const auto sb = oz2_load_mfma_src32(B_wn_slot + off_B);
+                        const int off = base_off + static_cast<int>(ku * KBLK);
+                        const auto sa = oz2_load_mfma_src32(A_wm_slot + off);
+                        const auto sb = oz2_load_mfma_src32(B_wn_slot + off);
                         vx = oz2_do_mfma_32(sa, sb, vx);
                     }
                     for (unsigned e = 0; e < NREG_single; ++e) C32[reg_off + e] = vx[static_cast<int>(e)];
@@ -473,16 +480,25 @@ oz2_fused_TN_kernel(
 
             __syncthreads();
 
-            const int8_t* A_base[A_STEPS_SAFE];
-            const int8_t* B_base[B_STEPS_SAFE];
+            /* K-loop global-prefetch cursors.  Rather than recomputing
+             * base + nxt_k each iteration (a full 64-bit address materialize
+             * whose offset quickly exceeds the load instruction's 12-bit
+             * immediate field, forcing an extra v_add per pointer per
+             * iteration), we advance these cursors in place by the compile-
+             * time-constant KBLK_LOAD.  The constant increment lets the
+             * compiler fold the step and keeps per-iteration address math to
+             * a single add per pointer.  Cursors start at k_off=0; each loop
+             * iteration steps to the next K-block before dereferencing.       */
+            const int8_t* A_cur[A_STEPS_SAFE];
+            const int8_t* B_cur[B_STEPS_SAFE];
             #pragma unroll
             for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                A_base[ls] = A8i_s + static_cast<size_t>(mi_A[ls]) * lda8i
-                           + static_cast<size_t>(k4_A[ls]) * 4u;
+                A_cur[ls] = A8i_s + static_cast<size_t>(mi_A[ls]) * lda8i
+                          + static_cast<size_t>(k4_A[ls]) * 4u;
             #pragma unroll
             for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                B_base[ls] = B8i_s + static_cast<size_t>(ni_B[ls]) * ldb8i
-                           + static_cast<size_t>(k4_B[ls]) * 4u;
+                B_cur[ls] = B8i_s + static_cast<size_t>(ni_B[ls]) * ldb8i
+                          + static_cast<size_t>(k4_B[ls]) * 4u;
 
             /* rA/rB from outer scope used here for K-block double buffering. */
             int cur = 0;
@@ -490,13 +506,16 @@ oz2_fused_TN_kernel(
             for (int k_off = 0; k_off + static_cast<int>(KBLK_LOAD) < k_int;
                  k_off += static_cast<int>(KBLK_LOAD)) {
                 const int nxt   = 1 - cur;
-                const int nxt_k = k_off + static_cast<int>(KBLK_LOAD);
                 #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    rA[ls] = *reinterpret_cast<const int32_t*>(A_base[ls] + nxt_k);
+                for (unsigned ls = 0; ls < A_STEPS; ++ls) {
+                    A_cur[ls] += KBLK_LOAD;
+                    rA[ls] = *reinterpret_cast<const int32_t*>(A_cur[ls]);
+                }
                 #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    rB[ls] = *reinterpret_cast<const int32_t*>(B_base[ls] + nxt_k);
+                for (unsigned ls = 0; ls < B_STEPS; ++ls) {
+                    B_cur[ls] += KBLK_LOAD;
+                    rB[ls] = *reinterpret_cast<const int32_t*>(B_cur[ls]);
+                }
                 apply_mfma(&A8i_lds[cur][wm * WaveM][0][0], &B8i_lds[cur][wn * WaveN][0][0], C32);
                 #pragma unroll
                 for (unsigned ls = 0; ls < A_STEPS; ++ls)
