@@ -348,7 +348,7 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool tA, bool tB,
 
     /* Fused TN kernel: reads pre-computed INT8 A8i/B8i from workspace, performs
      * MFMA + CRT accumulation, writes FP64 D directly.  Scale runs separately.  */
-    static constexpr double EFF_FUSED = 0.57;
+    static constexpr double EFF_FUSED = 0.333;
     const double t_fused_bw   = (s * (mk + kn) + 16.0 * mn) / c0;  /* INT8 + FP64 C/D */
     const double t_fused_int8 = s * 2.0 * mnk / c2;                  /* MFMA              */
     const double t_fused_fp64 = s * 8.0 * mn / c1;                   /* CRT accum only    */

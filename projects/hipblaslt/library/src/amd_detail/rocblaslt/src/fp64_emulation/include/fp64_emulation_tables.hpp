@@ -35,6 +35,18 @@ __device__ __forceinline__ double oz2_neg_mod(unsigned i) noexcept {
     return v[i];
 }
 
+/* Integer modulus pi_s — same values as -oz2_neg_mod(i) but as int32.
+ * Used by the CRT fast path to replace the FP64 fma(-pi, q, dc_raw) with
+ * an exact integer multiply-subtract, freeing the FP64 execution unit.    */
+__device__ __forceinline__ int32_t oz2_mod_int(unsigned i) noexcept {
+    static constexpr int32_t v[OZ2_S_MAX] = {
+        256, 255, 253, 251, 247, 241, 239,
+        233, 229, 227, 223, 217, 211, 199,
+        197, 193, 191, 181
+    };
+    return v[i];
+}
+
 __device__ __forceinline__ double oz2_inv_mod(unsigned i) noexcept {
     static constexpr double v[OZ2_S_MAX] = {
         0x1.0000000000000p-8,   /* 1/256 */
