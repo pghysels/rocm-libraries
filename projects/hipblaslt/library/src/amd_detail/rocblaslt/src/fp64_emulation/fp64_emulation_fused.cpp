@@ -149,17 +149,10 @@ oz2_load_mfma_src32(const int8_t* __restrict__ ptr) noexcept {
 /* KU_PARAM=0 means "auto-select K_UNROLL from LDS budget" (the default).
  * Set KU_PARAM=1,2,4 via OZ2_FUSED_SHAPE_OVERRIDE to override for tuning. */
 /* NO_CRT=true skips both the CRT accumulation and the finalize/D-write sections.
- * Results are garbage but kernel time isolates pure MFMA+prefetch overhead.
- * NO_FINALIZE=true skips only the finalize/D-write section, keeping CRT accumulation.
- * Use OZ2_NO_FINALIZE=1 to isolate pure CRT cost (MFMA + CRT, no D-write).   */
-/* KSTAGES: depth of the K-loop LDS software pipeline (double/triple buffer).
- *   KSTAGES=2 (default) — classic double buffer, byte-for-byte the original code.
- *   KSTAGES=3 — triple buffer (experimental). Set via the 8th field of
- *   OZ2_FUSED_SHAPE_OVERRIDE ("WM WN WaveM WaveN TILE KU FVA KSTAGES").        */
+ * Results are garbage but kernel time isolates pure MFMA+prefetch overhead.   */
 template <unsigned S, bool HAS_LO, unsigned WM = 4u, unsigned WN = 4u, unsigned TILE = 16u,
           unsigned WaveM = 1u, unsigned WaveN = 1u, unsigned KU_PARAM = 0u,
-          bool FORCE_VGPR_ACCUM = false, bool NO_CRT = false, bool NO_FINALIZE = false,
-          unsigned KSTAGES = 2u>
+          bool FORCE_VGPR_ACCUM = false, bool NO_CRT = false>
 __global__ static void
 oz2_fused_TN_kernel(
     const int8_t*  __restrict__ A8i,   /* [S × lda8i × cola8i] INT8 A  */
@@ -230,11 +223,7 @@ oz2_fused_TN_kernel(
     /* VALID_CONFIG: false when A_STEPS or B_STEPS < 1 (gfx950-only KU=1 on gfx942). */
     static constexpr unsigned A_STEPS_SAFE = (A_STEPS > 0u) ? A_STEPS : 1u;
     static constexpr unsigned B_STEPS_SAFE = (B_STEPS > 0u) ? B_STEPS : 1u;
-    static constexpr unsigned KSTG = KSTAGES;
-    static constexpr size_t   LDS_MFMA_KSTG = static_cast<size_t>(KSTG)
-        * (WM * WaveM * TILE * KBLK_STRIDE + WN * WaveN * TILE * KBLK_STRIDE);
-    static constexpr bool     LDS_FITS_KSTG = (LDS_MFMA_KSTG + LDS_SFT <= LDS_BUDGET);
-    static constexpr bool     VALID_CONFIG  = (A_STEPS >= 1u && B_STEPS >= 1u && LDS_FITS_KSTG);
+    static constexpr bool     VALID_CONFIG  = (A_STEPS >= 1u && B_STEPS >= 1u);
 
     /* ── LDS accumulator decision ───────────────────────────────────────────
      * Store Zhi/Zlo in LDS when the combined budget (MFMA tiles + accumulators
@@ -252,8 +241,8 @@ oz2_fused_TN_kernel(
     static constexpr bool   USE_LDS_ACCUM = FITS_IN_LDS && !FORCE_VGPR_ACCUM;
 
     /* ── Static LDS ────────────────────────────────────────────────────────── */
-    __shared__ int8_t  A8i_lds[KSTG][WM * WaveM][TILE][KBLK_STRIDE];
-    __shared__ int8_t  B8i_lds[KSTG][WN * WaveN][TILE][KBLK_STRIDE];
+    __shared__ int8_t  A8i_lds[2][WM * WaveM][TILE][KBLK_STRIDE];
+    __shared__ int8_t  B8i_lds[2][WN * WaveN][TILE][KBLK_STRIDE];
     __shared__ int16_t sftA_lds[WM * WaveM * TILE];
     __shared__ int16_t sftB_lds[WN * WaveN * TILE];
     /* CRT accumulator LDS — flat layout [e * BLK_THR + tid].
@@ -423,14 +412,8 @@ oz2_fused_TN_kernel(
      * single-tile case.                                                        */
     auto apply_mfma = [&](const int8_t* A_wm_base, const int8_t* B_wn_base,
                           int32_t (&C32)[NREG]) __attribute__((always_inline)) {
-        const int m_col   = lane % static_cast<int>(TILE);
-        const int k_base  = static_cast<int>(K_A_BYTES) * (lane / static_cast<int>(TILE));
-        /* base_off: byte offset to this lane's K-slice within any LDS row.
-         * m_col * KBLK_STRIDE selects the row; k_base selects the lane's
-         * starting K-byte within that row.  Hoisted outside the ku loop so
-         * the compiler can fold ku*KBLK as a compile-time constant into the
-         * LDS instruction's 16-bit offset field.                              */
-        const int base_off = m_col * static_cast<int>(KBLK_STRIDE) + k_base;
+        const int m_col  = lane % static_cast<int>(TILE);
+        const int k_base = static_cast<int>(K_A_BYTES) * (lane / static_cast<int>(TILE));
         /* Stride (in bytes) between consecutive M-rows of the LDS A tile. */
         static constexpr int A_ROW_STRIDE = static_cast<int>(TILE * KBLK_STRIDE);
         static constexpr int B_ROW_STRIDE = static_cast<int>(TILE * KBLK_STRIDE);
@@ -444,25 +427,24 @@ oz2_fused_TN_kernel(
                 if constexpr (TILE == 16u) {
                     v4i32 vx;
                     for (unsigned e = 0; e < NREG_single; ++e) vx[static_cast<int>(e)] = C32[reg_off + e];
-                    #pragma unroll
                     for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-                        /* ku*KBLK is a compile-time constant after unroll; adding
-                         * it to base_off lets the compiler fold the result into
-                         * the LDS DS instruction's constant offset field.       */
-                        const int off = base_off + static_cast<int>(ku * KBLK);
-                        const auto sa = oz2_load_mfma_src16(A_wm_slot + off);
-                        const auto sb = oz2_load_mfma_src16(B_wn_slot + off);
+                        const int kab   = k_base + static_cast<int>(ku * KBLK);
+                        const int off_A = m_col * static_cast<int>(KBLK_STRIDE) + kab;
+                        const int off_B = m_col * static_cast<int>(KBLK_STRIDE) + kab;
+                        const auto sa = oz2_load_mfma_src16(A_wm_slot + off_A);
+                        const auto sb = oz2_load_mfma_src16(B_wn_slot + off_B);
                         vx = oz2_do_mfma_16(sa, sb, vx);
                     }
                     for (unsigned e = 0; e < NREG_single; ++e) C32[reg_off + e] = vx[static_cast<int>(e)];
                 } else {
                     v16i32 vx;
                     for (unsigned e = 0; e < NREG_single; ++e) vx[static_cast<int>(e)] = C32[reg_off + e];
-                    #pragma unroll
                     for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-                        const int off = base_off + static_cast<int>(ku * KBLK);
-                        const auto sa = oz2_load_mfma_src32(A_wm_slot + off);
-                        const auto sb = oz2_load_mfma_src32(B_wn_slot + off);
+                        const int kab   = k_base + static_cast<int>(ku * KBLK);
+                        const int off_A = m_col * static_cast<int>(KBLK_STRIDE) + kab;
+                        const int off_B = m_col * static_cast<int>(KBLK_STRIDE) + kab;
+                        const auto sa = oz2_load_mfma_src32(A_wm_slot + off_A);
+                        const auto sb = oz2_load_mfma_src32(B_wn_slot + off_B);
                         vx = oz2_do_mfma_32(sa, sb, vx);
                     }
                     for (unsigned e = 0; e < NREG_single; ++e) C32[reg_off + e] = vx[static_cast<int>(e)];
@@ -491,47 +473,30 @@ oz2_fused_TN_kernel(
 
             __syncthreads();
 
-            /* K-loop global-prefetch cursors.  Rather than recomputing
-             * base + nxt_k each iteration (a full 64-bit address materialize
-             * whose offset quickly exceeds the load instruction's 12-bit
-             * immediate field, forcing an extra v_add per pointer per
-             * iteration), we advance these cursors in place by the compile-
-             * time-constant KBLK_LOAD.  The constant increment lets the
-             * compiler fold the step and keeps per-iteration address math to
-             * a single add per pointer.  Cursors start at k_off=0; each loop
-             * iteration steps to the next K-block before dereferencing.       */
-            const int8_t* A_cur[A_STEPS_SAFE];
-            const int8_t* B_cur[B_STEPS_SAFE];
+            const int8_t* A_base[A_STEPS_SAFE];
+            const int8_t* B_base[B_STEPS_SAFE];
             #pragma unroll
             for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                A_cur[ls] = A8i_s + static_cast<size_t>(mi_A[ls]) * lda8i
-                          + static_cast<size_t>(k4_A[ls]) * 4u;
+                A_base[ls] = A8i_s + static_cast<size_t>(mi_A[ls]) * lda8i
+                           + static_cast<size_t>(k4_A[ls]) * 4u;
             #pragma unroll
             for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                B_cur[ls] = B8i_s + static_cast<size_t>(ni_B[ls]) * ldb8i
-                          + static_cast<size_t>(k4_B[ls]) * 4u;
+                B_base[ls] = B8i_s + static_cast<size_t>(ni_B[ls]) * ldb8i
+                           + static_cast<size_t>(k4_B[ls]) * 4u;
 
-            /* Hoisted loop bound: k_off + KBLK_LOAD < k_int  ⇔  k_off < k_last.
-             * k_last may be negative for tiny K; k_off=0 < k_last<0 is false,
-             * so the loop simply doesn't execute — identical to the original. */
-            const int k_last = k_int - static_cast<int>(KBLK_LOAD);
-
-            if constexpr (KSTG == 2u) {
-            /* ── Classic 2-stage double-buffer loop (unchanged) ──────────────── */
             /* rA/rB from outer scope used here for K-block double buffering. */
             int cur = 0;
-            for (int k_off = 0; k_off < k_last; k_off += static_cast<int>(KBLK_LOAD)) {
+
+            for (int k_off = 0; k_off + static_cast<int>(KBLK_LOAD) < k_int;
+                 k_off += static_cast<int>(KBLK_LOAD)) {
                 const int nxt   = 1 - cur;
+                const int nxt_k = k_off + static_cast<int>(KBLK_LOAD);
                 #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-                    A_cur[ls] += KBLK_LOAD;
-                    rA[ls] = *reinterpret_cast<const int32_t*>(A_cur[ls]);
-                }
+                for (unsigned ls = 0; ls < A_STEPS; ++ls)
+                    rA[ls] = *reinterpret_cast<const int32_t*>(A_base[ls] + nxt_k);
                 #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-                    B_cur[ls] += KBLK_LOAD;
-                    rB[ls] = *reinterpret_cast<const int32_t*>(B_cur[ls]);
-                }
+                for (unsigned ls = 0; ls < B_STEPS; ++ls)
+                    rB[ls] = *reinterpret_cast<const int32_t*>(B_base[ls] + nxt_k);
                 apply_mfma(&A8i_lds[cur][wm * WaveM][0][0], &B8i_lds[cur][wn * WaveN][0][0], C32);
                 #pragma unroll
                 for (unsigned ls = 0; ls < A_STEPS; ++ls)
@@ -545,73 +510,6 @@ oz2_fused_TN_kernel(
                 cur = nxt;
             }
             apply_mfma(&A8i_lds[cur][wm * WaveM][0][0], &B8i_lds[cur][wn * WaveN][0][0], C32);
-            } else {
-            /* ── Triple-buffer (KSTG==3) software pipeline ───────────────────────
-             * buf[0] already holds blk0 (published by the __syncthreads above).
-             * Total MFMA count == number of K-blocks (NBLK), matching 2-stage.    */
-            if (k_last > 0) {
-                /* Prefetch blk1 into rA/rB. */
-                #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-                    A_cur[ls] += KBLK_LOAD;
-                    rA[ls] = *reinterpret_cast<const int32_t*>(A_cur[ls]);
-                }
-                #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-                    B_cur[ls] += KBLK_LOAD;
-                    rB[ls] = *reinterpret_cast<const int32_t*>(B_cur[ls]);
-                }
-                /* Store blk1 into buf[1]. */
-                #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    *reinterpret_cast<int32_t*>(
-                        &A8i_lds[1][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA[ls];
-                #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    *reinterpret_cast<int32_t*>(
-                        &B8i_lds[1][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB[ls];
-                __syncthreads();
-
-                int i = 1;
-                for (int k_off = static_cast<int>(KBLK_LOAD); k_off < k_last;
-                     k_off += static_cast<int>(KBLK_LOAD)) {
-                    const int cur_buf = i % static_cast<int>(KSTG);
-                    const int nxt_buf = (i + 1) % static_cast<int>(KSTG);
-                    #pragma unroll
-                    for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-                        A_cur[ls] += KBLK_LOAD;
-                        rA[ls] = *reinterpret_cast<const int32_t*>(A_cur[ls]);
-                    }
-                    #pragma unroll
-                    for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-                        B_cur[ls] += KBLK_LOAD;
-                        rB[ls] = *reinterpret_cast<const int32_t*>(B_cur[ls]);
-                    }
-                    apply_mfma(&A8i_lds[cur_buf][wm * WaveM][0][0],
-                               &B8i_lds[cur_buf][wn * WaveN][0][0], C32);
-                    #pragma unroll
-                    for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                        *reinterpret_cast<int32_t*>(
-                            &A8i_lds[nxt_buf][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA[ls];
-                    #pragma unroll
-                    for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                        *reinterpret_cast<int32_t*>(
-                            &B8i_lds[nxt_buf][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB[ls];
-                    __syncthreads();
-                    ++i;
-                }
-                apply_mfma(&A8i_lds[0][wm * WaveM][0][0],
-                           &B8i_lds[0][wn * WaveN][0][0], C32);
-                {
-                    const int last_buf = i % static_cast<int>(KSTG);
-                    apply_mfma(&A8i_lds[last_buf][wm * WaveM][0][0],
-                               &B8i_lds[last_buf][wn * WaveN][0][0], C32);
-                }
-            } else {
-                apply_mfma(&A8i_lds[0][wm * WaveM][0][0],
-                           &B8i_lds[0][wn * WaveN][0][0], C32);
-            }
-            }
 
             /* After the last MFMA, rA/rB are dead (last K-block written to LDS).
              * Reuse them to preload the next modulus's first K-block from HBM.
@@ -716,8 +614,8 @@ oz2_fused_TN_kernel(
         }  /* end NO_CRT constexpr guard */
     }
 
-    /* ── Finalize ── (skipped when NO_CRT=true or NO_FINALIZE=true) */
-    if constexpr (!NO_CRT && !NO_FINALIZE) {
+    /* ── Finalize ── (skipped when NO_CRT=true for MFMA-isolation experiment) */
+    if constexpr (!NO_CRT) {
     /* ── Finalize: CRT range-reduction + inverse scale + write D ─────────────
      * ISA-verified output layout (AMD CDNA3, Sec. 7.1.4.2) per MFMA tile:
      *   col = lane % TILE
@@ -912,8 +810,8 @@ rocblaslt_status oz2_launch_fused_TN(
  * KU_V=2,4 → force a specific K_UNROLL for tuning.
  * FVA_V=false → use LDS accumulators when they fit (default).
  * FVA_V=true  → force VGPR-based accumulators even when LDS has space.        */
-#define OZ2_FUSED_LAUNCH(S_V, HL, WM_V, WN_V, TILE_V, WM_WAVE_V, WN_WAVE_V, KU_V, FVA_V, KS_V) \
-    hipLaunchKernelGGL((oz2_fused_TN_kernel<(S_V),(HL),(WM_V),(WN_V),(TILE_V),(WM_WAVE_V),(WN_WAVE_V),(KU_V),(FVA_V),false,false,(KS_V)>), \
+#define OZ2_FUSED_LAUNCH(S_V, HL, WM_V, WN_V, TILE_V, WM_WAVE_V, WN_WAVE_V, KU_V, FVA_V) \
+    hipLaunchKernelGGL((oz2_fused_TN_kernel<(S_V),(HL),(WM_V),(WN_V),(TILE_V),(WM_WAVE_V),(WN_WAVE_V),(KU_V),(FVA_V)>), \
                        make_grid((WM_V),(WN_V),(TILE_V),(WM_WAVE_V),(WN_WAVE_V)), \
                        dim3((WM_V)*(WN_V)*64u), 0, stream, \
                        A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i, \
@@ -939,21 +837,18 @@ rocblaslt_status oz2_launch_fused_TN(
  * false/true for the bool FORCE_VGPR_ACCUM template parameter).
  * The dispatch table encodes _fva==0 / _fva==1 in the condition, so each call
  * site always passes a compile-time constant — no runtime branch needed here.  */
-/* _OV_DISPATCH: KS_V is the KSTAGES template arg (2 = double buffer default,
- * 3 = triple buffer).  All existing table entries pass 2u; the KSTAGES=3
- * experiment entries (guarded by _ks==3u) pass 3u.                            */
-#define _OV_DISPATCH(S_V,WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V,KS_V) \
+#define _OV_DISPATCH(S_V,WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V) \
     do { \
-        if(has_lo) OZ2_FUSED_LAUNCH((S_V),true, WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V,KS_V); \
-        else       OZ2_FUSED_LAUNCH((S_V),false,WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V,KS_V); \
+        if(has_lo) OZ2_FUSED_LAUNCH((S_V),true, WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V); \
+        else       OZ2_FUSED_LAUNCH((S_V),false,WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V); \
     } while(0)
 
 #define OZ2_DISPATCH_SHAPE_OVERRIDE(S_V) \
     do { \
         const char* _ov = std::getenv("OZ2_FUSED_SHAPE_OVERRIDE"); \
         if (_ov) { \
-            unsigned _wm=0,_wn=0,_wm_w=0,_wn_w=0,_t=0,_ku=0,_fva=0,_ks=2u; \
-            { std::sscanf(_ov,"%u %u %u %u %u %u %u %u",&_wm,&_wn,&_wm_w,&_wn_w,&_t,&_ku,&_fva,&_ks); } \
+            unsigned _wm=0,_wn=0,_wm_w=0,_wn_w=0,_t=0,_ku=0,_fva=0; \
+            { std::sscanf(_ov,"%u %u %u %u %u %u %u",&_wm,&_wn,&_wm_w,&_wn_w,&_t,&_ku,&_fva); } \
             if (_wm && _wn && (_t==16u||_t==32u)) { \
                 /* OZ2_DISPATCH_SHAPE_OVERRIDE always dispatches oz2_fused_TN_kernel<16,...>. \
                  * The caller MUST fix num_moduli=16 via the emulation handle so that the \
@@ -968,156 +863,143 @@ rocblaslt_status oz2_launch_fused_TN(
                         num_moduli); \
                     std::abort(); \
                 } \
-                /* KSTAGES=3 triple-buffer experiment (8th override field = 3). \
-                 * Guarded by _ks==3u so these match first; every entry below is \
-                 * KSTAGES=2 (default).  Only these configs compiled for KSTAGES=3. */ \
-                if      (_ks==3u&&_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,0u,3u); /* 256x256 */ \
-                else if (_ks==3u&&_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,0u,3u); /* 256x128 */ \
-                else if (_ks==3u&&_wm==4&&_wn==4&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,4u,1u,0u,3u); /* 128x256 */ \
-                else if (_ks==3u&&_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,0u,3u); /* 128x128 */ \
-                else if (_ks==3u&&_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,2u,0u,3u); /* 256x64 */ \
-                else if (_ks==3u&&_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,2u,0u,3u); /* 64x256 */ \
-                else if (_ks==3u&&_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,0u,3u); /* 64x128 T32 */ \
-                else if (_ks==3u&&_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,4u,0u,3u); /* 128x64 T32 */ \
-                else if (_ks==3u&&_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,4u,0u,3u); /* 64x128 ku4 */ \
-                else if (_ks==3u&&_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,2u,0u,3u); /* 64x64 */ \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,4u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,4u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,4u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,4u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,4u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,4u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,4u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,4u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,4u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,4u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,4u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,4u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,4u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,4u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,4u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,4u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,4u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,4u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,4u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,4u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,4u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,2u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,2u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,2u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,2u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,2u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,2u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,2u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,2u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,2u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,2u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,2u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,2u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,2u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,2u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,2u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,2u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,2u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,2u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,2u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,2u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,2u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,2u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,1u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,1u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,1u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,1u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,4u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,1u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,1u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,1u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,1u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,1u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,1u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,1u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,1u,1u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,1u,1u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,1u,1u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,1u,1u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,32u,1u,1u,1u,1u,2u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,1u,1u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,1u,1u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,1u,1u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,1u,1u,2u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,1u,1u,2u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,4u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,4u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,4u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,2u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,2u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,2u,1u,2u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,1u,2u); \
+                if      (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,4u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,4u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,4u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,4u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,4u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,4u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,4u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,4u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,4u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,4u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,4u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,4u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,4u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,4u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,4u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,4u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,4u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,4u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,4u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,4u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,4u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,4u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,4u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,4u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,4u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,4u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,4u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,4u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,4u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,4u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,4u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,4u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,4u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,2u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,2u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,2u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,2u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,2u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,2u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,2u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,2u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,2u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,2u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,2u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,2u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,2u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,2u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,2u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,2u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,2u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,2u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,2u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,2u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,2u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,2u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,2u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,2u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,2u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,2u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,2u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,2u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,2u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,2u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,2u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,2u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,2u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,2u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,2u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,2u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,1u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,1u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,1u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,1u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,1u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,1u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,4u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,1u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,1u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,1u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,1u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,1u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,1u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,1u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,1u,0u); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,1u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,1u,0u); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,1u,0u); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,1u,0u); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,1u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,1u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,1u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,1u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,32u,1u,1u,1u,0u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,1u,0u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,1u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,1u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,1u,0u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,1u,0u); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,1u,0u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,1u,1u); \
+                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,1u,1u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,1u,1u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,1u,1u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,32u,1u,1u,1u,1u); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,1u,1u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,1u,1u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,1u,1u); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,1u,1u); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,1u,1u); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,4u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,4u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,4u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,2u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,2u,1u); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,2u,1u); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,1u); \
                 else { return rocblaslt_status_invalid_value; } \
                 return rocblaslt_status_success; \
             } \
@@ -1142,9 +1024,9 @@ rocblaslt_status oz2_launch_fused_TN(
          * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256,       \
          * keeping all CUs occupied.                                              */ \
         if (is_gfx950 && m >= 8192 && n >= 8192 && k >= 8192) { \
-            _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,2u);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1 */ \
+            _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1 */ \
         } else { \
-            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,2u);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 */ \
+            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 */ \
         } \
     } while(0)
 
@@ -1172,36 +1054,6 @@ rocblaslt_status oz2_launch_fused_TN(
             else
                 hipLaunchKernelGGL(
                     (oz2_fused_TN_kernel<16u, false, 4u, 4u, 16u, 2u, 2u, 2u, false, true>),
-                    make_grid(4u, 4u, 16u, 2u, 2u), dim3(4u * 4u * 64u), 0, stream,
-                    A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i,
-                    C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, num_xccs);
-            return rocblaslt_status_success;
-        }
-    }
-
-    /* ── OZ2_NO_FINALIZE=1 experiment: dispatch CRT-only kernel (no D-write) ──
-     * Skips only the finalize/D-write block; CRT accumulation runs normally.
-     * Time = full - no_finalize → D-write + finalization cost.
-     * Time = no_finalize - no_crt → pure CRT arithmetic cost.               */
-    {
-        const char* _no_fin_env = std::getenv("OZ2_NO_FINALIZE");
-        if (_no_fin_env && std::strcmp(_no_fin_env, "1") == 0) {
-            if (num_moduli != 16u) {
-                std::fprintf(stderr,
-                    "[oz2_launch_fused_TN] OZ2_NO_FINALIZE=1 requires num_moduli=16 (got %u)\n",
-                    num_moduli);
-                std::abort();
-            }
-            /* NO_CRT=false, NO_FINALIZE=true: runs MFMA + CRT, skips D-write. */
-            if (has_lo)
-                hipLaunchKernelGGL(
-                    (oz2_fused_TN_kernel<16u, true,  4u, 4u, 16u, 2u, 2u, 2u, false, false, true>),
-                    make_grid(4u, 4u, 16u, 2u, 2u), dim3(4u * 4u * 64u), 0, stream,
-                    A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i,
-                    C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, num_xccs);
-            else
-                hipLaunchKernelGGL(
-                    (oz2_fused_TN_kernel<16u, false, 4u, 4u, 16u, 2u, 2u, 2u, false, false, true>),
                     make_grid(4u, 4u, 16u, 2u, 2u), dim3(4u * 4u * 64u), 0, stream,
                     A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i,
                     C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, num_xccs);
