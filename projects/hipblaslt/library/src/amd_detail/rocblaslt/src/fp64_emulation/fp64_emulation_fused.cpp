@@ -733,6 +733,13 @@ oz2_fused_TN_kernel(
             for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
                 const unsigned reg_off = (wm_w * WaveN + wn_w) * NREG_single;
                 const double nm = oz2_neg_mod(s), im = oz2_inv_mod(s);
+                /* Hoist the s-runtime CRT coefficients out of the innermost
+                 * e/sub loops.  Kept at (wm_w, wn_w) tile scope (NOT above the
+                 * K-loop) so they stay dead during the MFMA phase and add no
+                 * VGPR pressure to the register-critical inner K-loop.
+                 * qlo is only consumed when HAS_LO (S > 7).                    */
+                const double qhi = oz2_qpi_hi(S - 2, s);
+                const double qlo = HAS_LO ? oz2_qpi_lo(S - 2, s) : 0.0;
                 if constexpr (!USE_LDS_ACCUM && NREG_sub_iters == 1u) {
                     /* Fast path: compute directly on Zhi_reg/Zlo_reg.
                      * For TILE=16 (NREG_sub=NREG_single=4, NREG_sub_iters=1) the
@@ -742,12 +749,12 @@ oz2_fused_TN_kernel(
                     for (unsigned e = 0; e < NREG_sub; ++e) {
                         const double dc_raw = static_cast<double>(C32[reg_off + e]);
                         const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-                        const double hi     = dc * oz2_qpi_hi(S - 2, s);
+                        const double hi     = dc * qhi;
                         const double new_hi = Zhi_reg[reg_off + e] + hi;
                         const double err    = hi - (new_hi - Zhi_reg[reg_off + e]);
                         Zhi_reg[reg_off + e] = new_hi;
                         if constexpr (HAS_LO)
-                            Zlo_reg[reg_off + e] = fma(dc, oz2_qpi_lo(S - 2, s),
+                            Zlo_reg[reg_off + e] = fma(dc, qlo,
                                                        Zlo_reg[reg_off + e] + err);
                         else Zlo_reg[reg_off + e] += err;
                     }
@@ -775,11 +782,11 @@ oz2_fused_TN_kernel(
                         for (unsigned e = 0; e < NREG_sub; ++e) {
                             const double dc_raw = static_cast<double>(C32[reg_off + sub_e0 + e]);
                             const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-                            const double hi     = dc * oz2_qpi_hi(S - 2, s);
+                            const double hi     = dc * qhi;
                             const double new_hi = Zhi_t[e] + hi;
                             const double err    = hi - (new_hi - Zhi_t[e]);
                             Zhi_t[e] = new_hi;
-                            if constexpr (HAS_LO) Zlo_t[e] = fma(dc, oz2_qpi_lo(S - 2, s), Zlo_t[e] + err);
+                            if constexpr (HAS_LO) Zlo_t[e] = fma(dc, qlo, Zlo_t[e] + err);
                             else                  Zlo_t[e] += err;
                         }
                         if constexpr (USE_LDS_ACCUM) {
