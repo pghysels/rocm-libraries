@@ -77,6 +77,15 @@ struct KernelConfig {
 };
 
 static const KernelConfig CONFIGS[] = {
+    /* ── PRODUCTION / IMPORTANT CONFIGS (run first) ──
+     * Duplicated here so the shape-heuristic-dispatched winners benchmark
+     * before the full sweep.  (Originals remain below → these run twice.)   */
+    { 4, 4, 2, 2, 16, 2, false, false, false, "WM4WN4Wm2Wn2T16ku2" },  /* 128×128 KU2 — small_k/square/default winner */
+    { 4, 4, 4, 2, 16, 1, false, false, false, "WM4WN4Wm4Wn2T16ku1" },  /* 256×128 KU1 — tall/wide elongated (large K) */
+    { 4, 4, 4, 4, 16, 1, false, false, false, "WM4WN4Wm4Wn4T16ku1" },  /* 256×256 KU1 — gfx950 large symmetric */
+    { 4, 4, 1, 2, 16, 4, false, false, false, "WM4WN4Wm1Wn2T16ku4" },  /* 64×128 KU4  — task focus small_k */
+    { 4, 4, 2, 1, 16, 4, false, false, false, "WM4WN4Wm2Wn1T16ku4" },  /* 128×64 KU4  — task focus small_k */
+
     /* ── DTL=1 (DirectToLDS) candidate configs — sweep the USE_DTL axis ── */
     { 1, 1, 1, 1, 16, 4, false, false, true, "WM1WN1Wm1Wn1T16ku4dtl1" },
     { 1, 1, 1, 1, 16, 2, false, false, true, "WM1WN1Wm1Wn1T16ku2dtl1" },
