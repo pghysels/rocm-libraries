@@ -2393,14 +2393,37 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
                 (fused_mode == Oz2FusedMode::ON ||
                  (pm.t_fused_ms > 0.0 &&
                   pm.t_fused_ms < pm.t_int8_gemms_ms + pm.t_accum_ms))) {
-                /* Zero A8i/B8i workspace padding so the fused kernel's double-buffer
-                 * prefetch reads zeros beyond k_int. */
-                /* Zero workspace padding so the fused kernel's double-buffer prefetch
-                 * reads zeros beyond k.  OZ2_FUSED_KBLK_LOAD_MAX is the maximum
-                 * KBLK_LOAD across all kernel variants (TILE=16 and TILE=32).      */
+                /* Zero ONLY the K-padding tail [k, lda8i) of each row so the fused
+                 * kernel's double-buffer prefetch reads zeros beyond k_int.  The
+                 * scale kernels write columns [0, k); the padding columns [k, lda8i)
+                 * (lda8i = oz2_pad(k), a 128-byte multiple) are what the DTL prefetch
+                 * over-reads and must be zero.
+                 *
+                 * Previously this zeroed the ENTIRE A8i/B8i workspace
+                 * (chunk_size × lda8i × cola8i and chunk_size × ldb8i × n) whenever
+                 * k was not a multiple of OZ2_FUSED_KBLK_LOAD_MAX.  Since the INT8
+                 * arrays are 128-byte aligned/padded (OZ2_ALIGN=128) with a
+                 * contiguous per-modulus slab layout, all moduli's rows form one
+                 * contiguous (rows × pitch) block, so a single 2D memset of just the
+                 * tail band (width = lda8i - k, height = rows) zeros every modulus's
+                 * padding in one launch — moving far less bandwidth for non-256-K
+                 * (e.g. k=1000 → 24/1024 bytes/row instead of the full row).
+                 * Guard unchanged: when k is a multiple of KBLK_LOAD_MAX the DTL
+                 * prefetch never over-reads, so no zeroing is needed.               */
                 if (static_cast<int>(k) % static_cast<int>(OZ2_FUSED_KBLK_LOAD_MAX) != 0) {
-                    (void)hipMemsetAsync(A8i, 0, szA8i, stream);
-                    (void)hipMemsetAsync(B8i, 0, szB8i, stream);
+                    const size_t tail_w = lda8i - static_cast<size_t>(k);  /* == ldb8i - k */
+                    if (tail_w > 0u) {
+                        /* A8i: rows = cola8i × chunk_size (contiguous slabs), pitch lda8i,
+                         * zero columns [k, lda8i). */
+                        (void)hipMemset2DAsync(A8i + static_cast<size_t>(k), lda8i,
+                                               0, tail_w,
+                                               cola8i * static_cast<size_t>(chunk_size), stream);
+                        /* B8i: rows = n × chunk_size, pitch ldb8i, zero columns [k, ldb8i). */
+                        (void)hipMemset2DAsync(B8i + static_cast<size_t>(k), ldb8i,
+                                               0, tail_w,
+                                               static_cast<size_t>(n) * static_cast<size_t>(chunk_size),
+                                               stream);
+                    }
                 }
                 /* Fused path: scale all moduli in chunks, then MFMA+CRT fused kernel. */
                 for (unsigned chunk_start = 0; chunk_start < effective_s; chunk_start += chunk_size)

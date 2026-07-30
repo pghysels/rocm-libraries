@@ -109,6 +109,46 @@ oz2_load_mfma_src32(const int8_t* __restrict__ ptr) noexcept {
     return oz2_load_mfma_src16(ptr);
 }
 
+/* ── DTL per-row global→LDS load helper ────────────────────────────────────
+ * Streams `n_dwords` consecutive dwords of one padded A/B row from HBM into
+ * the wave-UNIFORM LDS row base `lds_base` via __builtin_amdgcn_global_load_lds,
+ * following the verified contract (per-lane source, uniform LDS base, exec mask
+ * honored).  `src_lane0` is the row's byte source for lane 0 (row start + k_off);
+ * lane L reads src_lane0 + L*4 and the hardware writes it to lds_base + L*4.
+ *
+ * ARCH-SPECIFIC WIDTH (verified on this toolchain):
+ *   gfx942: __builtin_amdgcn_global_load_lds accepts size ∈ {1,2,4} ONLY
+ *           (size=12/16 REJECTED at compile time).  → K4DIM 4-byte loads,
+ *           one per active lane (lane < n_dwords).  UNCHANGED from the
+ *           runtime-validated path.
+ *   gfx950: size=16 (dwordx4) compiles.  → n_dwords/4 sixteen-byte loads,
+ *           each active lane (lane < n_dwords/4) moving 4 consecutive dwords,
+ *           quartering the DTL load-instruction count.  n_dwords is always a
+ *           multiple of 4 for all gfx950 DTL configs (K4DIM = KBLK_LOAD/4 with
+ *           KBLK=64 T16 / 32 T32, K_UNROLL≥1 → K4DIM ∈ {8,16,32,64}).
+ *           gfx950 wide-load runtime semantics are compile-verified only here
+ *           (no gfx950 hardware); the gfx942 path is the runtime-validated one. */
+__device__ __forceinline__ void
+oz2_dtl_row_load(const int8_t* __restrict__ src_lane0,
+                 uint32_t* __restrict__ lds_base,
+                 int lane, unsigned n_dwords) noexcept
+{
+#if defined(__gfx950__)
+    /* 16-byte (dwordx4) per active lane: lane L handles dwords [4L, 4L+4). */
+    const unsigned n_quads = n_dwords >> 2;   /* n_dwords always a multiple of 4 */
+    if (static_cast<unsigned>(lane) < n_quads)
+        __builtin_amdgcn_global_load_lds(
+            reinterpret_cast<const uint32_t*>(src_lane0 + lane * 16),
+            lds_base + lane * 4u, 16u, 0u, 0u);
+#else
+    /* gfx942 (and host pass): 4-byte per active lane — runtime-validated path. */
+    if (static_cast<unsigned>(lane) < n_dwords)
+        __builtin_amdgcn_global_load_lds(
+            reinterpret_cast<const uint32_t*>(src_lane0 + lane * 4),
+            lds_base + lane, 4u, 0u, 0u);
+#endif
+}
+
 /* =========================================================================
  * oz2_fused_TN_kernel — unified template supporting three macrotile sizes:
  *
@@ -522,17 +562,20 @@ oz2_fused_TN_kernel(
             uint32_t*     B_rdst0[B_ROWS_PER_WAVE];
             static constexpr unsigned A_BUF_DWORDS = (WM * WaveM * TILE * KBLK_STRIDE) / 4u;
             static constexpr unsigned B_BUF_DWORDS = (WN * WaveN * TILE * KBLK_STRIDE) / 4u;
+            /* Per-row cursors hold the LANE-0 row byte source (row start + k_off);
+             * oz2_dtl_row_load adds each lane's per-lane offset internally so it
+             * can pick the arch-appropriate load width (4-byte on gfx942, wide
+             * 16-byte on gfx950).  Cursors advance by KBLK_LOAD per K-block. */
             #pragma unroll
             for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
                 const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                 if (r < NROWS_A) {
                     const int mi = block_m_base + static_cast<int>(r);
-                    A_rsrc[ri]  = A8i_s + static_cast<size_t>(mi) * lda8i
-                                + static_cast<size_t>(lane) * 4u;
+                    A_rsrc[ri]  = A8i_s + static_cast<size_t>(mi) * lda8i;  /* lane-0 base */
                     A_rdst0[ri] = reinterpret_cast<uint32_t*>(
                                     &A8i_lds[0][r / TILE][r % TILE][0]);
                 } else {
-                    A_rsrc[ri]  = A8i_s + static_cast<size_t>(lane) * 4u;  /* unused */
+                    A_rsrc[ri]  = A8i_s;  /* unused */
                     A_rdst0[ri] = reinterpret_cast<uint32_t*>(&A8i_lds[0][0][0][0]);
                 }
             }
@@ -541,12 +584,11 @@ oz2_fused_TN_kernel(
                 const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                 if (r < NROWS_B) {
                     const int ni = block_n_base + static_cast<int>(r);
-                    B_rsrc[ri]  = B8i_s + static_cast<size_t>(ni) * ldb8i
-                                + static_cast<size_t>(lane) * 4u;
+                    B_rsrc[ri]  = B8i_s + static_cast<size_t>(ni) * ldb8i;  /* lane-0 base */
                     B_rdst0[ri] = reinterpret_cast<uint32_t*>(
                                     &B8i_lds[0][r / TILE][r % TILE][0]);
                 } else {
-                    B_rsrc[ri]  = B8i_s + static_cast<size_t>(lane) * 4u;  /* unused */
+                    B_rsrc[ri]  = B8i_s;  /* unused */
                     B_rdst0[ri] = reinterpret_cast<uint32_t*>(&B8i_lds[0][0][0][0]);
                 }
             }
@@ -556,16 +598,14 @@ oz2_fused_TN_kernel(
             #pragma unroll
             for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
                 const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
-                if (r < NROWS_A && lane < static_cast<int>(K4DIM))
-                    __builtin_amdgcn_global_load_lds(
-                        reinterpret_cast<const uint32_t*>(A_rsrc[ri]), A_rdst0[ri], 4u, 0u, 0u);
+                if (r < NROWS_A)
+                    oz2_dtl_row_load(A_rsrc[ri], A_rdst0[ri], lane, K4DIM);
             }
             #pragma unroll
             for (unsigned ri = 0; ri < B_ROWS_PER_WAVE; ++ri) {
                 const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
-                if (r < NROWS_B && lane < static_cast<int>(K4DIM))
-                    __builtin_amdgcn_global_load_lds(
-                        reinterpret_cast<const uint32_t*>(B_rsrc[ri]), B_rdst0[ri], 4u, 0u, 0u);
+                if (r < NROWS_B)
+                    oz2_dtl_row_load(B_rsrc[ri], B_rdst0[ri], lane, K4DIM);
             }
             __syncthreads();
 
@@ -579,19 +619,17 @@ oz2_fused_TN_kernel(
                 for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
                     const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                     A_rsrc[ri] += KBLK_LOAD;
-                    if (r < NROWS_A && lane < static_cast<int>(K4DIM))
-                        __builtin_amdgcn_global_load_lds(
-                            reinterpret_cast<const uint32_t*>(A_rsrc[ri]),
-                            A_rdst0[ri] + static_cast<unsigned>(nxt) * A_BUF_DWORDS, 4u, 0u, 0u);
+                    if (r < NROWS_A)
+                        oz2_dtl_row_load(A_rsrc[ri],
+                            A_rdst0[ri] + static_cast<unsigned>(nxt) * A_BUF_DWORDS, lane, K4DIM);
                 }
                 #pragma unroll
                 for (unsigned ri = 0; ri < B_ROWS_PER_WAVE; ++ri) {
                     const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                     B_rsrc[ri] += KBLK_LOAD;
-                    if (r < NROWS_B && lane < static_cast<int>(K4DIM))
-                        __builtin_amdgcn_global_load_lds(
-                            reinterpret_cast<const uint32_t*>(B_rsrc[ri]),
-                            B_rdst0[ri] + static_cast<unsigned>(nxt) * B_BUF_DWORDS, 4u, 0u, 0u);
+                    if (r < NROWS_B)
+                        oz2_dtl_row_load(B_rsrc[ri],
+                            B_rdst0[ri] + static_cast<unsigned>(nxt) * B_BUF_DWORDS, lane, K4DIM);
                 }
                 apply_mfma(&A8i_lds[curd][wm * WaveM][0][0], &B8i_lds[curd][wn * WaveN][0][0], C32);
                 __syncthreads();
