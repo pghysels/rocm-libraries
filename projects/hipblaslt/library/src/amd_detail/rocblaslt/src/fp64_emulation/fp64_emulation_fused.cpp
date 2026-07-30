@@ -138,13 +138,13 @@ oz2_dtl_row_load(const int8_t* __restrict__ src_lane0,
     const unsigned n_quads = n_dwords >> 2;   /* n_dwords always a multiple of 4 */
     if (static_cast<unsigned>(lane) < n_quads)
         __builtin_amdgcn_global_load_lds(
-            reinterpret_cast<const uint32_t*>(src_lane0 + lane * 16),
+            reinterpret_cast<uint32_t*>(const_cast<int8_t*>(src_lane0) + lane * 16),
             lds_base + lane * 4u, 16u, 0u, 0u);
 #else
     /* gfx942 (and host pass): 4-byte per active lane — runtime-validated path. */
     if (static_cast<unsigned>(lane) < n_dwords)
         __builtin_amdgcn_global_load_lds(
-            reinterpret_cast<const uint32_t*>(src_lane0 + lane * 4),
+            reinterpret_cast<uint32_t*>(const_cast<int8_t*>(src_lane0) + lane * 4),
             lds_base + lane, 4u, 0u, 0u);
 #endif
 }
@@ -1237,21 +1237,29 @@ rocblaslt_status oz2_launch_fused_TN(
     do { \
         /* Shape heuristic — two architectures, one macro.                        \
          *                                                                        \
-         * gfx942 (MI300X): WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) is best across  \
-         *   all shapes (directional M/N-swizzle for tall/wide L2 reuse):        \
-         *   square K=32768: 31878 GFLOP/s   square K=1024: 27381 GFLOP/s       \
-         *   tall M>>N:      15633 GFLOP/s   wide N>>M:     14812 GFLOP/s       \
+         * gfx942 (MI300X):                                                       \
+         *   square / small-K:  WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) is best.      \
+         *     square K=32768: 31878 GFLOP/s   square K=1024: 27381 GFLOP/s      \
+         *   ELONGATED (tall M≫N or wide N≫M) with large K: the 256×128         \
+         *     macrotile WM4WN4Wm4Wn2T16ku1 is faster (rocprofv3 min-kernel µs,  \
+         *     Warmup=3 + profiled, gfx942 MI300X):                              \
+         *       tall M=32768,N=256,K=32768: 20606 µs (256×128) vs 21275 (128×128) → −3.1% \
+         *       wide M=256,N=32768,K=32768: 20142 µs (256×128) vs 21034 (128×128) → −4.2% \
+         *     256×128 wins BOTH directions (beats 128×256 on wide too), because  \
+         *     the longer M-macrotile amortises scale/MFMA startup over the       \
+         *     skinny dimension while KU=1 keeps per-barrier KBLK_LOAD small for  \
+         *     very large K.  Gated on large K (≥4096) so small-K elongated       \
+         *     shapes keep the 128×128 KU=2 winner.                               \
          *                                                                        \
-         * gfx950 (MI355X): same 128×128 KU=2 is best for small-K / tall / wide.\
-         *   But for large symmetric shapes (M,N,K ≥ 8192) the 256×256 KU=1     \
-         *   config is +23% better:                                               \
-         *   square K=32768: 76472 GFLOP/s (256×256) vs 61999 (128×128)         \
-         *   square K=1024:  best with 128×128 (256×256 gives only 8436)         \
-         *   tall / wide:    best with 128×128                                    \
-         * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256,       \
-         * keeping all CUs occupied.                                              */ \
+         * gfx950 (MI355X): 128×128 KU=2 for small-K / tall / wide; 256×256 KU=1 \
+         *   for large symmetric shapes (M,N,K ≥ 8192, +23%).  The gfx942        \
+         *   elongated 256×128 branch is gfx942-only (unmeasured on gfx950).      \
+         * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256.        */ \
+        const bool _elongated = (m >= 4*n) || (n >= 4*m); \
         if (is_gfx950 && m >= 8192 && n >= 8192 && k >= 8192) { \
             _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,false);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1 */ \
+        } else if (!is_gfx950 && _elongated && k >= 4096) { \
+            _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,false,false);  /* WM4WN4Wm4Wn2T16: 256×128, KU=1 (tall/wide) */ \
         } else { \
             _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 */ \
         } \
