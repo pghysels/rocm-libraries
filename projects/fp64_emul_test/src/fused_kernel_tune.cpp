@@ -361,7 +361,8 @@ static std::string detect_gpu_name(int dev)
     int chip_id = 0;
     (void)hipDeviceGetAttribute(&chip_id, hipDeviceAttributePciChipId, dev);
     uint32_t pci = static_cast<uint32_t>(chip_id) & 0xFFFFu;
-    if (pci == 0x75a3u || pci == 0x75b3u) return "gfx950 (MI350)";
+    if (pci == 0x75a3u || pci == 0x75b3u) return "gfx950 (MI350X)";
+    if (pci == 0x75a0u || pci == 0x75b0u) return "gfx950 (MI355X)";
     if (pci == 0x74a1u) return "gfx942 (MI300X)";
     char name[128] = {};
     (void)hipDeviceGetName(name, sizeof(name), dev);
@@ -471,7 +472,7 @@ int main(int argc, char** argv)
     int num_xccs = 0;
     (void)hipDeviceGetAttribute(&num_xccs, hipDeviceAttributeNumberOfXccs, cur_dev);
     std::fprintf(stderr, "Device: %s  XCCs: %d\n", gpu_name.c_str(), num_xccs);
-    const bool is_gfx950 = (gpu_name.find("MI350") != std::string::npos);
+    const bool is_gfx950 = (gpu_name.find("gfx950") != std::string::npos);
 
     /* ── Create handles ─────────────────────────────────────────────────── */
     /* Emulated handle: eager mode, S fixed at 16.
