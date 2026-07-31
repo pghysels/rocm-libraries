@@ -47,7 +47,7 @@ int main(int argc, char** argv)
 
     /* Mandatory env vars */
     setenv("HIPBLASLT_EMULATE_DOUBLE_PRECISION", "1", 1);
-    setenv("HIPBLASLT_EMULATION_FUSED",          "force", 1);
+    setenv("HIPBLASLT_EMULATION_FUSED",          "force", 0); /* 0 = don't override if already set */
 
     const char* cfg = std::getenv("OZ2_FUSED_SHAPE_OVERRIDE");
     std::fprintf(stderr, "OZ2_FUSED_SHAPE_OVERRIDE=%s\n", cfg ? cfg : "(not set, using launcher default)");
