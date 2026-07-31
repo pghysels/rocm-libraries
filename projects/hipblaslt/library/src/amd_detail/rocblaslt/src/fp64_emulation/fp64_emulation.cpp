@@ -1936,8 +1936,7 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
         /* When fused mode is active (HIPBLASLT_EMULATION_FUSED=on/force), use the
          * fused chunk formula (no C32i in workspace budget): chunk_size = S for all
          * practical shapes → n_chunks = 1 → no binary-halving split.
-         * Eliminates per-leaf pipeline overhead that caused uniform ~42 TFLOP/s for
-         * all macrotile configs on small-K shapes (shape1: M=N=32768, K=1024).  */
+         */
         const bool fused_forced = (oz2_fused_mode() == Oz2FusedMode::ON);
         const unsigned chunk_sz = fused_forced
             ? oz2_compute_chunk_size_fused(m, n, k, num_moduli)
@@ -2619,13 +2618,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
          *      a previous GPU fault on the same stream.  hipMallocAsync fails
          *      immediately when the stream has a sticky error, even with plenty
          *      of free device memory.
-         *  (2) The allocation draws from the same device memory pool as the
-         *      benchmark's memory_pool<d_memory> (which also uses hipMalloc),
-         *      so pool contention is resolved naturally: if device memory is
-         *      scarce, the benchmark pool's existing retry logic (pool.clear()
-         *      on hipMalloc failure) frees idle matrix buffers.
-         *  The synchronous overhead of hipMalloc is negligible compared to the
-         *  hundreds-of-millisecond GEMM that follows.                           */
+         */
         if(hipMalloc(&ws_toplevel, wsNeeded) != hipSuccess)
             return rocblaslt_status_memory_error;
         effectiveSettings.workspace       = ws_toplevel;
