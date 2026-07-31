@@ -1382,7 +1382,12 @@ rocblaslt_status oz2_launch_fused_TN(
         /* Shape heuristic — two architectures, one macro.                        \
          *                                                                        \
          * gfx942 (MI300X):                                                       \
-         *   square / small-K:  WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) is best.      \
+         *   SMALL-K (K ≤ 256): WM4WN4Wm2Wn2T16ku1 (128×128, KU=1) wins.         \
+         *     KU=1 avoids double-buffering overhead when K is so small that the  \
+         *     entire K-dimension fits in one KBLK (=K_UNROLL×32 = 32 for KU=1). \
+         *     Measured gains vs KU=2 on gfx942 MI300X (32768×32768):             \
+         *       K=64:  +41%   K=128: +34%   K=256: +15%                          \
+         *   square / medium-K:  WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) is best.     \
          *     square K=32768: 31878 GFLOP/s   square K=1024: 27381 GFLOP/s      \
          *   ELONGATED (tall M≫N or wide N≫M) with large K: the 256×128         \
          *     macrotile WM4WN4Wm4Wn2T16ku1 is faster (rocprofv3 min-kernel µs,  \
@@ -1393,17 +1398,20 @@ rocblaslt_status oz2_launch_fused_TN(
          *     the longer M-macrotile amortises scale/MFMA startup over the       \
          *     skinny dimension while KU=1 keeps per-barrier KBLK_LOAD small for  \
          *     very large K.  Gated on large K (≥4096) so small-K elongated       \
-         *     shapes keep the 128×128 KU=2 winner.                               \
+         *     shapes keep the 128×128 KU=1 winner.                               \
          *                                                                        \
          * gfx950 (MI355X): 128×128 KU=2 for small-K / tall / wide; 256×256 KU=1 \
          *   for large symmetric shapes (M,N,K ≥ 8192, +23%).  The gfx942        \
-         *   elongated 256×128 branch is gfx942-only (unmeasured on gfx950).      \
+         *   small-K KU=1 and elongated 256×128 branches are gfx942-only          \
+         *   (unmeasured on gfx950).                                               \
          * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256.        */ \
         const bool _elongated = (m >= 4*n) || (n >= 4*m); \
         if (is_gfx950 && m >= 8192 && n >= 8192 && k >= 8192) { \
             _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,false);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1 */ \
         } else if (!is_gfx950 && _elongated && k >= 4096) { \
             _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,false,false);  /* WM4WN4Wm4Wn2T16: 256×128, KU=1 (tall/wide) */ \
+        } else if (!is_gfx950 && k <= 256) { \
+            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,false,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=1 (small-K) */ \
         } else { \
             _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 */ \
         } \
