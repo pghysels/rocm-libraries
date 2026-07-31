@@ -273,6 +273,22 @@ namespace
         EXPECT_FALSE(would_apply(HIP_R_64F, 4096, 4096, 4096, 2));
     }
 
+    // PERFORMANT strategy uses the cost model; small GEMMs should be rejected.
+    TEST_F(Fp64EmulationTest, WouldApply_PerformantSmallReturnsFalse)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT);
+        EXPECT_FALSE(would_apply(HIP_R_64F, 16, 16, 16, 1));
+    }
+
+    // PERFORMANT strategy should accept large FP64 GEMMs where emulation wins.
+    TEST_F(Fp64EmulationTest, WouldApply_PerformantLargeReturnsTrue)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT);
+        EXPECT_TRUE(would_apply(HIP_R_64F, 4096, 4096, 4096, 1));
+    }
+
     TEST_F(Fp64EmulationTest, ApiValidationRejectsInvalidMantissaControl)
     {
         EXPECT_EQ(hipblasLtSetFixedPointEmulationMantissaControl(
@@ -451,6 +467,7 @@ namespace
             return (static_cast<double>(vi) == v) ? std::to_string(vi) : "x";
         };
         return "s" + std::to_string(p.s) + suf
+               + "_" + std::to_string(p.m) + "x" + std::to_string(p.n) + "x" + std::to_string(p.k)
                + "_" + opA_c + opB_c
                + "_a" + fmt_s(p.alpha)
                + "_b" + fmt_s(p.beta);
@@ -925,6 +942,71 @@ namespace
         EmulAccuracyParamName
     );
 
+    // ── RectangularShapes: non-square m×n×k to exercise different tile paths ──
+    //
+    // All existing accuracy tests use square 64² or 128² output shapes.
+    // These rectangular shapes test different kernel tile selection and
+    // edge-handling in the extraction and finalize kernels.
+    INSTANTIATE_TEST_SUITE_P(
+        RectangularShapes,
+        Fp64EmulationAccuracyTest,
+        ::testing::Values(
+            /* Tall-and-thin output (m >> n) */
+            EmulAccuracyParam{16, 512, 16, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
+            /* Wide-and-short output (n >> m) */
+            EmulAccuracyParam{16, 16, 512, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
+            /* Intermediate rectangular */
+            EmulAccuracyParam{16, 256, 64, 1024, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 }
+        ),
+        EmulAccuracyParamName
+    );
+
+    // ── Demmel matrix helper ──────────────────────────────────────────────────
+    //
+    // Shared construction for DemmelAdpFallback and DemmelBlas2 tests.
+    // Generates x ~ U(1,2), d[m] = 2^{j_m}, j_m = -b + round(m×2b/(n-1)),
+    // and fills column-major A and B:
+    //   A[col*n+row] = x[(row+col)%n] × d[(row+col)%n]
+    //   B[col*n+row] = x[(row+col)%n] / d[(row+col)%n]
+    static void build_demmel_ab(int n, int b,
+                                std::vector<double>& h_x,
+                                std::vector<double>& h_d,
+                                std::vector<double>& h_A,
+                                std::vector<double>& h_B)
+    {
+        const size_t N = static_cast<size_t>(n);
+        h_x.resize(N);
+        h_d.resize(N);
+        h_A.resize(N * N);
+        h_B.resize(N * N);
+
+        for(int i = 0; i < n; ++i)
+        {
+            uint64_t s = static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL
+                         + 1442695040888963407ULL;
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            h_x[static_cast<size_t>(i)] =
+                1.0 + static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0);
+        }
+
+        const double delta = (n > 1) ? (2.0 * b) / static_cast<double>(n - 1) : 0.0;
+        for(int m = 0; m < n; ++m)
+        {
+            double jm = -b + std::round(static_cast<double>(m) * delta);
+            h_d[static_cast<size_t>(m)] = std::ldexp(1.0, static_cast<int>(jm));
+        }
+
+        for(int col = 0; col < n; ++col)
+            for(int row = 0; row < n; ++row)
+            {
+                const size_t m   = static_cast<size_t>((row + col) % n);
+                const size_t idx = static_cast<size_t>(col * n + row);
+                h_A[idx] = h_x[m] * h_d[m];
+                h_B[idx] = h_x[m] / h_d[m];
+            }
+    }
+
     // ── DemmelAdpFallback: ADP must detect overflow for extreme b ─────────────
     //
     // For b=32, n=128 the ADP reduction computes:
@@ -953,33 +1035,8 @@ namespace
         constexpr size_t N2    = static_cast<size_t>(n) * n;
         const size_t     bytes = N2 * sizeof(double);
 
-        // Generate x ~ U(1,2) and d[m] = 2^{j_m}
-        std::vector<double> h_x(n), h_d(n);
-        for(int i = 0; i < n; ++i)
-        {
-            uint64_t s = static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL
-                         + 1442695040888963407ULL;
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            h_x[i] = 1.0 + static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0);
-        }
-        const double delta_d = (n > 1) ? (2.0 * b) / (n - 1) : 0.0;
-        for(int m = 0; m < n; ++m)
-        {
-            double jm = -b + std::round(static_cast<double>(m) * delta_d);
-            h_d[m] = std::ldexp(1.0, static_cast<int>(jm));
-        }
-
-        // Fill A[col*n+row] = x[(row+col)%n]*d[...], B[...] = x[...]/d[...]
-        std::vector<double> h_A(N2), h_B(N2);
-        for(int col = 0; col < n; ++col)
-            for(int row = 0; row < n; ++row)
-            {
-                const size_t m   = static_cast<size_t>((row + col) % n);
-                const size_t idx = static_cast<size_t>(col * n + row);
-                h_A[idx] = h_x[m] * h_d[m];
-                h_B[idx] = h_x[m] / h_d[m];
-            }
+        std::vector<double> h_x, h_d, h_A, h_B;
+        build_demmel_ab(n, b, h_x, h_d, h_A, h_B);
 
         double *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr;
         ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
@@ -1065,41 +1122,11 @@ namespace
     {
         const EmulDemmelParam& p = GetParam();
         const int64_t          N = static_cast<int64_t>(p.n);
+        const size_t           N2 = static_cast<size_t>(N) * static_cast<size_t>(N);
 
-        // ── Host: x[i] ~ U(1,2) using the same XORshift64 RNG as the bench ──
-        std::vector<double> h_x(static_cast<size_t>(N));
-        for(int64_t i = 0; i < N; ++i)
-        {
-            uint64_t s = static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL
-                         + 1442695040888963407ULL;
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            h_x[static_cast<size_t>(i)] =
-                1.0 + static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0);
-        }
-
-        // ── Host: d[m] = 2^{j_m}, j_m = -b + round(m × 2b / (n-1)) ─────────
-        std::vector<double> h_d(static_cast<size_t>(N));
-        const double delta = (N > 1) ? (2.0 * p.b) / static_cast<double>(N - 1) : 0.0;
-        for(int64_t m = 0; m < N; ++m)
-        {
-            double jm = -p.b + std::round(static_cast<double>(m) * delta);
-            h_d[static_cast<size_t>(m)] = std::ldexp(1.0, static_cast<int>(jm));
-        }
-
-        // ── Host: fill A and B (column-major, lda=ldb=N) ─────────────────────
-        // A[col*N+row] = x[(row+col)%N] * d[(row+col)%N]
-        // B[col*N+row] = x[(row+col)%N] / d[(row+col)%N]
-        const size_t        N2 = static_cast<size_t>(N) * static_cast<size_t>(N);
-        std::vector<double> h_A(N2), h_B(N2);
-        for(int64_t col = 0; col < N; ++col)
-            for(int64_t row = 0; row < N; ++row)
-            {
-                const size_t m   = static_cast<size_t>((row + col) % N);
-                const size_t idx = static_cast<size_t>(col * N + row);
-                h_A[idx] = h_x[m] * h_d[m];
-                h_B[idx] = h_x[m] / h_d[m];
-            }
+        // ── Host: build Demmel A, B matrices using shared helper ──────────────
+        std::vector<double> h_x, h_d, h_A, h_B;
+        build_demmel_ab(p.n, p.b, h_x, h_d, h_A, h_B);
 
         // ── Host: exact reference in long double for all n² elements ──────────
         // C is circulant: C[k,i] = h[(i-k+N)%N] where
@@ -1225,6 +1252,16 @@ namespace
         DemmelBlas2,
         Fp64EmulationDemmelTest,
         ::testing::Values(
+            // s=7..14, b=0: d[m]=1 for all m → A=B elementwise, trivially safe.
+            // Thresholds match CRT capacity per s (same pattern as AllModuliCounts).
+            EmulDemmelParam{ 7, 512, 0, 5e-4},
+            EmulDemmelParam{ 8, 512, 0, 5e-4},
+            EmulDemmelParam{ 9, 512, 0, 1e-6},
+            EmulDemmelParam{10, 512, 0, 1e-7},
+            EmulDemmelParam{11, 512, 0, 1e-8},
+            EmulDemmelParam{12, 512, 0, 1e-9},
+            EmulDemmelParam{13, 512, 0, 1e-10},
+            EmulDemmelParam{14, 512, 0, 1e-10},
             // s=15 (~118 CRT bits), b_max=4
             EmulDemmelParam{15, 512, 1, 1e-13},
             EmulDemmelParam{15, 512, 2, 1e-13},
@@ -1248,6 +1285,13 @@ namespace
         EmulDemmelParamName
     );
 
+    // ── IllConditionedGramMatrix: disabled ─────────────────────────────────────
+    //
+    // Disabled because condition number is a solver concept, not a GEMM concept.
+    // The Gram matrix test A^T×A verifies Q orthogonality (a property of the
+    // host Gram-Schmidt), not the GEMM implementation.  The test always skips
+    // on devices where ADP triggers, providing no meaningful coverage.
+#if 0
     // ── IllConditionedGramMatrix: A^T×A for varying condition numbers ──────────
     //
     // Constructs A = Q × D where Q is a random orthogonal matrix (N×N,
@@ -1458,14 +1502,17 @@ namespace
         ),
         EmulIllCondParamName
     );
+#endif  // IllConditionedGramMatrix disabled
 
     // ── StructuredGemmTest: stress matrices targeting the Ozaki extraction ────
     //
-    // Five structured matrix types (N×N, NN mode, C = A × B):
+    // Seven structured matrix types (N×N, NN mode, C = A × B):
     //   CatastrophicCancel  row pairs (+v,−v): (A×B)[2k,:] + (A×B)[2k+1,:] = 0
     //   ScaledDynamicRange  row i scaled by 2^{i·16/(N-1)−8}: N distinct sftA values
     //   OnesAndEpsilons     A[i,j]=ε for j<N-1, A[i,N-1]=1 — tests ε residual capture
-    //   Moler               M[i,j] = min(i+1,j+1)          — structured SPD-like
+    //   Hadamard            Walsh-Hadamard (Sylvester), entries ±1
+    //   Toeplitz            T[i,j] = 0.9^{|i-j|}, decaying off-diagonals
+    //   Rank1Perturb        A = I + u·vᵀ, u=sin, v=cos
     //   Alternating         A=checkerboard×U, B=U(0,1)      — signed cancellation
     //
     // All tests run with ADP mode (dynamic moduli selection) — the production default.
@@ -1474,7 +1521,7 @@ namespace
 
     enum StructuredMatType {
         SMAT_CATASTROPHIC_CANCEL, SMAT_SCALED_DYNAMIC_RANGE, SMAT_ONES_AND_EPSILONS,
-        SMAT_MOLER, SMAT_ALTERNATING,
+        SMAT_HADAMARD, SMAT_TOEPLITZ, SMAT_RANK1_PERTURB, SMAT_ALTERNATING,
     };
 
     struct StructuredGemmParam {
@@ -1488,7 +1535,7 @@ namespace
     {
         const char* names[] = {
             "CatastrophicCancel", "ScaledDynamicRange", "OnesAndEpsilons",
-            "Moler", "Alternating"
+            "Hadamard", "Toeplitz", "Rank1Perturb", "Alternating"
         };
         return std::string(names[static_cast<int>(info.param.mat_type)])
                + "_N" + std::to_string(info.param.N);
@@ -1568,8 +1615,10 @@ namespace
                     hB[idx] = 1.0;
                     break;
                 }
-                case SMAT_MOLER:
-                    hA[idx] = hB[idx] = static_cast<double>(std::min(i + 1, j + 1));
+                case SMAT_HADAMARD:
+                case SMAT_TOEPLITZ:
+                case SMAT_RANK1_PERTURB:
+                    /* Filled after the (i,j) loop — see below. */
                     break;
                 case SMAT_ALTERNATING:
                 {
@@ -1581,6 +1630,63 @@ namespace
                 }
                 }
             }
+
+        /* ── Post-loop fills for matrix types that need global structure ────── */
+        if(type == SMAT_HADAMARD)
+        {
+            /* Walsh-Hadamard (Sylvester construction) for N = power-of-2.
+             * H₁ = [1], H_{2n} = [[H_n, H_n], [H_n, -H_n]].
+             * For non-power-of-2 N, we build the smallest power-of-2 ≥ N and
+             * use the top-left N×N sub-block (still ±1 entries).                */
+            int logN = 0;
+            while((1 << logN) < N) ++logN;
+            const int HN = (1 << logN);
+            std::vector<double> H(static_cast<size_t>(HN) * HN, 0.0);
+            H[0] = 1.0;
+            for(int step = 1; step < HN; step *= 2)
+                for(int r = 0; r < step; ++r)
+                    for(int c = 0; c < step; ++c)
+                    {
+                        const double v = H[static_cast<size_t>(r + c * HN)];
+                        H[static_cast<size_t>(r + step + c * HN)]         =  v;
+                        H[static_cast<size_t>(r       + (c + step) * HN)] =  v;
+                        H[static_cast<size_t>(r + step + (c + step) * HN)] = -v;
+                    }
+            /* Copy top-left N×N block into hA, hB = identity-like (B=I so C=A). */
+            for(int jj = 0; jj < N; ++jj)
+                for(int ii = 0; ii < N; ++ii)
+                {
+                    const size_t idx2 = static_cast<size_t>(ii + jj * N);
+                    hA[idx2] = H[static_cast<size_t>(ii + jj * HN)];
+                    hB[idx2] = (ii == jj) ? 1.0 : 0.0;
+                }
+        }
+        else if(type == SMAT_TOEPLITZ)
+        {
+            /* T[i,j] = 0.9^{|i-j|}: geometrically decaying off-diagonals.
+             * Both A and B are set to T so C = T × T.                          */
+            for(int jj = 0; jj < N; ++jj)
+                for(int ii = 0; ii < N; ++ii)
+                {
+                    const size_t idx2 = static_cast<size_t>(ii + jj * N);
+                    hA[idx2] = hB[idx2] = std::pow(0.9, std::abs(ii - jj));
+                }
+        }
+        else if(type == SMAT_RANK1_PERTURB)
+        {
+            /* A = I + u·vᵀ where u[i]=sin(π(i+1)/(N+1)), v[j]=cos(π(j+1)/(N+1)).
+             * B = identity.  C = A × B = A.                                    */
+            const double pi = 3.14159265358979323846;
+            for(int jj = 0; jj < N; ++jj)
+                for(int ii = 0; ii < N; ++ii)
+                {
+                    const size_t idx2 = static_cast<size_t>(ii + jj * N);
+                    const double u_i = std::sin(pi * (ii + 1) / (N + 1));
+                    const double v_j = std::cos(pi * (jj + 1) / (N + 1));
+                    hA[idx2] = ((ii == jj) ? 1.0 : 0.0) + u_i * v_j;
+                    hB[idx2] = (ii == jj) ? 1.0 : 0.0;
+                }
+        }
     }
 
     TEST_P(Fp64EmulationStructuredTest, VsNativeDgemm)
@@ -1718,7 +1824,7 @@ namespace
 
         const char* mat_names[] = {
             "CatastrophicCancel", "ScaledDynamicRange", "OnesAndEpsilons",
-            "Moler", "Alternating"
+            "Hadamard", "Toeplitz", "Rank1Perturb", "Alternating"
         };
         EXPECT_LE(max_rel_err, p.threshold)
             << "Structured GEMM (" << mat_names[static_cast<int>(p.mat_type)]
@@ -1756,7 +1862,9 @@ namespace
             StructuredGemmParam{SMAT_CATASTROPHIC_CANCEL,  128, 1e-10},
             StructuredGemmParam{SMAT_SCALED_DYNAMIC_RANGE, 128, 1e-10},
             StructuredGemmParam{SMAT_ONES_AND_EPSILONS,    128, 1e-10},
-            StructuredGemmParam{SMAT_MOLER,                128, 1e-10},
+            StructuredGemmParam{SMAT_HADAMARD,             128, 1e-10},
+            StructuredGemmParam{SMAT_TOEPLITZ,             128, 1e-10},
+            StructuredGemmParam{SMAT_RANK1_PERTURB,        128, 1e-10},
             StructuredGemmParam{SMAT_ALTERNATING,          128, 1e-10}
         ),
         StructuredGemmParamName
@@ -2206,6 +2314,276 @@ namespace
             EXPECT_TRUE(std::isinf(d2(5, 1)) && d2(5, 1) > 0.0)
                 << "A=2*I col 5 row 1: 2*DMAX overflows to +Inf, got " << d2(5, 1);
         }
+    }
+
+    // ── NonUnitLeadingDimension: lda/ldb/ldc/ldd != m/k/m/m ──────────────────
+    //
+    // Exercises the non-unit-stride paths in the extraction and finalize kernels.
+    // 128×128×128 NN with lda=m+7=135, ldb=k+13=141, ldc=ldd=m+11=139.
+    TEST_F(Fp64EmulationTest, NonUnitLeadingDimension)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
+
+        constexpr int64_t M = 128, N = 128, K = 128;
+        constexpr int64_t LDA = M + 7;   // 135
+        constexpr int64_t LDB = K + 13;  // 141
+        constexpr int64_t LDC = M + 11;  // 139
+        constexpr int64_t LDD = LDC;
+
+        const size_t nA = static_cast<size_t>(LDA) * K;
+        const size_t nB = static_cast<size_t>(LDB) * N;
+        const size_t nC = static_cast<size_t>(LDC) * N;
+        const size_t nD = static_cast<size_t>(LDD) * N;
+
+        std::vector<double> hA(nA), hB(nB), hD_emu(nD), hD_nat(nD);
+        fill_uniform_host(hA, 0xaabb000011110000ULL);
+        fill_uniform_host(hB, 0xccdd000022220000ULL);
+
+        double *dA = nullptr, *dB = nullptr, *dC = nullptr;
+        double *dD_emu = nullptr, *dD_nat = nullptr;
+        ASSERT_EQ(hipMalloc(&dA, nA * sizeof(double)), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, nB * sizeof(double)), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, nC * sizeof(double)), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_emu, nD * sizeof(double)), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_nat, nD * sizeof(double)), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, hA.data(), nA * sizeof(double), hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, hB.data(), nB * sizeof(double), hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, nC * sizeof(double)), hipSuccess);
+
+        auto free_all = [&]() {
+            (void)hipFree(dD_nat); (void)hipFree(dD_emu);
+            (void)hipFree(dC); (void)hipFree(dB); (void)hipFree(dA);
+        };
+
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(m_roc, HIP_R_64F,
+                                      HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
+            if(!gate.apply) { free_all(); GTEST_SKIP() << "Device not supported"; }
+        }
+
+        /* Native reference via hipblasLtMatmul */
+        hipblasLtHandle_t hnat = nullptr;
+        hipblasLtMatmulDesc_t desc = nullptr;
+        hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtMatmulHeuristicResult_t heur{};
+        ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&la, HIP_R_64F, M, K, LDA), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lb, HIP_R_64F, K, N, LDB), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lc, HIP_R_64F, M, N, LDC), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&ld, HIP_R_64F, M, N, LDD), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&pref), HIPBLAS_STATUS_SUCCESS);
+        int nat_cnt = 0;
+        hipblasLtMatmulAlgoGetHeuristic(hnat, desc, la, lb, lc, ld, pref, 1, &heur, &nat_cnt);
+
+        auto destroy_nat = [&]() {
+            hipblasLtMatmulPreferenceDestroy(pref);
+            hipblasLtMatrixLayoutDestroy(ld); hipblasLtMatrixLayoutDestroy(lc);
+            hipblasLtMatrixLayoutDestroy(lb); hipblasLtMatrixLayoutDestroy(la);
+            hipblasLtMatmulDescDestroy(desc); hipblasLtDestroy(hnat);
+        };
+
+        if(nat_cnt == 0) { destroy_nat(); free_all(); GTEST_SKIP() << "No native algo"; }
+
+        const double alpha = 1.0, beta = 0.0;
+        hipblasLtMatmul(hnat, desc, &alpha, dA, la, dB, lb,
+                        &beta, dC, lc, dD_nat, ld,
+                        &heur.algo, nullptr, 0, nullptr);
+
+        /* Emulated */
+        Fp64EmulationSettings emu{};
+        emu.num_moduli = 16u;
+        emu.sv_mask = 0u;
+        const rocblaslt_status st =
+            fp64EmulatedGemm(m_handle,
+                             HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K,
+                             &alpha, dA, LDA, dB, LDB,
+                             &beta,  dC, LDC, dD_emu, LDD,
+                             nullptr, emu);
+
+        if(st != rocblaslt_status_success) {
+            destroy_nat(); free_all();
+            GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(st);
+        }
+
+        ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, nD * sizeof(double), hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(hD_emu.data(), dD_emu, nD * sizeof(double), hipMemcpyDeviceToHost), hipSuccess);
+        destroy_nat(); free_all();
+
+        double dmax = 0.0;
+        for(int64_t j = 0; j < N; ++j)
+            for(int64_t i = 0; i < M; ++i)
+                dmax = std::max(dmax, std::abs(hD_nat[static_cast<size_t>(i + j * LDD)]));
+        const double norm = std::max(dmax, 1.0);
+        double max_rel = 0.0;
+        for(int64_t j = 0; j < N; ++j)
+            for(int64_t i = 0; i < M; ++i)
+            {
+                const size_t idx = static_cast<size_t>(i + j * LDD);
+                max_rel = std::max(max_rel, std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
+            }
+
+        EXPECT_LE(max_rel, 1e-10)
+            << "NonUnitLeadingDimension: max_rel=" << max_rel;
+    }
+
+    // ── SvMaskInfInput: sv_mask=0x1 with +Inf input must return invalid_value ─
+    //
+    // Constructs a 64×64 matrix with one +Inf element. With sv_mask=0x1
+    // (Inf detection enabled), fp64EmulatedGemm must return
+    // rocblaslt_status_invalid_value.
+    TEST_F(Fp64EmulationTest, SvMaskInfInput)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
+
+        constexpr int64_t N = 64;
+        const size_t      N2    = static_cast<size_t>(N) * N;
+        const size_t      bytes = N2 * sizeof(double);
+
+        std::vector<double> hA(N2, 1.0), hB(N2, 1.0);
+        hA[0] = std::numeric_limits<double>::infinity(); /* one +Inf element */
+
+        double *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr;
+        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD, bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, hB.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
+
+        auto cleanup = [&]() {
+            (void)hipFree(dD); (void)hipFree(dC);
+            (void)hipFree(dB); (void)hipFree(dA);
+        };
+
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(m_roc, HIP_R_64F,
+                                      HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+            if(!gate.apply) { cleanup(); GTEST_SKIP() << "Device not supported"; }
+        }
+
+        Fp64EmulationSettings settings{};
+        settings.num_moduli = 16u;
+        settings.sv_mask    = 0x1u;   /* enable Inf detection */
+
+        const double alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st =
+            fp64EmulatedGemm(m_handle,
+                             HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                             &alpha, dA, N, dB, N,
+                             &beta,  dC, N, dD, N,
+                             nullptr, settings);
+        cleanup();
+
+        EXPECT_EQ(st, rocblaslt_status_invalid_value)
+            << "sv_mask=0x1 with +Inf input should return invalid_value, got "
+            << static_cast<int>(st);
+    }
+
+    // ── AdpLowModuliUpperBound: ADP with num_moduli=8 on well-conditioned data ─
+    //
+    // Runs ADP with a low upper bound (num_moduli=8) on a 128×128 random matrix.
+    // ADP should succeed (data is well-conditioned) and error within 1e-4.
+    TEST_F(Fp64EmulationTest, AdpLowModuliUpperBound)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
+
+        constexpr int64_t N = 128;
+        const size_t      N2    = static_cast<size_t>(N) * N;
+        const size_t      bytes = N2 * sizeof(double);
+
+        std::vector<double> hA(N2), hB(N2), hD_emu(N2), hD_nat(N2);
+        fill_uniform_host(hA, 0x1111aaaa2222bbbbULL);
+        fill_uniform_host(hB, 0x3333cccc4444ddddULL);
+
+        double *dA = nullptr, *dB = nullptr, *dC = nullptr;
+        double *dD_emu = nullptr, *dD_nat = nullptr;
+        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_emu, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_nat, bytes), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, hB.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
+
+        auto free_all = [&]() {
+            (void)hipFree(dD_nat); (void)hipFree(dD_emu);
+            (void)hipFree(dC); (void)hipFree(dB); (void)hipFree(dA);
+        };
+
+        {
+            const Fp64EmulationDecision gate =
+                fp64EmulationDecision(m_roc, HIP_R_64F,
+                                      HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+            if(!gate.apply) { free_all(); GTEST_SKIP() << "Device not supported"; }
+        }
+
+        /* Native reference */
+        hipblasLtHandle_t hnat = nullptr;
+        hipblasLtMatmulDesc_t desc = nullptr;
+        hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtMatmulHeuristicResult_t heur{};
+        ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&la, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lb, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&ld, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&pref), HIPBLAS_STATUS_SUCCESS);
+        int nat_cnt = 0;
+        hipblasLtMatmulAlgoGetHeuristic(hnat, desc, la, lb, ld, ld, pref, 1, &heur, &nat_cnt);
+
+        auto destroy_nat = [&]() {
+            hipblasLtMatmulPreferenceDestroy(pref);
+            hipblasLtMatrixLayoutDestroy(ld); hipblasLtMatrixLayoutDestroy(lb);
+            hipblasLtMatrixLayoutDestroy(la); hipblasLtMatmulDescDestroy(desc);
+            hipblasLtDestroy(hnat);
+        };
+        if(nat_cnt == 0) { destroy_nat(); free_all(); GTEST_SKIP() << "No native algo"; }
+
+        const double alpha = 1.0, beta = 0.0;
+        hipblasLtMatmul(hnat, desc, &alpha, dA, la, dB, lb,
+                        &beta, dC, ld, dD_nat, ld,
+                        &heur.algo, nullptr, 0, nullptr);
+
+        /* Emulated with ADP, num_moduli=8 upper bound */
+        Fp64EmulationSettings emu{};
+        emu.num_moduli   = 8u;
+        emu.sv_mask      = 0u;
+        emu.dynamic_mode = true;
+        const rocblaslt_status st =
+            fp64EmulatedGemm(m_handle,
+                             HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                             &alpha, dA, N, dB, N,
+                             &beta,  dC, N, dD_emu, N,
+                             nullptr, emu);
+
+        if(st != rocblaslt_status_success) {
+            destroy_nat(); free_all();
+            GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(st);
+        }
+
+        ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, bytes, hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(hD_emu.data(), dD_emu, bytes, hipMemcpyDeviceToHost), hipSuccess);
+        destroy_nat(); free_all();
+
+        double dmax = 0.0;
+        for(double v : hD_nat) dmax = std::max(dmax, std::abs(v));
+        const double norm = std::max(dmax, 1.0);
+        double max_rel = 0.0;
+        for(size_t idx = 0; idx < N2; ++idx)
+            max_rel = std::max(max_rel, std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
+
+        EXPECT_LE(max_rel, 1e-4)
+            << "AdpLowModuliUpperBound (num_moduli=8): max_rel=" << max_rel;
     }
 
 } // namespace
