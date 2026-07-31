@@ -24,10 +24,10 @@ Performance model
 Hardware constants
 ------------------
   MI355X entries are taken verbatim from the C++ Oz2PerfModelParams table.
-  MI455 entries are ESTIMATED from AMD's public CDNA5 / "Tethys" roadmap:
-    • HBM bandwidth  : ~8.5 TB/s  (+25 % over MI355X)
-    • FP64 throughput: ~120 TFLOP/s observed  (+55 %)
-    • INT8 throughput: ~7000 TOPS observed    (+112 %)
+  MI455 entries are ESTIMATED:
+    • HBM bandwidth  : ~23.3 TB/s
+    • FP64 throughput: ~5 TFLOP/s   (SIMD only, no MFMA)
+    • INT8 throughput: ~3300 TOPS effective  (5000 TOPS peak × 0.66)
   All kernel efficiency factors and launch latencies are inherited from the
   MI355X calibration (per the task specification).
 
@@ -100,23 +100,30 @@ HW_PARAMS = {
         "ai":      11.3284,  # → c1 ≈  77.2 TFLOP/s FP64
         "ratio":   42.7280,  # → c2 ≈ 3298 TOPS INT8
     },
+    # ── MI455 (old estimate, superseded) ─────────────────────────────────────
+    # "MI455": {
+    #     "latency": 1.705e8,      # → c0 ≈ 17.05 TB/s  (2.5× MI355X BW)
+    #     "ai":      10.0 / 17.05, # → c1 ≈ 10 TFLOP/s FP64 (SIMD only, no MFMA)
+    #     "ratio":   211.3,         # → c2 ≈ 2113 TOPS INT8  (same fraction as MI355X)
+    # },
     # ── MI455  —  ESTIMATED parameters ───────────────────────────────────────
     # Estimation rationale:
-    #   HBM bandwidth  : 2.5× MI355X → c0 = 2.5 × 6.82 TB/s = 17.05 TB/s
-    #     latency = 17.05e12 × LATENCY_MATMUL = 17.05e12 × 10e-6 = 1.705e8
+    #   HBM bandwidth  : 23.3 TB/s
+    #     latency = 23.3e12 × LATENCY_MATMUL = 23.3e12 × 10e-6 = 2.33e8
     #   FP64 throughput: MI455 has no FP64 matrix (MFMA) instructions.
-    #     Native DGEMM falls back to SIMD-only FP64 → ~10 TFLOP/s.
-    #     ai = 10e12 / 17.05e12 ≈ 0.587
-    #   INT8 throughput: peak is 3200 TOPS, but the model uses the *effective*
-    #     observed fraction.  MI355X effective / peak = 3301 / 5000 ≈ 0.660.
-    #     MI455 effective INT8 = 0.660 × 3200 ≈ 2113 TOPS.
-    #     ratio = 2113e12 / 10e12 ≈ 211.3
+    #     Native DGEMM falls back to SIMD-only FP64 → ~5 TFLOP/s.
+    #     ai = 5e12 / 23.3e12 ≈ 0.2146
+    #   INT8 throughput: peak is 5000 TOPS (5 POPS), but the model uses the
+    #     *effective* observed fraction.
+    #     MI355X effective / peak = 3301 / 5000 ≈ 0.660.
+    #     MI455 effective INT8 = 0.660 × 5000 ≈ 3300 TOPS.
+    #     ratio = 3300e12 / 5e12 = 660.0
     #   All kernel efficiency factors and LATENCY_* constants are INHERITED
     #   from MI355X calibration (monolithic path, no fused kernel).
     "MI455": {
-        "latency": 1.705e8,      # → c0 ≈ 17.05 TB/s  (2.5× MI355X BW)
-        "ai":      10.0 / 17.05, # → c1 ≈ 10 TFLOP/s FP64 (SIMD only, no MFMA)
-        "ratio":   211.3,         # → c2 ≈ 2113 TOPS INT8  (same fraction as MI355X)
+        "latency": 2.33e8,       # → c0 ≈ 23.3 TB/s
+        "ai":      5.0 / 23.3,   # → c1 ≈ 5 TFLOP/s FP64 (SIMD only, no MFMA)
+        "ratio":   660.0,         # → c2 ≈ 3300 TOPS INT8  (same fraction as MI355X)
     },
 }
 
