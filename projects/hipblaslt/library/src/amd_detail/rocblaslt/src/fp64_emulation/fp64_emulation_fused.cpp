@@ -840,7 +840,8 @@ rocblaslt_status oz2_launch_fused_TN(
         int gfx950_chip_id = 0;
         (void)hipDeviceGetAttribute(&gfx950_chip_id, hipDeviceAttributePciChipId, cur_dev);
         const uint32_t pci_id = static_cast<uint32_t>(gfx950_chip_id) & 0xFFFFu;
-        is_gfx950 = (pci_id == 0x75a3u || pci_id == 0x75b3u) ? 1 : 0;
+        is_gfx950 = (pci_id == 0x75a3u || pci_id == 0x75b3u     /* MI350X */
+                  || pci_id == 0x75a0u || pci_id == 0x75b0u) ? 1 : 0;  /* MI355X */
     }
     (void)is_gfx950;                  /* reserved for future gfx950-specific tuning */
     /* Query number of XCCs (Graphics Compute Dies) on the current device. */
@@ -1120,38 +1121,31 @@ rocblaslt_status oz2_launch_fused_TN(
 #define OZ2_DISPATCH_SHAPE(S_V) \
     do { \
         /* Shape heuristic — two architectures, one macro.                        \
-         *                                                                        \
          * gfx942 (MI300X):                                                       \
-         *   SMALL-K (K ≤ 256): WM4WN4Wm2Wn2T16ku1 (128×128, KU=1) wins.         \
-         *     KU=1 avoids double-buffering overhead when K is so small that the  \
-         *     entire K-dimension fits in one KBLK (=K_UNROLL×32 = 32 for KU=1). \
-         *     Measured gains vs KU=2 on gfx942 MI300X (32768×32768):             \
-         *       K=64:  +41%   K=128: +34%   K=256: +15%                          \
-         *   square / medium-K:  WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) is best.     \
-         *     square K=32768: 31878 GFLOP/s   square K=1024: 27381 GFLOP/s      \
+         *   DEFAULT: WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) wins for all square     \
+         *     and near-square shapes across the full K range (K=64..32768).      \
+         *     Measured on gfx942 MI300X (32768×32768, S=16, global-warmup):      \
+         *       K=64:  6300   K=128: 12446   K=256: 18716   K=512: 24707        \
+         *       K=1024: 28943  K=2048: 31165  K=32768: 32149 GFLOP/s            \
          *   ELONGATED (tall M≫N or wide N≫M) with large K: the 256×128         \
-         *     macrotile WM4WN4Wm4Wn2T16ku1 is faster (rocprofv3 min-kernel µs,  \
-         *     Warmup=3 + profiled, gfx942 MI300X):                              \
-         *       tall M=32768,N=256,K=32768: 20606 µs (256×128) vs 21275 (128×128) → −3.1% \
-         *       wide M=256,N=32768,K=32768: 20142 µs (256×128) vs 21034 (128×128) → −4.2% \
+         *     macrotile WM4WN4Wm4Wn2T16ku1 is faster:                           \
+         *       tall M=32768,N=256,K=32768: 16354 GFLOP/s (+5% vs 128×128)      \
+         *       wide M=256,N=32768,K=32768: 15460 GFLOP/s (+4% vs 128×128)      \
          *     256×128 wins BOTH directions (beats 128×256 on wide too), because  \
          *     the longer M-macrotile amortises scale/MFMA startup over the       \
          *     skinny dimension while KU=1 keeps per-barrier KBLK_LOAD small for  \
          *     very large K.  Gated on large K (≥4096) so small-K elongated       \
-         *     shapes keep the 128×128 KU=1 winner.                               \
+         *     shapes keep the 128×128 KU=2 default.                              \
          *                                                                        \
          * gfx950 (MI355X): 128×128 KU=2 for small-K / tall / wide; 256×256 KU=1 \
          *   for large symmetric shapes (M,N,K ≥ 8192, +23%).  The gfx942        \
-         *   small-K KU=1 and elongated 256×128 branches are gfx942-only          \
-         *   (unmeasured on gfx950).                                               \
+         *   elongated 256×128 branch is gfx942-only (unmeasured on gfx950).      \
          * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256.        */ \
         const bool _elongated = (m >= 4*n) || (n >= 4*m); \
         if (is_gfx950 && m >= 8192 && n >= 8192 && k >= 8192) { \
             _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,false);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1 */ \
         } else if (!is_gfx950 && _elongated && k >= 4096) { \
             _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,false,false);  /* WM4WN4Wm4Wn2T16: 256×128, KU=1 (tall/wide) */ \
-        } else if (!is_gfx950 && k <= 256) { \
-            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,false,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=1 (small-K) */ \
         } else { \
             _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 */ \
         } \
