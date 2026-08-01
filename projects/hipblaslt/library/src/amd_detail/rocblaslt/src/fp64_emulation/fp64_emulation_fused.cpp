@@ -211,13 +211,6 @@ oz2_fused_TN_kernel(
     /* ── Derived compile-time constants ────────────────────────────────────── */
     static constexpr unsigned NREG_single = TILE * TILE / 64u;          /* accumulators per thread per MFMA tile */
     static constexpr unsigned NREG        = WaveM * WaveN * NREG_single; /* total accumulators per thread         */
-    /* NREG_sub: CRT update sub-tile size.  Keeps Zhi_t/Zlo_t to ≤4 doubles
-     * (16 VGPRs) regardless of NREG_single, reducing peak register pressure
-     * for TILE=32 when USE_LDS_ACCUM=true (e.g., MI350X TILE=32 NREG_single=16
-     * → 64-VGPR Zhi_t/Zlo_t reduced to 16 VGPRs, hiding behind MFMAs).
-     * For TILE=16: NREG_single=4 → NREG_sub=4 → trivial 1-iter loop (no-op). */
-    static constexpr unsigned NREG_sub = (NREG_single > 4u) ? 4u : NREG_single;
-    static constexpr unsigned NREG_sub_iters = NREG_single / NREG_sub;
     static constexpr unsigned KBLK        = (TILE == 16u) ? OZ2_KBLK_16 : OZ2_KBLK_32;
     /* K-loop unroll factor:
      *   gfx94x (MI300): K_UNROLL=4 — measured scratch=108B ✓
@@ -226,22 +219,21 @@ oz2_fused_TN_kernel(
      *     K_UNROLL=8 (scratch=388B, 2.5× slower). Confirmed on hardware:
      *     K_UNROLL=4 → scratch=424B ✗  K_UNROLL=2 → scratch=104B ✓          */
 #if defined(__gfx950__)
-    static constexpr size_t   LDS_BUDGET  = 159u * 1024u;
+    static constexpr size_t   LDS_BUDGET  = 160u * 1024u;
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
       || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-    static constexpr size_t   LDS_BUDGET  = 63u * 1024u;
+    static constexpr size_t   LDS_BUDGET  = 64u * 1024u;
 #else
 #  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
     static constexpr size_t   LDS_MFMA_K4 = 2u * (WM * WaveM * TILE * (KBLK * 4u)
                                                   + WN * WaveN * TILE * (KBLK * 4u));
-    static constexpr size_t   LDS_SFT     = static_cast<size_t>((WM * WaveM + WN * WaveN) * TILE * 2u);
     /* K_UNROLL: auto-selected from LDS budget, or overridden via KU_PARAM. */
 #if defined(__gfx950__)
     static constexpr unsigned K_UNROLL_AUTO = (TILE == 32u) ? 2u : 4u;
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
       || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-    static constexpr unsigned K_UNROLL_AUTO = (LDS_MFMA_K4 + LDS_SFT <= LDS_BUDGET) ? 4u : 2u;
+    static constexpr unsigned K_UNROLL_AUTO = (LDS_MFMA_K4 <= LDS_BUDGET) ? 4u : 2u;
 #else
 #  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
@@ -271,6 +263,7 @@ oz2_fused_TN_kernel(
     static constexpr unsigned A_STEPS_SAFE = (A_STEPS > 0u) ? A_STEPS : 1u;
     static constexpr unsigned B_STEPS_SAFE = (B_STEPS > 0u) ? B_STEPS : 1u;
     static constexpr bool     VALID_CONFIG  = (A_STEPS >= 1u && B_STEPS >= 1u);
+    if constexpr (!VALID_CONFIG) return; /* bail early for invalid arch/config combos */
 
     /* ── LDS accumulator decision ───────────────────────────────────────────
      * Store Zhi/Zlo in LDS when the combined budget (MFMA tiles + accumulators
@@ -281,17 +274,17 @@ oz2_fused_TN_kernel(
     static constexpr size_t LDS_MFMA      = 2u * (WM * WaveM * TILE * KBLK_STRIDE
                                                  + WN * WaveN * TILE * KBLK_STRIDE);
     static constexpr size_t LDS_ZHI_ZLO   = 2u * BLK_THR * NREG * sizeof(double);
-    static constexpr bool   FITS_IN_LDS   = (LDS_MFMA + LDS_SFT + LDS_ZHI_ZLO <= LDS_BUDGET);
+    static constexpr bool   FITS_IN_LDS   = (LDS_MFMA + LDS_ZHI_ZLO <= LDS_BUDGET);
     /* USE_LDS_ACCUM: use LDS for Zhi/Zlo only when LDS has room AND FORCE_VGPR_ACCUM is not set.
      * FORCE_VGPR_ACCUM=true keeps accumulators in registers even when LDS has space,
      * which can be faster when NREG is small enough to avoid VGPR spilling.             */
     static constexpr bool   USE_LDS_ACCUM = FITS_IN_LDS && !FORCE_VGPR_ACCUM;
 
     /* ── Static LDS ────────────────────────────────────────────────────────── */
-    __shared__ int8_t  A8i_lds[2][WM * WaveM][TILE][KBLK_STRIDE];
-    __shared__ int8_t  B8i_lds[2][WN * WaveN][TILE][KBLK_STRIDE];
-    __shared__ int16_t sftA_lds[WM * WaveM * TILE];
-    __shared__ int16_t sftB_lds[WN * WaveN * TILE];
+    static constexpr unsigned A_BUF_BYTES = WM * WaveM * TILE * KBLK_STRIDE;
+    static constexpr unsigned B_BUF_BYTES = WN * WaveN * TILE * KBLK_STRIDE;
+    __shared__ int8_t  A8i_lds[2][A_BUF_BYTES];
+    __shared__ int8_t  B8i_lds[2][B_BUF_BYTES];
     /* CRT accumulator LDS — flat layout [e * BLK_THR + tid].
      * Thread tid owns column tid for accumulator row e, giving consecutive
      * intra-wavefront access (2-way bank conflict; unavoidable for 64-lane
@@ -355,102 +348,65 @@ oz2_fused_TN_kernel(
     const int n_base = block_n_base + wn * static_cast<int>(WaveN * TILE);
 
     /* ── CRT accumulators ───────────────────────────────────────────────────
-     * Register fallback (size 1 placeholder when USE_LDS_ACCUM=true).
+     * Size-1 placeholder when USE_LDS_ACCUM=true (never accessed).
      * Each thread owns its own Zhi/Zlo elements — no barrier needed for init. */
     double Zhi_reg[USE_LDS_ACCUM ? 1u : NREG] = {};
     double Zlo_reg[USE_LDS_ACCUM ? 1u : NREG] = {};
     if constexpr (USE_LDS_ACCUM) {
-        #pragma unroll
         for (unsigned e = 0; e < NREG; ++e) {
             Zhi_lds[e * BLK_THR + static_cast<unsigned>(tid)] = 0.0;
             Zlo_lds[e * BLK_THR + static_cast<unsigned>(tid)] = 0.0;
         }
     }
 
-    /* ── Cooperative-load position tables ───────────────────────────────────── */
-    /* wm_A ranges 0..WM*WaveM-1, covering all M rows in the macrotile. */
-    unsigned wm_A[A_STEPS_SAFE]; int ml_A[A_STEPS_SAFE], k4_A[A_STEPS_SAFE], mi_A[A_STEPS_SAFE];
-    #pragma unroll
-    for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-        const int flat     = static_cast<int>(threadIdx.x + ls * BLK_THR);
-        const int tile_dim = static_cast<int>(TILE * K4DIM);
-        wm_A[ls] = static_cast<unsigned>(flat / tile_dim);
-        ml_A[ls] = (flat % tile_dim) / static_cast<int>(K4DIM);
-        k4_A[ls] = (flat % tile_dim) % static_cast<int>(K4DIM);
-        mi_A[ls] = block_m_base + static_cast<int>(wm_A[ls]) * static_cast<int>(TILE) + ml_A[ls];
-    }
-    unsigned wn_B[B_STEPS_SAFE]; int nl_B[B_STEPS_SAFE], k4_B[B_STEPS_SAFE], ni_B[B_STEPS_SAFE];
-    #pragma unroll
-    for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-        const int flat     = static_cast<int>(threadIdx.x + ls * BLK_THR);
-        const int tile_dim = static_cast<int>(TILE * K4DIM);
-        wn_B[ls] = static_cast<unsigned>(flat / tile_dim);
-        nl_B[ls] = (flat % tile_dim) / static_cast<int>(K4DIM);
-        k4_B[ls] = (flat % tile_dim) % static_cast<int>(K4DIM);
-        ni_B[ls] = block_n_base + static_cast<int>(wn_B[ls]) * static_cast<int>(TILE) + nl_B[ls];
-    }
-
-    /* ── Boundary-safe 4-byte load helpers (prologue only) ─────────────────── */
-    auto cond_load_a = [&](const int8_t* As, unsigned ls, int ki) -> int32_t {
-        int32_t v = 0;
-        const int mi = mi_A[ls];
-        if (mi < static_cast<int>(m)) {
-            if (ki + 3 < k_int)
-                v = *reinterpret_cast<const int32_t*>(As + static_cast<size_t>(mi) * lda8i + ki);
-            else if (ki < k_int) {
-                const int8_t* p = As + static_cast<size_t>(mi) * lda8i + ki;
-                for (int b = 0; b < 4 && ki + b < k_int; ++b)
-                    reinterpret_cast<int8_t*>(&v)[b] = p[b];
-            }
-        }
-        return v;
-    };
-    auto cond_load_b = [&](const int8_t* Bs, unsigned ls, int ki) -> int32_t {
-        int32_t v = 0;
-        const int ni = ni_B[ls];
-        if (ni < static_cast<int>(n)) {
-            if (ki + 3 < k_int)
-                v = *reinterpret_cast<const int32_t*>(Bs + static_cast<size_t>(ni) * ldb8i + ki);
-            else if (ki < k_int) {
-                const int8_t* p = Bs + static_cast<size_t>(ni) * ldb8i + ki;
-                for (int b = 0; b < 4 && ki + b < k_int; ++b)
-                    reinterpret_cast<int8_t*>(&v)[b] = p[b];
-            }
-        }
-        return v;
-    };
-
-    /* ── Cooperative load of sftA/sftB into LDS ────────────────────────────── */
-    /* Loop-stride pattern so any BLK_THR covers all entries, even when
-     * BLK_THR < (WM*WaveM + WN*WaveN)*TILE (e.g., WM=WN=1, WaveM=WaveN=4). */
-    for (unsigned si = threadIdx.x; si < WM * WaveM * TILE; si += BLK_THR) {
-        const int mi = block_m_base + static_cast<int>(si);
-        sftA_lds[si] = (mi < static_cast<int>(m)) ? sftA[mi] : 0;
-    }
-    for (unsigned si = threadIdx.x; si < WN * WaveN * TILE; si += BLK_THR) {
-        const int ni = block_n_base + static_cast<int>(si);
-        sftB_lds[si] = (ni < static_cast<int>(n)) ? sftB[ni] : 0;
-    }
-
+    /* ── Flat LDS/HBM offsets (register staging path only) ─────────────────── */
+    /* Each thread precomputes its LDS write offset and HBM read offset once;
+     * when USE_DTL=true, the compiler DCEs them (never initialized/read).      */
+    unsigned lds_off_A[USE_DTL ? 1u : A_STEPS_SAFE];  /* flat LDS byte offset within one buffer */
+    size_t   hbm_off_A[USE_DTL ? 1u : A_STEPS_SAFE];  /* flat HBM byte offset from A8i base   */
+    unsigned lds_off_B[USE_DTL ? 1u : B_STEPS_SAFE];
+    size_t   hbm_off_B[USE_DTL ? 1u : B_STEPS_SAFE];
     /* ── Pre-fetch modulus s=0 prologue into registers ─────────────────────── */
     /* rA/rB serve dual purpose: K-loop double-buffer AND cross-modulus prologue.
      * Declaring at kernel scope (outside both S-loop and K-loop) lets the compiler
      * allocate them once, saving A_STEPS+B_STEPS VGPRs vs the old rA_pro/rB_pro
      * design where both were simultaneously live during the K-loop.            */
-    int32_t rA[A_STEPS_SAFE] = {};
-    int32_t rB[B_STEPS_SAFE] = {};
+    int32_t rA[USE_DTL ? 1u : A_STEPS_SAFE];
+    int32_t rB[USE_DTL ? 1u : B_STEPS_SAFE];
     if constexpr (!USE_DTL) {
+        /* Compute flat LDS + HBM offsets, then prefetch first K-block. */
+        #pragma unroll
+        for (unsigned ls = 0; ls < A_STEPS; ++ls) {
+            const unsigned flat = static_cast<unsigned>(threadIdx.x) + ls * BLK_THR;
+            const unsigned tile_dim = TILE * K4DIM;
+            const unsigned wm  = flat / tile_dim;
+            const unsigned ml  = (flat % tile_dim) / K4DIM;
+            const unsigned k4  = (flat % tile_dim) % K4DIM;
+            lds_off_A[ls] = (wm * TILE + ml) * KBLK_STRIDE + k4 * 4u;
+            const int mi = block_m_base + static_cast<int>(wm * TILE + ml);
+            hbm_off_A[ls] = static_cast<size_t>(mi) * lda8i + static_cast<size_t>(k4) * 4u;
+        }
+        #pragma unroll
+        for (unsigned ls = 0; ls < B_STEPS; ++ls) {
+            const unsigned flat = static_cast<unsigned>(threadIdx.x) + ls * BLK_THR;
+            const unsigned tile_dim = TILE * K4DIM;
+            const unsigned wn  = flat / tile_dim;
+            const unsigned nl  = (flat % tile_dim) / K4DIM;
+            const unsigned k4  = (flat % tile_dim) % K4DIM;
+            lds_off_B[ls] = (wn * TILE + nl) * KBLK_STRIDE + k4 * 4u;
+            const int ni = block_n_base + static_cast<int>(wn * TILE + nl);
+            hbm_off_B[ls] = static_cast<size_t>(ni) * ldb8i + static_cast<size_t>(k4) * 4u;
+        }
         if (k_int > 0) {
             #pragma unroll
             for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                rA[ls] = cond_load_a(A8i, ls, k4_A[ls] * 4);
+                rA[ls] = *reinterpret_cast<const int32_t*>(A8i + hbm_off_A[ls]);
             #pragma unroll
             for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                rB[ls] = cond_load_b(B8i, ls, k4_B[ls] * 4);
+                rB[ls] = *reinterpret_cast<const int32_t*>(B8i + hbm_off_B[ls]);
         }
     }
-    if constexpr (!VALID_CONFIG) return; /* no-op on wrong arch */
-    __syncthreads();
+    if constexpr (USE_LDS_ACCUM) __syncthreads(); /* sync Zhi_lds/Zlo_lds init */
 
     /* ── MFMA helper ──────────────────────────────────────────────────────────
      * A_wm_base: pointer to A8i_lds[cur][wm*WaveM][0][0]
@@ -566,42 +522,38 @@ oz2_fused_TN_kernel(
              * oz2_dtl_row_load adds each lane's per-lane offset internally so it
              * can pick the arch-appropriate load width (4-byte on gfx942, wide
              * 16-byte on gfx950).  Cursors advance by KBLK_LOAD per K-block. */
-            #pragma unroll
             for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
                 const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                 if (r < NROWS_A) {
                     const int mi = block_m_base + static_cast<int>(r);
                     A_rsrc[ri]  = A8i_s + static_cast<size_t>(mi) * lda8i;  /* lane-0 base */
                     A_rdst0[ri] = reinterpret_cast<uint32_t*>(
-                                    &A8i_lds[0][r / TILE][r % TILE][0]);
+                                    &A8i_lds[0][r * KBLK_STRIDE]);
                 } else {
                     A_rsrc[ri]  = A8i_s;  /* unused */
-                    A_rdst0[ri] = reinterpret_cast<uint32_t*>(&A8i_lds[0][0][0][0]);
+                    A_rdst0[ri] = reinterpret_cast<uint32_t*>(&A8i_lds[0][0]);
                 }
             }
-            #pragma unroll
             for (unsigned ri = 0; ri < B_ROWS_PER_WAVE; ++ri) {
                 const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                 if (r < NROWS_B) {
                     const int ni = block_n_base + static_cast<int>(r);
                     B_rsrc[ri]  = B8i_s + static_cast<size_t>(ni) * ldb8i;  /* lane-0 base */
                     B_rdst0[ri] = reinterpret_cast<uint32_t*>(
-                                    &B8i_lds[0][r / TILE][r % TILE][0]);
+                                    &B8i_lds[0][r * KBLK_STRIDE]);
                 } else {
                     B_rsrc[ri]  = B8i_s;  /* unused */
-                    B_rdst0[ri] = reinterpret_cast<uint32_t*>(&B8i_lds[0][0][0][0]);
+                    B_rdst0[ri] = reinterpret_cast<uint32_t*>(&B8i_lds[0][0]);
                 }
             }
 
             __syncthreads();
             /* Prologue: first K-block into buffer 0 via per-row padded loads. */
-            #pragma unroll
             for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
                 const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                 if (r < NROWS_A)
                     oz2_dtl_row_load(A_rsrc[ri], A_rdst0[ri], lane, K4DIM);
             }
-            #pragma unroll
             for (unsigned ri = 0; ri < B_ROWS_PER_WAVE; ++ri) {
                 const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                 if (r < NROWS_B)
@@ -615,7 +567,6 @@ oz2_fused_TN_kernel(
                 const int nxt = 1 - curd;
                 /* Load nxt buffer: advance each row cursor by one K-block and
                  * write into the nxt buffer's padded row (offset by BUF_DWORDS). */
-                #pragma unroll
                 for (unsigned ri = 0; ri < A_ROWS_PER_WAVE; ++ri) {
                     const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                     A_rsrc[ri] += KBLK_LOAD;
@@ -623,7 +574,6 @@ oz2_fused_TN_kernel(
                         oz2_dtl_row_load(A_rsrc[ri],
                             A_rdst0[ri] + static_cast<unsigned>(nxt) * A_BUF_DWORDS, lane, K4DIM);
                 }
-                #pragma unroll
                 for (unsigned ri = 0; ri < B_ROWS_PER_WAVE; ++ri) {
                     const unsigned r = static_cast<unsigned>(wid) + ri * NUM_WAVES;
                     B_rsrc[ri] += KBLK_LOAD;
@@ -631,20 +581,20 @@ oz2_fused_TN_kernel(
                         oz2_dtl_row_load(B_rsrc[ri],
                             B_rdst0[ri] + static_cast<unsigned>(nxt) * B_BUF_DWORDS, lane, K4DIM);
                 }
-                apply_mfma(&A8i_lds[curd][wm * WaveM][0][0], &B8i_lds[curd][wn * WaveN][0][0], C32);
+                apply_mfma(&A8i_lds[curd][wm * static_cast<int>(WaveM * TILE * KBLK_STRIDE)], &B8i_lds[curd][wn * static_cast<int>(WaveN * TILE * KBLK_STRIDE)], C32);
                 __syncthreads();
                 curd = nxt;
             }
-            apply_mfma(&A8i_lds[curd][wm * WaveM][0][0], &B8i_lds[curd][wn * WaveN][0][0], C32);
+            apply_mfma(&A8i_lds[curd][wm * static_cast<int>(WaveM * TILE * KBLK_STRIDE)], &B8i_lds[curd][wn * static_cast<int>(WaveN * TILE * KBLK_STRIDE)], C32);
           } else {
             __syncthreads();
 
             #pragma unroll
             for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                *reinterpret_cast<int32_t*>(&A8i_lds[0][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA[ls];
+                *reinterpret_cast<int32_t*>(&A8i_lds[0][lds_off_A[ls]]) = rA[ls];
             #pragma unroll
             for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                *reinterpret_cast<int32_t*>(&B8i_lds[0][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB[ls];
+                *reinterpret_cast<int32_t*>(&B8i_lds[0][lds_off_B[ls]]) = rB[ls];
             /* Cross-modulus prologue prefetch moved to after the last MFMA (below),
              * where rA/rB are dead and CRT provides latency-hiding compute.    */
 
@@ -663,12 +613,10 @@ oz2_fused_TN_kernel(
             const int8_t* B_cur[B_STEPS_SAFE];
             #pragma unroll
             for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                A_cur[ls] = A8i_s + static_cast<size_t>(mi_A[ls]) * lda8i
-                          + static_cast<size_t>(k4_A[ls]) * 4u;
+                A_cur[ls] = A8i_s + hbm_off_A[ls];
             #pragma unroll
             for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                B_cur[ls] = B8i_s + static_cast<size_t>(ni_B[ls]) * ldb8i
-                          + static_cast<size_t>(k4_B[ls]) * 4u;
+                B_cur[ls] = B8i_s + hbm_off_B[ls];
 
             /* rA/rB from outer scope used here for K-block double buffering. */
             int cur = 0;
@@ -686,19 +634,19 @@ oz2_fused_TN_kernel(
                     B_cur[ls] += KBLK_LOAD;
                     rB[ls] = *reinterpret_cast<const int32_t*>(B_cur[ls]);
                 }
-                apply_mfma(&A8i_lds[cur][wm * WaveM][0][0], &B8i_lds[cur][wn * WaveN][0][0], C32);
+                apply_mfma(&A8i_lds[cur][wm * static_cast<int>(WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * static_cast<int>(WaveN * TILE * KBLK_STRIDE)], C32);
                 #pragma unroll
                 for (unsigned ls = 0; ls < A_STEPS; ++ls)
                     *reinterpret_cast<int32_t*>(
-                        &A8i_lds[nxt][wm_A[ls]][ml_A[ls]][k4_A[ls] * 4u]) = rA[ls];
+                        &A8i_lds[nxt][lds_off_A[ls]]) = rA[ls];
                 #pragma unroll
                 for (unsigned ls = 0; ls < B_STEPS; ++ls)
                     *reinterpret_cast<int32_t*>(
-                        &B8i_lds[nxt][wn_B[ls]][nl_B[ls]][k4_B[ls] * 4u]) = rB[ls];
+                        &B8i_lds[nxt][lds_off_B[ls]]) = rB[ls];
                 __syncthreads();
                 cur = nxt;
             }
-            apply_mfma(&A8i_lds[cur][wm * WaveM][0][0], &B8i_lds[cur][wn * WaveN][0][0], C32);
+            apply_mfma(&A8i_lds[cur][wm * static_cast<int>(WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * static_cast<int>(WaveN * TILE * KBLK_STRIDE)], C32);
 
             /* After the last MFMA, rA/rB are dead (last K-block written to LDS).
              * Reuse them to preload the next modulus's first K-block from HBM.
@@ -707,26 +655,20 @@ oz2_fused_TN_kernel(
             if (s + 1 < S) {
                 #pragma unroll
                 for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    rA[ls] = cond_load_a(A8i + static_cast<size_t>(s + 1) * stride_A_s, ls, k4_A[ls] * 4);
+                    rA[ls] = *reinterpret_cast<const int32_t*>(A8i + static_cast<size_t>(s + 1) * stride_A_s + hbm_off_A[ls]);
                 #pragma unroll
                 for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    rB[ls] = cond_load_b(B8i + static_cast<size_t>(s + 1) * stride_B_s, ls, k4_B[ls] * 4);
+                    rB[ls] = *reinterpret_cast<const int32_t*>(B8i + static_cast<size_t>(s + 1) * stride_B_s + hbm_off_B[ls]);
             }
           } /* end else (register staging path) */
         }
 
-        /* ── CRT update: one (wm_w, wn_w) tile × one NREG_sub chunk at a time ─
-         * The outer (wm_w, wn_w) loop covers WaveM×WaveN MFMA tiles.
-         * The inner sub loop splits NREG_single into NREG_sub_iters passes of
-         * NREG_sub elements each, keeping only NREG_sub doubles live (4 for
-         * TILE=16 already; 4-of-16 for TILE=32, saving 48 VGPRs when
-         * USE_LDS_ACCUM=true).  For TILE=16: NREG_sub=NREG_single=4,
-         * NREG_sub_iters=1 → single-iteration no-op, identical to before.
-         * No inter-thread barrier needed (each thread owns its own column).
-         *
-         * Note: Phase A/B split (dc_v/hi_v temp arrays) was tested and found
-         * to be -2% due to extra VGPR pressure; compiler already schedules
-         * the independent chains optimally from the unrolled inner loop.      */
+        /* ── CRT update ─────────────────────────────────────────────────────────
+         * Flat loop over all NREG accumulators (no forced unroll — compiler
+         * decides based on VGPR pressure).  Two variants:
+         *   !USE_LDS_ACCUM: operates directly on Zhi_reg[r] / Zlo_reg[r].
+         *   USE_LDS_ACCUM:  loads scalar from Zhi_lds → TwoSum → stores back.
+         * No inter-thread barrier needed (each thread owns its own column).  */
         /* Per-s CRT coefficients — hoisted ONCE per modulus (they depend only on
          * s, not on the tile/element), so they're computed a single time instead
          * of WaveM×WaveN times.  Kept below the K-loop so they stay dead during
@@ -735,18 +677,10 @@ oz2_fused_TN_kernel(
         const double qhi = oz2_qpi_hi(S - 2, s);
         const double qlo = HAS_LO ? oz2_qpi_lo(S - 2, s) : 0.0;
 
-        if constexpr (!USE_LDS_ACCUM && NREG_sub_iters == 1u) {
-            /* ── CRT-ILP fast path: ONE flat unrolled loop over ALL NREG
-             * accumulators (WaveM×WaveN tiles × NREG_single elements).  The
-             * previous nested (wm_w,wn_w)×e loops interleaved per-tile scalar
-             * setup between 4-wide batches, breaking the run of independent
-             * double-double chains the scheduler could overlap.  Flattening to a
-             * single #pragma-unroll body exposes all NREG independent TwoSum
-             * chains at once → higher VALU utilization / better latency hiding,
-             * with NO extra live temporaries (no dc_v[]/hi_v[] arrays, so no VGPR
-             * blowup).  Bit-identical: each element's op sequence is unchanged;
-             * only the inter-element scheduling window widens.                  */
-            #pragma unroll
+        if constexpr (!USE_LDS_ACCUM) {
+            /* VGPR-accum path: flat loop over all NREG accumulators.
+             * No forced unroll — let the compiler decide based on VGPR
+             * pressure (NREG is compile-time known).                            */
             for (unsigned r = 0; r < NREG; ++r) {
                 const double dc_raw = static_cast<double>(C32[r]);
                 const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
@@ -758,57 +692,24 @@ oz2_fused_TN_kernel(
                 else                  Zlo_reg[r] += err;
             }
         } else {
-            /* General subtiling path: for USE_LDS_ACCUM (gfx950 large
-             * WaveM/WaveN) or TILE=32 where NREG_sub_iters > 1.  Unchanged
-             * except the per-s scalars are now hoisted above.                  */
-            #pragma unroll
-            for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
-              #pragma unroll
-              for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
-                const unsigned reg_off = (wm_w * WaveN + wn_w) * NREG_single;
-                #pragma unroll
-                for (unsigned sub = 0; sub < NREG_sub_iters; ++sub) {
-                    const unsigned sub_e0 = sub * NREG_sub;
-                    double Zhi_t[NREG_sub], Zlo_t[NREG_sub];
-                    if constexpr (USE_LDS_ACCUM) {
-                        #pragma unroll
-                        for (unsigned e = 0; e < NREG_sub; ++e) {
-                            Zhi_t[e] = Zhi_lds[(reg_off + sub_e0 + e) * BLK_THR + static_cast<unsigned>(tid)];
-                            Zlo_t[e] = Zlo_lds[(reg_off + sub_e0 + e) * BLK_THR + static_cast<unsigned>(tid)];
-                        }
-                    } else {
-                        #pragma unroll
-                        for (unsigned e = 0; e < NREG_sub; ++e) {
-                            Zhi_t[e] = Zhi_reg[reg_off + sub_e0 + e];
-                            Zlo_t[e] = Zlo_reg[reg_off + sub_e0 + e];
-                        }
-                    }
-                    #pragma unroll
-                    for (unsigned e = 0; e < NREG_sub; ++e) {
-                        const double dc_raw = static_cast<double>(C32[reg_off + sub_e0 + e]);
-                        const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-                        const double hi     = dc * qhi;
-                        const double new_hi = Zhi_t[e] + hi;
-                        const double err    = hi - (new_hi - Zhi_t[e]);
-                        Zhi_t[e] = new_hi;
-                        if constexpr (HAS_LO) Zlo_t[e] = fma(dc, qlo, Zlo_t[e] + err);
-                        else                  Zlo_t[e] += err;
-                    }
-                    if constexpr (USE_LDS_ACCUM) {
-                        #pragma unroll
-                        for (unsigned e = 0; e < NREG_sub; ++e) {
-                            Zhi_lds[(reg_off + sub_e0 + e) * BLK_THR + static_cast<unsigned>(tid)] = Zhi_t[e];
-                            Zlo_lds[(reg_off + sub_e0 + e) * BLK_THR + static_cast<unsigned>(tid)] = Zlo_t[e];
-                        }
-                    } else {
-                        #pragma unroll
-                        for (unsigned e = 0; e < NREG_sub; ++e) {
-                            Zhi_reg[reg_off + sub_e0 + e] = Zhi_t[e];
-                            Zlo_reg[reg_off + sub_e0 + e] = Zlo_t[e];
-                        }
-                    }
-                }
-              }
+            /* LDS-accum path: flat loop over all NREG accumulators, one at a
+             * time via scalar LDS load → CRT TwoSum → LDS store.  No
+             * #pragma unroll — let the compiler decide based on VGPR pressure
+             * (NREG is compile-time known, so it can fully unroll when safe). */
+            for (unsigned r = 0; r < NREG; ++r) {
+                const unsigned idx = r * BLK_THR + static_cast<unsigned>(tid);
+                double Zhi = Zhi_lds[idx];
+                double Zlo = Zlo_lds[idx];
+                const double dc_raw = static_cast<double>(C32[r]);
+                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
+                const double hi     = dc * qhi;
+                const double new_hi = Zhi + hi;
+                const double err    = hi - (new_hi - Zhi);
+                Zhi = new_hi;
+                if constexpr (HAS_LO) Zlo = fma(dc, qlo, Zlo + err);
+                else                  Zlo += err;
+                Zhi_lds[idx] = Zhi;
+                Zlo_lds[idx] = Zlo;
             }
         }  /* end CRT update */
     }
@@ -818,199 +719,38 @@ oz2_fused_TN_kernel(
      *   col = lane % TILE
      *   row = 4*(lane/TILE) + 8*(e/4) + (e%4)   for e = 0..NREG_single-1
      *
-     * COALESCED EPILOGUE via per-wave LDS transpose.
-     * -----------------------------------------------
-     * D and C are COLUMN-MAJOR (idx = row + col*ld).  In the native MFMA
-     * output layout, consecutive lanes 0..TILE-1 share lane/TILE and step
-     * `col` by 1, so their D addresses differ by ldd → each lane's store is a
-     * separate cache line (fully uncoalesced), and the same for the C load.
-     *
-     * Fix: each lane finalizes its NREG_single results (identical math as
-     * before), writes them into a per-wave LDS scratch tile `Dsh[row][col]`,
-     * a wave barrier, then all 64 lanes re-read the tile in a COLUMN-MAJOR-
-     * friendly order — flat p = f*64 + lane, col = p/TILE, row = p%TILE — so
-     * consecutive lanes map to consecutive `row` within one `col`.  For
-     * column-major D that yields contiguous 128-byte segments per column →
-     * coalesced global stores (and coalesced C loads under beta!=0).
-     *
-     * The MFMA staging LDS (A8i_lds) is DEAD by the finalize phase, so the
-     * transpose scratch is ALIASED onto it → zero extra LDS.  Each wave uses
-     * its own TILE*TILE slice (indexed by wid), so a wave-scoped view is
-     * sufficient; we use __syncthreads() (runs once per kernel — negligible)
-     * to keep the write→read ordering simple and correct across all configs.
-     *
-     * Bit-exact: pure store/load reordering of identical finalized values.   */
-    {
-        /* Per-wave transpose scratch: dedicated __shared__ sized to exactly
-         * NUM_WAVES_EP * TILE*TILE doubles.  Placed in a compile-time branch
-         * (EP_COALESCE) gated on it fitting the LDS budget together with the
-         * scale-shift arrays (the MFMA staging LDS is dead by now, so total
-         * peak LDS is max(K-loop LDS, epilogue LDS); we conservatively require
-         * the epilogue scratch itself to fit the budget).  When it doesn't fit
-         * (very large WaveM×WaveN), fall back to the original scattered path. */
-        static constexpr unsigned NUM_WAVES_EP = BLK_THR / 64u;
-        static constexpr unsigned TILE_ELEMS   = TILE * TILE;
-        /* Padded per-tile row stride (Step 3): TILE+1 doubles per row breaks the
-         * 32-bank LDS conflict on the column-major re-read (consecutive rows in a
-         * column would otherwise collide on the same bank set).                  */
-        static constexpr unsigned EP_STRIDE       = TILE + 1u;
-        static constexpr unsigned EP_TILE_DBLS    = TILE * EP_STRIDE;                 /* doubles per MFMA tile */
-        static constexpr unsigned EP_PERWAVE_DBLS = WaveM * WaveN * EP_TILE_DBLS;     /* all tiles for one wave */
-
-        /* ZERO-EXTRA-LDS transpose: ALIAS the scratch onto the DEAD MFMA staging
-         * buffer A8i_lds (fully consumed by the finalize phase).  The TRUE dead
-         * region size is sizeof(A8i_lds) = 2*WM*WaveM*TILE*KBLK_STRIDE bytes; the
-         * previous LDS_MFMA/2 derivation was WRONG (LDS_MFMA already folds the ×2
-         * double-buffer factor, so LDS_MFMA/2 ≠ sizeof(A8i_lds)).  We size the
-         * per-wave slice to hold ALL WaveM×WaveN tiles at once (needed for the
-         * single-barrier restructure) and gate on it fitting sizeof(A8i_lds).
-         * A single reinterpret_cast from A8i_lds cannot safely span into B8i_lds
-         * (separate __shared__ objects), so the guard keeps the whole transpose
-         * inside A8i_lds; configs that don't fit take the scattered fallback.    */
-        static constexpr size_t   EP_DEAD_BYTES = sizeof(A8i_lds);  /* true A8i_lds size */
-        static constexpr bool     EP_COALESCE   =
-            (static_cast<size_t>(NUM_WAVES_EP) * EP_PERWAVE_DBLS * sizeof(double) <= EP_DEAD_BYTES);
-
-        if constexpr (EP_COALESCE) {
-            /* Alias onto the dead A8i_lds region (zero extra LDS).  Each wave owns
-             * a slice of EP_PERWAVE_DBLS doubles holding ALL WaveM×WaveN tiles at
-             * once (padded EP_STRIDE=TILE+1 per row), enabling a single pair of
-             * barriers around the whole write→read of the wave's tiles.          */
-            double* Dsh_all = reinterpret_cast<double*>(&A8i_lds[0][0][0][0]);
-            double* Dsh     = Dsh_all + static_cast<unsigned>(wid) * EP_PERWAVE_DBLS;
-
-            /* ── Phase 1 (Step 2): finalize + write ALL WaveM×WaveN tiles into the
-             * per-wave slice. Each tile occupies its own EP_TILE_DBLS sub-region. */
-            #pragma unroll
-            for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
-                #pragma unroll
-                for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
-                    const int m_wave_base  = m_base + static_cast<int>(wm_w * TILE);
-                    const int n_wave_base  = n_base + static_cast<int>(wn_w * TILE);
-                    const unsigned reg_off  = (wm_w * WaveN + wn_w) * NREG_single;
-                    const unsigned tile_off = (wm_w * WaveN + wn_w) * EP_TILE_DBLS;
-
-                    const int col_in = lane % static_cast<int>(TILE);
-                    const int row_lb = 4 * (lane / static_cast<int>(TILE));
-                    double Zhi_t[NREG_single], Zlo_t[NREG_single];
-                    if constexpr (USE_LDS_ACCUM) {
-                        #pragma unroll
-                        for (unsigned e = 0; e < NREG_single; ++e) {
-                            Zhi_t[e] = Zhi_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
-                            Zlo_t[e] = Zlo_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
-                        }
-                    } else {
-                        #pragma unroll
-                        for (unsigned e = 0; e < NREG_single; ++e) {
-                            Zhi_t[e] = Zhi_reg[reg_off + e];
-                            Zlo_t[e] = Zlo_reg[reg_off + e];
-                        }
-                    }
-                    #pragma unroll
-                    for (unsigned e = 0; e < NREG_single; ++e) {
-                        const int row_in = row_lb + static_cast<int>(8u * (e / 4u) + (e % 4u));
-                        const int ri = m_wave_base + row_in;
-                        const int ci = n_wave_base + col_in;
-                        double d_val = 0.0;
-                        if (ri < static_cast<int>(m) && ci < static_cast<int>(n)) {
-                            const double q = rint((Zhi_t[e] + Zlo_t[e]) * oz2_inv_P(S - 2));
-                            const double X = fma(oz2_P_lo(S - 2), q,
-                                                 fma(oz2_P_hi(S - 2), q, Zhi_t[e]) + Zlo_t[e]);
-                            const int inv_sft = -(static_cast<int>(sftA_lds[ri - block_m_base])
-                                                 + static_cast<int>(sftB_lds[ci - block_n_base]));
-                            d_val = alpha * ldexp(X, inv_sft);
-                        }
-                        Dsh[tile_off + static_cast<unsigned>(row_in) * EP_STRIDE
-                            + static_cast<unsigned>(col_in)] = d_val;
-                    }
+     * Scattered stores with __builtin_nontemporal_store (bypasses L2 caching). */
+    for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
+        for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
+            const int m_wave_base   = m_base + static_cast<int>(wm_w * TILE);
+            const int n_wave_base   = n_base + static_cast<int>(wn_w * TILE);
+            const int col_val       = n_wave_base + (lane % static_cast<int>(TILE));
+            const int lane_row_base = m_wave_base + 4 * (lane / static_cast<int>(TILE));
+            const unsigned reg_off  = (wm_w * WaveN + wn_w) * NREG_single;
+            for (unsigned e = 0; e < NREG_single; ++e) {
+                const int ri = lane_row_base + static_cast<int>(8u * (e / 4u) + (e % 4u));
+                const int ci = col_val;
+                if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
+                double Zhi, Zlo;
+                if constexpr (USE_LDS_ACCUM) {
+                    Zhi = Zhi_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
+                    Zlo = Zlo_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
+                } else {
+                    Zhi = Zhi_reg[reg_off + e];
+                    Zlo = Zlo_reg[reg_off + e];
                 }
-            }
-
-            /* Wave-scoped fence (Step 6): each wave reads ONLY the slice it just
-             * wrote, so a workgroup-wide s_barrier is unnecessary — a wave-local
-             * barrier makes this wave's LDS writes visible to its own reads at a
-             * fraction of the cost.  (No cross-wave sharing of the aliased Dsh
-             * slice, so no workgroup ordering is required.)                       */
-            __builtin_amdgcn_wave_barrier();
-
-            /* ── Phase 2 (Step 2): coalesced column-major store (and C load) for
-             * ALL tiles.  flat p = f*64 + lane; col = p/TILE, row = p%TILE →
-             * consecutive lanes map to consecutive rows in one column →
-             * contiguous D[ri + ci*ldd] run = coalesced 128-byte segment.       */
-            static constexpr unsigned EP_STEPS = TILE_ELEMS / 64u;  /* = NREG_single */
-            #pragma unroll
-            for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
-                #pragma unroll
-                for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
-                    const int m_wave_base   = m_base + static_cast<int>(wm_w * TILE);
-                    const int n_wave_base   = n_base + static_cast<int>(wn_w * TILE);
-                    const unsigned tile_off = (wm_w * WaveN + wn_w) * EP_TILE_DBLS;
-                    #pragma unroll
-                    for (unsigned f = 0; f < EP_STEPS; ++f) {
-                        const unsigned p   = f * 64u + static_cast<unsigned>(lane);
-                        const int col_out  = static_cast<int>(p / TILE);
-                        const int row_out  = static_cast<int>(p % TILE);
-                        const int ri = m_wave_base + row_out;
-                        const int ci = n_wave_base + col_out;
-                        if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
-                        double d_val = Dsh[tile_off + static_cast<unsigned>(row_out) * EP_STRIDE
-                                           + static_cast<unsigned>(col_out)];
-                        if (beta != 0.0) {
-                            const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
-                            d_val += beta * C[c_idx];
-                        }
-                        const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
-                        __builtin_nontemporal_store(d_val, D + d_idx);
-                    }
+                const double q = rint((Zhi + Zlo) * oz2_inv_P(S - 2));
+                const double X = fma(oz2_P_lo(S - 2), q,
+                                     fma(oz2_P_hi(S - 2), q, Zhi) + Zlo);
+                const int inv_sft = -(static_cast<int>(sftA[ri])
+                                     + static_cast<int>(sftB[ci]));
+                const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
+                double d_val = alpha * ldexp(X, inv_sft);
+                if (beta != 0.0) {
+                    const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
+                    d_val += beta * C[c_idx];
                 }
-            }
-            __builtin_amdgcn_wave_barrier();  /* wave-local: reads done before exit */
-        } else {
-            /* ── Fallback: original scattered epilogue (no transpose scratch).
-             * Used only when the per-wave transpose buffer would not fit LDS
-             * (very large WaveM×WaveN×TILE).  Same math, uncoalesced stores.   */
-            #pragma unroll
-            for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
-                #pragma unroll
-                for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
-                    const int m_wave_base   = m_base + static_cast<int>(wm_w * TILE);
-                    const int n_wave_base   = n_base + static_cast<int>(wn_w * TILE);
-                    const int col_val       = n_wave_base + (lane % static_cast<int>(TILE));
-                    const int lane_row_base = m_wave_base + 4 * (lane / static_cast<int>(TILE));
-                    const unsigned reg_off  = (wm_w * WaveN + wn_w) * NREG_single;
-                    double Zhi_t[NREG_single], Zlo_t[NREG_single];
-                    if constexpr (USE_LDS_ACCUM) {
-                        #pragma unroll
-                        for (unsigned e = 0; e < NREG_single; ++e) {
-                            Zhi_t[e] = Zhi_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
-                            Zlo_t[e] = Zlo_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
-                        }
-                    } else {
-                        #pragma unroll
-                        for (unsigned e = 0; e < NREG_single; ++e) {
-                            Zhi_t[e] = Zhi_reg[reg_off + e];
-                            Zlo_t[e] = Zlo_reg[reg_off + e];
-                        }
-                    }
-                    #pragma unroll
-                    for (unsigned e = 0; e < NREG_single; ++e) {
-                        const int ri = lane_row_base + static_cast<int>(8u * (e / 4u) + (e % 4u));
-                        const int ci = col_val;
-                        if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
-                        const double q = rint((Zhi_t[e] + Zlo_t[e]) * oz2_inv_P(S - 2));
-                        const double X = fma(oz2_P_lo(S - 2), q,
-                                             fma(oz2_P_hi(S - 2), q, Zhi_t[e]) + Zlo_t[e]);
-                        const int inv_sft = -(static_cast<int>(sftA_lds[ri - block_m_base])
-                                             + static_cast<int>(sftB_lds[ci - block_n_base]));
-                        const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
-                        double d_val = alpha * ldexp(X, inv_sft);
-                        if (beta != 0.0) {
-                            const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
-                            d_val += beta * C[c_idx];
-                        }
-                        __builtin_nontemporal_store(d_val, D + d_idx);
-                    }
-                }
+                __builtin_nontemporal_store(d_val, D + d_idx);
             }
         }
     }
