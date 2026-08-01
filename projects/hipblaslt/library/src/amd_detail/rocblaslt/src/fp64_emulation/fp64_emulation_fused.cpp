@@ -1144,10 +1144,12 @@ rocblaslt_status oz2_launch_fused_TN(
         const bool _elongated = (m >= 4*n) || (n >= 4*m); \
         if (is_gfx950 && m >= 8192 && n >= 8192 && k >= 8192) { \
             _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,false);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1 */ \
-        } else if (!is_gfx950 && _elongated && k >= 4096) { \
-            _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,false,false);  /* WM4WN4Wm4Wn2T16: 256×128, KU=1 (tall/wide) */ \
+        } else if (is_gfx950) { \
+            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,false,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=1 (gfx950 default) */ \
+        } else if (_elongated && k >= 4096) { \
+            _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,false,false);  /* WM4WN4Wm4Wn2T16: 256×128, KU=1 (gfx942 tall/wide) */ \
         } else { \
-            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 */ \
+            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,false);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 (gfx942 default) */ \
         } \
     } while(0)
 
