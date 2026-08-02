@@ -91,6 +91,10 @@ static const KernelConfig CONFIGS[] = {
     { 4, 4, 4, 2, 16, 1, false, false, 2, "WM4WN4Wm4Wn2T16ku1pgr2" },  /* 256×128 KU1 PGR2 — gfx942 tall/wide */
     { 4, 4, 4, 4, 16, 1, false, false, 2, "WM4WN4Wm4Wn4T16ku1pgr2" },  /* 256×256 KU1 PGR2 — gfx950 large */
     { 4, 4, 2, 2, 16, 1, false, false, 2, "WM4WN4Wm2Wn2T16ku1pgr2" },  /* 128×128 KU1 PGR2 — gfx950 default */
+    /* ── FVA=1 + PGR=2 (gfx950 only) ──────────────────────────────────── */
+    { 4, 4, 2, 2, 16, 1, true,  true,  2, "WM4WN4Wm2Wn2T16ku1fva1pgr2" },  /* 128×128 KU1 FVA1 PGR2 */
+    { 4, 4, 4, 4, 16, 1, true,  true,  2, "WM4WN4Wm4Wn4T16ku1fva1pgr2" },  /* 256×256 KU1 FVA1 PGR2 */
+    { 4, 4, 2, 2, 16, 2, true,  true,  2, "WM4WN4Wm2Wn2T16ku2fva1pgr2" },  /* 128×128 KU2 FVA1 PGR2 */
 
     /* WM, WN, WaveM, WaveN, TILE, KU, gfx950_only, force_vgpr_accum, pgr, label */
     /* KU=0/auto removed throughout — all entries use explicit KU=1/2/4.

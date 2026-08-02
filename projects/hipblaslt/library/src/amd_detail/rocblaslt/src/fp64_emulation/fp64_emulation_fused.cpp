@@ -1027,6 +1027,10 @@ rocblaslt_status oz2_launch_fused_TN(
                 else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,0u,2u); \
                 else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,0u,2u); \
                 else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,0u,2u); \
+                /* ── FVA=1 + PGR=2 (gfx950 only) ──────────────────────── */ \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,1u,2u); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,1u,2u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,1u,2u); \
                 else { return rocblaslt_status_invalid_value; } \
                 return rocblaslt_status_success; \
             } \
