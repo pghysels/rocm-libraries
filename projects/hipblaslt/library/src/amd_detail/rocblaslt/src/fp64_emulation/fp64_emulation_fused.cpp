@@ -237,8 +237,14 @@ oz2_fused_TN_kernel(
     /* ── Static LDS ────────────────────────────────────────────────────────── */
     static constexpr unsigned A_BUF_BYTES = WM * WaveM * TILE * KBLK_STRIDE;
     static constexpr unsigned B_BUF_BYTES = WN * WaveN * TILE * KBLK_STRIDE;
-    __shared__ int8_t  A8i_lds[N_BUF][A_BUF_BYTES];
-    __shared__ int8_t  B8i_lds[N_BUF][B_BUF_BYTES];
+    /* A8i_lds and B8i_lds are declared as a single contiguous flat buffer so
+     * that the finalize section can safely reinterpret the combined region as
+     * a double* tile_out for the coalesced output transpose.                  */
+    __shared__ int8_t  mfma_lds_flat[N_BUF * (A_BUF_BYTES + B_BUF_BYTES)];
+    auto (&A8i_lds)[N_BUF][A_BUF_BYTES] =
+        *reinterpret_cast<int8_t(*)[N_BUF][A_BUF_BYTES]>(mfma_lds_flat);
+    auto (&B8i_lds)[N_BUF][B_BUF_BYTES] =
+        *reinterpret_cast<int8_t(*)[N_BUF][B_BUF_BYTES]>(mfma_lds_flat + N_BUF * A_BUF_BYTES);
     /* CRT accumulator LDS — flat layout [e * BLK_THR + tid].
      * Thread tid owns column tid for accumulator row e, giving consecutive
      * intra-wavefront access (2-way bank conflict; unavoidable for 64-lane
@@ -582,42 +588,122 @@ oz2_fused_TN_kernel(
     }
 
     /* ── Finalize: CRT range-reduction + inverse scale + write D ─────────────
-     * ISA-verified output layout (AMD CDNA3, Sec. 7.1.4.2) per MFMA tile:
-     *   col = lane % TILE
-     *   row = 4*(lane/TILE) + 8*(e/4) + (e%4)   for e = 0..NREG_single-1
+     * Coalesced output path: per-wave LDS transpose for row-consecutive D writes.
      *
-     * Scattered stores with __builtin_nontemporal_store (bypasses L2 caching). */
-    for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
-        for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
-            const int m_wave_base   = m_base + static_cast<int>(wm_w * TILE);
-            const int n_wave_base   = n_base + static_cast<int>(wn_w * TILE);
-            const int col_val       = n_wave_base + (lane % static_cast<int>(TILE));
-            const int lane_row_base = m_wave_base + 4 * (lane / static_cast<int>(TILE));
-            const unsigned reg_off  = (wm_w * WaveN + wn_w) * NREG_single;
-            for (unsigned e = 0; e < NREG_single; ++e) {
-                const int ri = lane_row_base + static_cast<int>(8u * (e / 4u) + (e % 4u));
-                const int ci = col_val;
-                if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
-                double Zhi, Zlo;
-                if constexpr (USE_LDS_ACCUM) {
-                    Zhi = Zhi_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
-                    Zlo = Zlo_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
-                } else {
-                    Zhi = Zhi_reg[reg_off + e];
-                    Zlo = Zlo_reg[reg_off + e];
+     * MFMA output layout: col = lane%TILE, row = 4*(lane/TILE) + 8*(e/4) + (e%4).
+     * Problem: each lane writes to a different column → stride-ldd → no coalescing.
+     * Fix: store d_val to LDS in column-major layout, read back in row-major order
+     * so that consecutive threads write consecutive rows → stride-1 → coalesced.
+     * Also coalesces C reads (when beta != 0).
+     *
+     * LDS reuse: A8i_lds/B8i_lds are dead after the S-loop; reinterpret as double*.
+     * Each wave gets TILE*(TILE+1) doubles; the +1 padding ensures that 4 groups
+     * of 16 lanes (different cols, same rows) hit different banks (no conflict).
+     *
+     * Falls back to scattered stores when LDS is too small (e.g., large TILE=32). */
+    static constexpr unsigned TILE_OUT_STRIDE = TILE + 1u;
+    static constexpr size_t   TILE_OUT_BYTES  = static_cast<size_t>(WM * WN)
+                                              * TILE * TILE_OUT_STRIDE * sizeof(double);
+    static constexpr bool USE_COALESCED_OUT   = (TILE_OUT_BYTES
+                                              <= static_cast<size_t>(N_BUF) * (A_BUF_BYTES + B_BUF_BYTES));
+
+    if constexpr (USE_COALESCED_OUT) {
+        __syncthreads();  /* ensure all waves done with CRT / K-loop LDS before reuse */
+        /* Reinterpret MFMA LDS (mfma_lds_flat, dead after S-loop) as output tile. */
+        double* tile_out = reinterpret_cast<double*>(mfma_lds_flat);
+
+        for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
+            for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
+                const int m_wave_base   = m_base + static_cast<int>(wm_w * TILE);
+                const int n_wave_base   = n_base + static_cast<int>(wn_w * TILE);
+                const int mfma_col      = lane % static_cast<int>(TILE);
+                const int mfma_row_base = 4 * (lane / static_cast<int>(TILE));
+                const unsigned reg_off  = (wm_w * WaveN + wn_w) * NREG_single;
+                double* my_tile = tile_out + static_cast<unsigned>(wid) * TILE * TILE_OUT_STRIDE;
+
+                /* Phase 1: compute d_val in MFMA register order → LDS column-major.
+                 * Each lane stores its NREG_single elements to
+                 * my_tile[mfma_col * TILE_OUT_STRIDE + tile_row].                  */
+                for (unsigned e = 0; e < NREG_single; ++e) {
+                    const int tile_row = mfma_row_base + static_cast<int>(8u * (e / 4u) + (e % 4u));
+                    const int gi = m_wave_base + tile_row;
+                    const int gj = n_wave_base + mfma_col;
+                    double Zhi, Zlo;
+                    if constexpr (USE_LDS_ACCUM) {
+                        Zhi = Zhi_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
+                        Zlo = Zlo_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
+                    } else {
+                        Zhi = Zhi_reg[reg_off + e];
+                        Zlo = Zlo_reg[reg_off + e];
+                    }
+                    const double q = rint((Zhi + Zlo) * oz2_inv_P(S - 2));
+                    const double X = fma(oz2_P_lo(S - 2), q,
+                                         fma(oz2_P_hi(S - 2), q, Zhi) + Zlo);
+                    const int inv_sft = (gi < static_cast<int>(m) && gj < static_cast<int>(n))
+                                      ? -(static_cast<int>(sftA[gi]) + static_cast<int>(sftB[gj]))
+                                      : 0;
+                    my_tile[static_cast<unsigned>(mfma_col) * TILE_OUT_STRIDE
+                          + static_cast<unsigned>(tile_row)] = alpha * ldexp(X, inv_sft);
                 }
-                const double q = rint((Zhi + Zlo) * oz2_inv_P(S - 2));
-                const double X = fma(oz2_P_lo(S - 2), q,
-                                     fma(oz2_P_hi(S - 2), q, Zhi) + Zlo);
-                const int inv_sft = -(static_cast<int>(sftA[ri])
-                                     + static_cast<int>(sftB[ci]));
-                const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
-                double d_val = alpha * ldexp(X, inv_sft);
-                if (beta != 0.0) {
-                    const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
-                    d_val += beta * C[c_idx];
+                /* No __syncthreads() needed: each wave reads only its own LDS partition. */
+
+                /* Phase 2: read LDS in row-consecutive order → coalesced D write.
+                 * 64 threads, TILE×TILE elements → NREG_single passes.
+                 * Pass j: thread t handles linear element j*64 + lane.
+                 * row = lin % TILE, col = lin / TILE.
+                 * Threads 0..15 → rows 0..15 of the same column → coalesced!     */
+                for (unsigned j = 0; j < NREG_single; ++j) {
+                    const unsigned lin = j * 64u + static_cast<unsigned>(lane);
+                    const int r = static_cast<int>(lin % TILE);
+                    const int c = static_cast<int>(lin / TILE);
+                    const int gi = m_wave_base + r;
+                    const int gj = n_wave_base + c;
+                    if (gi < static_cast<int>(m) && gj < static_cast<int>(n)) {
+                        double val = my_tile[static_cast<unsigned>(c) * TILE_OUT_STRIDE
+                                           + static_cast<unsigned>(r)];
+                        if (beta != 0.0) {
+                            val += beta * C[static_cast<size_t>(gi) + static_cast<size_t>(gj) * ldc];
+                        }
+                        __builtin_nontemporal_store(val,
+                            D + static_cast<size_t>(gi) + static_cast<size_t>(gj) * ldd);
+                    }
                 }
-                __builtin_nontemporal_store(d_val, D + d_idx);
+            }
+        }
+    } else {
+        /* Fallback: scattered stores (original path, used when LDS is too small). */
+        for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
+            for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
+                const int m_wave_base   = m_base + static_cast<int>(wm_w * TILE);
+                const int n_wave_base   = n_base + static_cast<int>(wn_w * TILE);
+                const int col_val       = n_wave_base + (lane % static_cast<int>(TILE));
+                const int lane_row_base = m_wave_base + 4 * (lane / static_cast<int>(TILE));
+                const unsigned reg_off  = (wm_w * WaveN + wn_w) * NREG_single;
+                for (unsigned e = 0; e < NREG_single; ++e) {
+                    const int ri = lane_row_base + static_cast<int>(8u * (e / 4u) + (e % 4u));
+                    const int ci = col_val;
+                    if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
+                    double Zhi, Zlo;
+                    if constexpr (USE_LDS_ACCUM) {
+                        Zhi = Zhi_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
+                        Zlo = Zlo_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
+                    } else {
+                        Zhi = Zhi_reg[reg_off + e];
+                        Zlo = Zlo_reg[reg_off + e];
+                    }
+                    const double q = rint((Zhi + Zlo) * oz2_inv_P(S - 2));
+                    const double X = fma(oz2_P_lo(S - 2), q,
+                                         fma(oz2_P_hi(S - 2), q, Zhi) + Zlo);
+                    const int inv_sft = -(static_cast<int>(sftA[ri])
+                                         + static_cast<int>(sftB[ci]));
+                    const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
+                    double d_val = alpha * ldexp(X, inv_sft);
+                    if (beta != 0.0) {
+                        const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
+                        d_val += beta * C[c_idx];
+                    }
+                    __builtin_nontemporal_store(d_val, D + d_idx);
+                }
             }
         }
     }
@@ -970,17 +1056,20 @@ rocblaslt_status oz2_launch_fused_TN(
          *   for large symmetric shapes (M,N,K ≥ 8192, +23%).  The gfx942        \
          *   elongated 256×128 branch is gfx942-only (unmeasured on gfx950).      \
          * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256.        */ \
-        const bool _elongated = (m >= 4*n) || (n >= 4*m); \
-        if (is_gfx950 && m >= 8192 && n >= 8192 && k >= 8192) { \
-            _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,1u);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1 */ \
-        } else if (is_gfx950) { \
-            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,false,1u);  /* WM4WN4Wm2Wn2T16: 128×128, KU=1 (gfx950 default) */ \
-        } else if (!_elongated && m >= 8192 && n >= 8192 && k >= 8192) { \
-            _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,2u);  /* WM4WN4Wm4Wn4T16: 256×256, KU=1, PGR=2 (gfx942 large symmetric, +3.3% vs PGR=1) */ \
-        } else if (_elongated && k >= 4096) { \
-            _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,false,1u);  /* WM4WN4Wm4Wn2T16: 256×128, KU=1 (gfx942 tall/wide) */ \
+        if (is_gfx950) { \
+            /* ── gfx950 (MI355X) tile selection ────────────────────────── */ \
+            if (m >= 8192 && n >= 8192 && k >= 8192) { \
+                _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,1u);  /* 256×256, KU=1 */ \
+            } else { \
+                _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,false,1u);  /* 128×128, KU=1 */ \
+            } \
         } else { \
-            _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,1u);  /* WM4WN4Wm2Wn2T16: 128×128, KU=2 (gfx942 default) */ \
+            /* ── gfx942 (MI300X) tile selection ────────────────────────── */ \
+            if (m >= 8192 && n >= 8192 && k >= 8192) { \
+                _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,2u);  /* 256×256, KU=1, PGR=2 (+3.3%) */ \
+            } else { \
+                _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,1u);  /* 128×128, KU=2 */ \
+            } \
         } \
     } while(0)
 
