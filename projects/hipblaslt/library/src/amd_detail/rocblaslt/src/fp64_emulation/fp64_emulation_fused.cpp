@@ -39,27 +39,35 @@
  * so that apply_mfma can be written once without if constexpr on TILE.
  * All resolved at compile time — zero runtime overhead.
  * ========================================================================= */
-template <unsigned TILE> struct oz2_mfma_traits;
-template<> struct oz2_mfma_traits<16u> {
+template <int TILE> struct oz2_mfma_traits;
+template<> struct oz2_mfma_traits<16> {
 #if defined(__gfx950__)
-    static constexpr unsigned kblk = 64u;
+    static constexpr int    kblk       = 64;
+    static constexpr size_t lds_budget = 160 * 1024;
+    static constexpr int    ku_max     = 4;
     typedef long src_t __attribute__((ext_vector_type(2)));
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
       || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-    static constexpr unsigned kblk = 32u;
+    static constexpr int    kblk       = 32;
+    static constexpr size_t lds_budget = 64 * 1024;
+    static constexpr int    ku_max     = 4;
     using src_t = int64_t;
 #else
 #  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
     typedef int acc_t __attribute__((ext_vector_type(4)));
 };
-template<> struct oz2_mfma_traits<32u> {
+template<> struct oz2_mfma_traits<32> {
 #if defined(__gfx950__)
-    static constexpr unsigned kblk = 32u;
+    static constexpr int    kblk       = 32;
+    static constexpr size_t lds_budget = 160 * 1024;
+    static constexpr int    ku_max     = 2;   /* KU=4 → scratch=424B on gfx950 T32 */
     typedef long src_t __attribute__((ext_vector_type(2)));
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
       || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-    static constexpr unsigned kblk = 16u;
+    static constexpr int    kblk       = 16;
+    static constexpr size_t lds_budget = 64 * 1024;
+    static constexpr int    ku_max     = 4;
     using src_t = int64_t;
 #else
 #  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
@@ -72,7 +80,7 @@ template<> struct oz2_mfma_traits<32u> {
  * instead of 4-way from a single 16-byte load.
  * On gfx94x (K_A_BYTES=8): single 8-byte load is always conflict-free.
  * src16 == src32 on all architectures, so one template covers both tiles.   */
-template <unsigned TILE>
+template <int TILE>
 __device__ __forceinline__ typename oz2_mfma_traits<TILE>::src_t
 oz2_load_mfma_src(const int8_t* __restrict__ ptr) noexcept {
 #if defined(__gfx950__)
@@ -92,22 +100,31 @@ oz2_load_mfma_src(const int8_t* __restrict__ ptr) noexcept {
  * Dispatches to the correct v_mfma_i32 builtin based on TILE and arch.
  * TILE=16: 16x16x32 (gfx94x) / 16x16x64 (gfx95x)
  * TILE=32: 32x32x16 (gfx94x) / 32x32x32 (gfx95x)                         */
-template <unsigned TILE>
+template <int TILE>
 __device__ __forceinline__ typename oz2_mfma_traits<TILE>::acc_t
 oz2_do_mfma(typename oz2_mfma_traits<TILE>::src_t a,
             typename oz2_mfma_traits<TILE>::src_t b,
             typename oz2_mfma_traits<TILE>::acc_t c) noexcept {
 #if defined(__gfx950__)
-    if constexpr (TILE == 16u) return __builtin_amdgcn_mfma_i32_16x16x64_i8(a, b, c, 0, 0, 0);
-    else                       return __builtin_amdgcn_mfma_i32_32x32x32_i8(a, b, c, 0, 0, 0);
+    if constexpr (TILE == 16) return __builtin_amdgcn_mfma_i32_16x16x64_i8(a, b, c, 0, 0, 0);
+    else                      return __builtin_amdgcn_mfma_i32_32x32x32_i8(a, b, c, 0, 0, 0);
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
       || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-    if constexpr (TILE == 16u) return __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, c, 0, 0, 0);
-    else                       return __builtin_amdgcn_mfma_i32_32x32x16_i8(a, b, c, 0, 0, 0);
+    if constexpr (TILE == 16) return __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, c, 0, 0, 0);
+    else                      return __builtin_amdgcn_mfma_i32_32x32x16_i8(a, b, c, 0, 0, 0);
 #else
 #  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
 }
+
+/* ── Load-width type trait ─────────────────────────────────────────────────
+ * Maps a compile-time LOAD_BYTES (4, 8, or 16) to the corresponding C++
+ * register type.  The compiler lowers these to global_load_dword,
+ * global_load_dwordx2, or global_load_dwordx4 respectively.                */
+template <int LB> struct oz2_load_type;
+template<> struct oz2_load_type<4>  { using type = int32_t; };
+template<> struct oz2_load_type<8>  { using type = int64_t; };
+template<> struct oz2_load_type<16> { using type = longlong2; };
 
 /* =========================================================================
  * oz2_fused_TN_kernel — unified template supporting three macrotile sizes:
@@ -148,9 +165,9 @@ oz2_do_mfma(typename oz2_mfma_traits<TILE>::src_t a,
  * ========================================================================= */
 /* KU_PARAM=0 means "auto-select K_UNROLL from LDS budget" (the default).
  * Set KU_PARAM=1,2,4 via OZ2_FUSED_SHAPE_OVERRIDE to override for tuning. */
-template <unsigned S, bool HAS_LO, unsigned WM = 4u, unsigned WN = 4u, unsigned TILE = 16u,
-          unsigned WaveM = 1u, unsigned WaveN = 1u, unsigned KU_PARAM = 0u,
-          bool FORCE_VGPR_ACCUM = false, unsigned PGR = 1u>
+template <int S, bool HAS_LO, int WM = 4, int WN = 4, int TILE = 16,
+          int WaveM = 1, int WaveN = 1, int KU_PARAM = 0,
+          bool FORCE_VGPR_ACCUM = false, int PGR = 1>
 __global__ static void
 oz2_fused_TN_kernel(
     const int8_t*  __restrict__ A8i,   /* [S × lda8i × cola8i] INT8 A  */
@@ -170,74 +187,80 @@ oz2_fused_TN_kernel(
 {
     /* ── Derived compile-time constants ────────────────────────────────────── */
     using mfma_acc_t = typename oz2_mfma_traits<TILE>::acc_t;           /* v4i32 (TILE=16) or v16i32 (TILE=32)  */
-    static constexpr unsigned NREG_single = TILE * TILE / 64u;          /* accumulators per thread per MFMA tile */
-    static constexpr unsigned NREG        = WaveM * WaveN * NREG_single; /* total accumulators per thread         */
-    static constexpr unsigned KBLK        = oz2_mfma_traits<TILE>::kblk;
-    /* K-loop unroll factor:
-     *   gfx94x (MI300): K_UNROLL=4 — measured scratch=108B ✓
-     *   gfx95x (MI350): K_UNROLL=2 — KBLK is doubled vs gfx94x; K_UNROLL=4
-     *     would double A_STEPS/B_STEPS → same register pressure as gfx94x
-     *     K_UNROLL=8 (scratch=388B, 2.5× slower). Confirmed on hardware:
-     *     K_UNROLL=4 → scratch=424B ✗  K_UNROLL=2 → scratch=104B ✓          */
-#if defined(__gfx950__)
-    static constexpr size_t   LDS_BUDGET  = 160u * 1024u;
-#elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
-      || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-    static constexpr size_t   LDS_BUDGET  = 64u * 1024u;
-#else
-#  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
-#endif
-    static constexpr size_t   LDS_MFMA_K4 = 2u * (WM * WaveM * TILE * (KBLK * 4u)
-                                                  + WN * WaveN * TILE * (KBLK * 4u));
-    /* K_UNROLL: auto-selected from LDS budget, or overridden via KU_PARAM. */
-#if defined(__gfx950__)
-    static constexpr unsigned K_UNROLL_AUTO = (TILE == 32u) ? 2u : 4u;
-#elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
-      || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-    static constexpr unsigned K_UNROLL_AUTO = (LDS_MFMA_K4 <= LDS_BUDGET) ? 4u : 2u;
-#else
-#  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
-#endif
-    static constexpr unsigned K_UNROLL = (KU_PARAM > 0u) ? KU_PARAM : K_UNROLL_AUTO;
-    static constexpr unsigned KBLK_LOAD   = KBLK * K_UNROLL;
-    static constexpr unsigned K_A_BYTES   = KBLK * TILE / 64u;
-    static constexpr unsigned KBLK_PAD_UNIT = (K_A_BYTES == 16u) ? 8u : K_A_BYTES;
-    static constexpr size_t   LDS_BYTES_OLD = 2u * (WM * WaveM * TILE * KBLK_LOAD
-                                                   + WN * WaveN * TILE * KBLK_LOAD);
+    static constexpr int NREG_single = TILE * TILE / 64;                /* accumulators per thread per MFMA tile */
+    static constexpr int NREG        = WaveM * WaveN * NREG_single;    /* total accumulators per thread         */
+    static constexpr int KBLK        = oz2_mfma_traits<TILE>::kblk;
+    /* K-loop unroll factor: auto-selected from LDS budget and per-arch
+     * register-pressure ceiling (ku_max), or overridden via KU_PARAM.
+     * All arch-specific values come from oz2_mfma_traits — no #ifdef here. */
+    static constexpr size_t   LDS_BUDGET    = oz2_mfma_traits<TILE>::lds_budget;
+    static constexpr size_t   LDS_MFMA_K4   = 2 * (WM * WaveM * TILE * (KBLK * 4)
+                                                   + WN * WaveN * TILE * (KBLK * 4));
+    static constexpr int K_UNROLL_LDS   = (LDS_MFMA_K4 <= LDS_BUDGET) ? 4 : 2;
+    static constexpr int K_UNROLL_AUTO  = (K_UNROLL_LDS < oz2_mfma_traits<TILE>::ku_max)
+                                        ? K_UNROLL_LDS : oz2_mfma_traits<TILE>::ku_max;
+    static constexpr int K_UNROLL = (KU_PARAM > 0) ? KU_PARAM : K_UNROLL_AUTO;
+    static constexpr int KBLK_LOAD   = KBLK * K_UNROLL;
+    static constexpr int K_A_BYTES   = KBLK * TILE / 64;
+    static constexpr int KBLK_PAD_UNIT = (K_A_BYTES == 16) ? 8 : K_A_BYTES;
+    static constexpr size_t   LDS_BYTES_OLD = 2 * (WM * WaveM * TILE * KBLK_LOAD
+                                                  + WN * WaveN * TILE * KBLK_LOAD);
     /* Pad LDS stride so that apply_mfma's 64-lane reads at m_col*KBLK_STRIDE
      * land on distinct LDS banks (conflict-free).                             */
-    static constexpr unsigned KBLK_PAD    = (LDS_BYTES_OLD + KBLK_PAD_UNIT * TILE * (WM * WaveM + WN * WaveN) * 2u
-                                              <= LDS_BUDGET) ? KBLK_PAD_UNIT : 0u;
-    static constexpr unsigned KBLK_STRIDE = KBLK_LOAD + KBLK_PAD;
-    static constexpr unsigned BLK_THR   = WM * WN * 64u;
-    static constexpr unsigned K4DIM     = KBLK_LOAD / 4u;
-    static constexpr unsigned A_STEPS   = (WM * WaveM * TILE * K4DIM) / BLK_THR;
-    static constexpr unsigned B_STEPS   = (WN * WaveN * TILE * K4DIM) / BLK_THR;
-    /* VALID_CONFIG: false when A_STEPS or B_STEPS < 1 (gfx950-only KU=1 on gfx942). */
-    static constexpr unsigned A_STEPS_SAFE = (A_STEPS > 0u) ? A_STEPS : 1u;
-    static constexpr unsigned B_STEPS_SAFE = (B_STEPS > 0u) ? B_STEPS : 1u;
-    static constexpr bool     VALID_CONFIG  = (A_STEPS >= 1u && B_STEPS >= 1u);
-    if constexpr (!VALID_CONFIG) return; /* bail early for invalid arch/config combos */
+    static constexpr int KBLK_PAD    = (LDS_BYTES_OLD + KBLK_PAD_UNIT * TILE * (WM * WaveM + WN * WaveN) * 2
+                                         <= LDS_BUDGET) ? KBLK_PAD_UNIT : 0;
+    static constexpr int KBLK_STRIDE = KBLK_LOAD + KBLK_PAD;
+    static constexpr int BLK_THR    = WM * WN * 64;
 
-    /* ── LDS accumulator decision ───────────────────────────────────────────
+    /* ── LDS accumulator decision (computed early — needed by LOAD_BYTES) ───
      * Store Zhi/Zlo in LDS when the combined budget (MFMA tiles + accumulators
      * + scale shifts) fits within LDS_BUDGET.  This enables large WaveM×WaveN
      * configurations (e.g., WM=1,WN=1,WaveM=4,WaveN=4 on MI350) that would
      * otherwise spill registers.  When false (e.g., all current MI300 configs),
      * accumulators stay in VGPRs with zero overhead.                          */
-    static constexpr unsigned N_BUF       = PGR + 1u;   /* 2 for PGR=1, 3 for PGR=2 */
+    static constexpr int  N_BUF       = PGR + 1;   /* 2 for PGR=1, 3 for PGR=2 */
     static constexpr size_t LDS_MFMA      = N_BUF * (WM * WaveM * TILE * KBLK_STRIDE
                                                     + WN * WaveN * TILE * KBLK_STRIDE);
-    static constexpr size_t LDS_ZHI_ZLO   = 2u * BLK_THR * NREG * sizeof(double);
+    static constexpr size_t LDS_ZHI_ZLO   = 2 * BLK_THR * NREG * sizeof(double);
     static constexpr bool   FITS_IN_LDS   = (LDS_MFMA + LDS_ZHI_ZLO <= LDS_BUDGET);
     /* USE_LDS_ACCUM: use LDS for Zhi/Zlo only when LDS has room AND FORCE_VGPR_ACCUM is not set.
      * FORCE_VGPR_ACCUM=true keeps accumulators in registers even when LDS has space,
      * which can be faster when NREG is small enough to avoid VGPR spilling.             */
     static constexpr bool   USE_LDS_ACCUM = FITS_IN_LDS && !FORCE_VGPR_ACCUM;
 
+    /* Auto-select the widest global load (4/8/16 bytes = dword/dwordx2/dwordx4)
+     * that keeps both A_STEPS and B_STEPS ≥ 1.  Wider loads reduce instruction
+     * count; the limit is the smaller of the A and B tile data per thread.
+     *
+     * HIGH_VGPR_PRESSURE guard: when accumulators are in registers (not LDS)
+     * and NREG is large (e.g., 256×256 on gfx942 with NREG=64), the compiler
+     * is heavily scheduling-constrained.  Wider loads reduce instruction count
+     * but also reduce scheduling flexibility (fewer, larger loads vs many small
+     * loads that can be interleaved).  Fall back to 4-byte loads to preserve
+     * the original instruction schedule for these VGPR-heavy configs.
+     *
+     * gfx942 (KBLK=32): 8 B for KU≥2 symmetric with NREG≤16, 4 B otherwise.
+     * gfx950 (KBLK=64): 16 B for KU≥2 symmetric (USE_LDS_ACCUM=true → no guard). */
+    static constexpr int MIN_WAVE_DIM    = ((WM * WaveM) < (WN * WaveN))
+                                         ? (WM * WaveM) : (WN * WaveN);
+    static constexpr int MIN_BYTES_PER_THR = MIN_WAVE_DIM * TILE * KBLK_LOAD / BLK_THR;
+    static constexpr bool HIGH_VGPR_PRESSURE = (!USE_LDS_ACCUM && NREG > 16);
+    static constexpr int LOAD_BYTES  = (!HIGH_VGPR_PRESSURE && MIN_BYTES_PER_THR >= 16) ? 16
+                                     : (!HIGH_VGPR_PRESSURE && MIN_BYTES_PER_THR >=  8) ?  8
+                                     :                                                      4;
+    using load_t = typename oz2_load_type<LOAD_BYTES>::type;
+    static constexpr int KDIM       = KBLK_LOAD / LOAD_BYTES;
+    static constexpr int A_STEPS    = (WM * WaveM * TILE * KDIM) / BLK_THR;
+    static constexpr int B_STEPS    = (WN * WaveN * TILE * KDIM) / BLK_THR;
+    /* VALID_CONFIG: false when A_STEPS or B_STEPS < 1 (gfx950-only KU=1 on gfx942). */
+    static constexpr int  A_STEPS_SAFE = (A_STEPS > 0) ? A_STEPS : 1;
+    static constexpr int  B_STEPS_SAFE = (B_STEPS > 0) ? B_STEPS : 1;
+    static constexpr bool VALID_CONFIG  = (A_STEPS >= 1 && B_STEPS >= 1);
+    if constexpr (!VALID_CONFIG) return; /* bail early for invalid arch/config combos */
+
     /* ── Static LDS ────────────────────────────────────────────────────────── */
-    static constexpr unsigned A_BUF_BYTES = WM * WaveM * TILE * KBLK_STRIDE;
-    static constexpr unsigned B_BUF_BYTES = WN * WaveN * TILE * KBLK_STRIDE;
+    static constexpr int A_BUF_BYTES = WM * WaveM * TILE * KBLK_STRIDE;
+    static constexpr int B_BUF_BYTES = WN * WaveN * TILE * KBLK_STRIDE;
     /* A8i_lds and B8i_lds are declared as a single contiguous flat buffer so
      * that the finalize section can safely reinterpret the combined region as
      * a double* tile_out for the coalesced output transpose.                  */
@@ -251,24 +274,24 @@ oz2_fused_TN_kernel(
      * intra-wavefront access (2-way bank conflict; unavoidable for 64-lane
      * waves with 32 LDS banks and 8-byte doubles).
      * When USE_LDS_ACCUM=false, arrays are size 1 (placeholder, never read). */
-    __shared__ double Zhi_lds[USE_LDS_ACCUM ? NREG * BLK_THR : 1u];
-    __shared__ double Zlo_lds[USE_LDS_ACCUM ? NREG * BLK_THR : 1u];
+    __shared__ double Zhi_lds[USE_LDS_ACCUM ? NREG * BLK_THR : 1];
+    __shared__ double Zlo_lds[USE_LDS_ACCUM ? NREG * BLK_THR : 1];
 
     /* ── Thread decomposition ───────────────────────────────────────────────── */
     const int tid  = static_cast<int>(threadIdx.x);
     const int wid  = tid / 64;
-    const int wm   = wid / static_cast<int>(WN);
-    const int wn   = wid % static_cast<int>(WN);
+    const int wm   = wid / WN;
+    const int wn   = wid % WN;
     const int lane = tid % 64;
     const int k_int = static_cast<int>(k);
 
     /* ── XCC-aware block tile mapping ───────────────────────────────────────── */
     static constexpr int SWIZZLE_B8i_PREF = 4;
 
-    const int m_tiles_total   = (static_cast<int>(m) + static_cast<int>(WM * WaveM * TILE) - 1)
-                                / static_cast<int>(WM * WaveM * TILE);
-    const int n_tiles_total   = (static_cast<int>(n) + static_cast<int>(WN * WaveN * TILE) - 1)
-                                / static_cast<int>(WN * WaveN * TILE);
+    const int m_tiles_total   = (static_cast<int>(m) + WM * WaveM * TILE - 1)
+                                / (WM * WaveM * TILE);
+    const int n_tiles_total   = (static_cast<int>(n) + WN * WaveN * TILE - 1)
+                                / (WN * WaveN * TILE);
     uint32_t hw_xcc_id = 0u;
     asm volatile("s_getreg_b32 %0, hwreg(20)" : "=s"(hw_xcc_id));
 
@@ -303,67 +326,67 @@ oz2_fused_TN_kernel(
         if (n_tile >= n_tiles_total) return;
     }
 
-    const int block_m_base = m_tile * static_cast<int>(WM * WaveM * TILE);
-    const int block_n_base = n_tile * static_cast<int>(WN * WaveN * TILE);
-    const int m_base = block_m_base + wm * static_cast<int>(WaveM * TILE);
-    const int n_base = block_n_base + wn * static_cast<int>(WaveN * TILE);
+    const int block_m_base = m_tile * (WM * WaveM * TILE);
+    const int block_n_base = n_tile * (WN * WaveN * TILE);
+    const int m_base = block_m_base + wm * (WaveM * TILE);
+    const int n_base = block_n_base + wn * (WaveN * TILE);
 
     /* ── CRT accumulators ───────────────────────────────────────────────────
      * Size-1 placeholder when USE_LDS_ACCUM=true (never accessed).
      * Each thread owns its own Zhi/Zlo elements — no barrier needed for init. */
-    double Zhi_reg[USE_LDS_ACCUM ? 1u : NREG] = {};
-    double Zlo_reg[USE_LDS_ACCUM ? 1u : NREG] = {};
+    double Zhi_reg[USE_LDS_ACCUM ? 1 : NREG] = {};
+    double Zlo_reg[USE_LDS_ACCUM ? 1 : NREG] = {};
     if constexpr (USE_LDS_ACCUM) {
-        for (unsigned e = 0; e < NREG; ++e) {
-            Zhi_lds[e * BLK_THR + static_cast<unsigned>(tid)] = 0.0;
-            Zlo_lds[e * BLK_THR + static_cast<unsigned>(tid)] = 0.0;
+        for (int e = 0; e < NREG; ++e) {
+            Zhi_lds[e * BLK_THR + tid] = 0.0;
+            Zlo_lds[e * BLK_THR + tid] = 0.0;
         }
     }
 
     /* ── Flat LDS/HBM offsets ──────────────────────────────────────────────── */
     /* Each thread precomputes its LDS write offset and HBM read offset once.  */
-    unsigned lds_off_A[A_STEPS_SAFE];  /* flat LDS byte offset within one buffer */
-    size_t   hbm_off_A[A_STEPS_SAFE];  /* flat HBM byte offset from A8i base   */
-    unsigned lds_off_B[B_STEPS_SAFE];
-    size_t   hbm_off_B[B_STEPS_SAFE];
+    int    lds_off_A[A_STEPS_SAFE];  /* flat LDS byte offset within one buffer */
+    size_t hbm_off_A[A_STEPS_SAFE];  /* flat HBM byte offset from A8i base   */
+    int    lds_off_B[B_STEPS_SAFE];
+    size_t hbm_off_B[B_STEPS_SAFE];
     /* ── Pre-fetch modulus s=0 prologue into registers ─────────────────────── */
     /* rA/rB serve dual purpose: K-loop double-buffer AND cross-modulus prologue.
      * Declaring at kernel scope (outside both S-loop and K-loop) lets the compiler
      * allocate them once, saving A_STEPS+B_STEPS VGPRs vs the old rA_pro/rB_pro
      * design where both were simultaneously live during the K-loop.            */
-    int32_t rA[A_STEPS_SAFE];
-    int32_t rB[B_STEPS_SAFE];
+    load_t rA[A_STEPS_SAFE];
+    load_t rB[B_STEPS_SAFE];
     {
         /* Compute flat LDS + HBM offsets, then prefetch first K-block. */
         #pragma unroll
-        for (unsigned ls = 0; ls < A_STEPS; ++ls) {
-            const unsigned flat = static_cast<unsigned>(threadIdx.x) + ls * BLK_THR;
-            const unsigned tile_dim = TILE * K4DIM;
-            const unsigned wm  = flat / tile_dim;
-            const unsigned ml  = (flat % tile_dim) / K4DIM;
-            const unsigned k4  = (flat % tile_dim) % K4DIM;
-            lds_off_A[ls] = (wm * TILE + ml) * KBLK_STRIDE + k4 * 4u;
-            const int mi = block_m_base + static_cast<int>(wm * TILE + ml);
-            hbm_off_A[ls] = static_cast<size_t>(mi) * lda8i + static_cast<size_t>(k4) * 4u;
+        for (int ls = 0; ls < A_STEPS; ++ls) {
+            const int flat = static_cast<int>(threadIdx.x) + ls * BLK_THR;
+            const int tile_dim = TILE * KDIM;
+            const int wm  = flat / tile_dim;
+            const int ml  = (flat % tile_dim) / KDIM;
+            const int kd  = (flat % tile_dim) % KDIM;
+            lds_off_A[ls] = (wm * TILE + ml) * KBLK_STRIDE + kd * LOAD_BYTES;
+            const int mi = block_m_base + wm * TILE + ml;
+            hbm_off_A[ls] = static_cast<size_t>(mi) * lda8i + static_cast<size_t>(kd) * LOAD_BYTES;
         }
         #pragma unroll
-        for (unsigned ls = 0; ls < B_STEPS; ++ls) {
-            const unsigned flat = static_cast<unsigned>(threadIdx.x) + ls * BLK_THR;
-            const unsigned tile_dim = TILE * K4DIM;
-            const unsigned wn  = flat / tile_dim;
-            const unsigned nl  = (flat % tile_dim) / K4DIM;
-            const unsigned k4  = (flat % tile_dim) % K4DIM;
-            lds_off_B[ls] = (wn * TILE + nl) * KBLK_STRIDE + k4 * 4u;
-            const int ni = block_n_base + static_cast<int>(wn * TILE + nl);
-            hbm_off_B[ls] = static_cast<size_t>(ni) * ldb8i + static_cast<size_t>(k4) * 4u;
+        for (int ls = 0; ls < B_STEPS; ++ls) {
+            const int flat = static_cast<int>(threadIdx.x) + ls * BLK_THR;
+            const int tile_dim = TILE * KDIM;
+            const int wn  = flat / tile_dim;
+            const int nl  = (flat % tile_dim) / KDIM;
+            const int kd  = (flat % tile_dim) % KDIM;
+            lds_off_B[ls] = (wn * TILE + nl) * KBLK_STRIDE + kd * LOAD_BYTES;
+            const int ni = block_n_base + wn * TILE + nl;
+            hbm_off_B[ls] = static_cast<size_t>(ni) * ldb8i + static_cast<size_t>(kd) * LOAD_BYTES;
         }
         if (k_int > 0) {
             #pragma unroll
-            for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                rA[ls] = *reinterpret_cast<const int32_t*>(A8i + hbm_off_A[ls]);
+            for (int ls = 0; ls < A_STEPS; ++ls)
+                rA[ls] = *reinterpret_cast<const load_t*>(A8i + hbm_off_A[ls]);
             #pragma unroll
-            for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                rB[ls] = *reinterpret_cast<const int32_t*>(B8i + hbm_off_B[ls]);
+            for (int ls = 0; ls < B_STEPS; ++ls)
+                rB[ls] = *reinterpret_cast<const load_t*>(B8i + hbm_off_B[ls]);
         }
     }
     if constexpr (USE_LDS_ACCUM) __syncthreads(); /* sync Zhi_lds/Zlo_lds init */
@@ -375,15 +398,15 @@ oz2_fused_TN_kernel(
      * C32[i*NREG_single .. (i+1)*NREG_single-1].
      * With WaveM=WaveN=1 the loop bodies execute once, identical to the
      * single-tile case.                                                        */
-    static constexpr unsigned N_TILES = WaveM * WaveN;
+    static constexpr int N_TILES = WaveM * WaveN;
     auto apply_mfma = [&](const int8_t* A_wm_base, const int8_t* B_wn_base,
                           mfma_acc_t (&C32)[N_TILES]) __attribute__((always_inline)) {
         using src_t = typename oz2_mfma_traits<TILE>::src_t;
-        const int m_col   = lane % static_cast<int>(TILE);
-        const int k_base  = static_cast<int>(K_A_BYTES) * (lane / static_cast<int>(TILE));
-        const int base_off = m_col * static_cast<int>(KBLK_STRIDE) + k_base;
-        static constexpr int A_ROW_STRIDE = static_cast<int>(TILE * KBLK_STRIDE);
-        static constexpr int B_ROW_STRIDE = static_cast<int>(TILE * KBLK_STRIDE);
+        const int m_col   = lane % TILE;
+        const int k_base  = K_A_BYTES * (lane / TILE);
+        const int base_off = m_col * KBLK_STRIDE + k_base;
+        static constexpr int A_ROW_STRIDE = TILE * KBLK_STRIDE;
+        static constexpr int B_ROW_STRIDE = TILE * KBLK_STRIDE;
 
         /* KU loop is outermost → each sa/sb LDS load is reused across all
          * WaveN (for sa) or WaveM (for sb) tiles.  LDS reads reduced from
@@ -392,10 +415,15 @@ oz2_fused_TN_kernel(
          *
          * The smaller of WaveM/WaveN is pre-loaded into an array to minimize
          * VGPR usage (min(WaveM,WaveN) src_t registers).  Total LDS loads
-         * are (WaveM+WaveN)×KU regardless of ordering — reuse is symmetric. */
+         * are (WaveM+WaveN)×KU regardless of ordering — reuse is symmetric.
+         *
+         * PLR note: software-pipelined LDS reads (prefetching next-ku sources
+         * after current-ku MFMAs) was tested but measured neutral on both
+         * gfx942 and gfx950 — the compiler's instruction scheduler already
+         * hides LDS latency via #pragma unroll + MFMA pipeline overlap.     */
         #pragma unroll
-        for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-            const int off = base_off + static_cast<int>(ku * KBLK);
+        for (int ku = 0; ku < K_UNROLL; ++ku) {
+            const int off = base_off + ku * KBLK;
 
             if constexpr (WaveM >= WaveN) {
                 /* Pre-load B[WaveN] (the smaller-or-equal dimension).
@@ -403,13 +431,13 @@ oz2_fused_TN_kernel(
                  * each sa scalar is reused WaveN times in the inner wn_w loop. */
                 src_t sb[WaveN];
                 #pragma unroll
-                for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w)
+                for (int wn_w = 0; wn_w < WaveN; ++wn_w)
                     sb[wn_w] = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
                 #pragma unroll
-                for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
+                for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
                     const src_t sa = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
                     #pragma unroll
-                    for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w)
+                    for (int wn_w = 0; wn_w < WaveN; ++wn_w)
                         C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa, sb[wn_w],
                                                                        C32[wm_w * WaveN + wn_w]);
                 }
@@ -419,13 +447,13 @@ oz2_fused_TN_kernel(
                  * each sb scalar is reused WaveM times in the inner wm_w loop. */
                 src_t sa[WaveM];
                 #pragma unroll
-                for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w)
+                for (int wm_w = 0; wm_w < WaveM; ++wm_w)
                     sa[wm_w] = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
                 #pragma unroll
-                for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
+                for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
                     const src_t sb = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
                     #pragma unroll
-                    for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w)
+                    for (int wm_w = 0; wm_w < WaveM; ++wm_w)
                         C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa[wm_w], sb,
                                                                        C32[wm_w * WaveN + wn_w]);
                 }
@@ -437,15 +465,15 @@ oz2_fused_TN_kernel(
      * Factored out so both the sequential and pipelined S-loops can reuse it.
      * Performs the TwoSum CRT accumulation for one modulus, given the MFMA
      * results in C32[] and the per-modulus CRT coefficients.                   */
-    auto do_crt = [&](mfma_acc_t (&C32)[N_TILES], unsigned s_idx)
+    auto do_crt = [&](mfma_acc_t (&C32)[N_TILES], int s_idx)
                   __attribute__((always_inline)) {
         const double nm  = oz2_neg_mod(s_idx), im = oz2_inv_mod(s_idx);
         const double qhi = oz2_qpi_hi(S - 2, s_idx);
         const double qlo = HAS_LO ? oz2_qpi_lo(S - 2, s_idx) : 0.0;
         if constexpr (!USE_LDS_ACCUM) {
-            for (unsigned r = 0; r < NREG; ++r) {
+            for (int r = 0; r < NREG; ++r) {
                 const double dc_raw = static_cast<double>(
-                    C32[r / NREG_single][static_cast<int>(r % NREG_single)]);
+                    C32[r / NREG_single][r % NREG_single]);
                 const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
                 const double hi     = dc * qhi;
                 const double new_hi = Zhi_reg[r] + hi;
@@ -455,12 +483,12 @@ oz2_fused_TN_kernel(
                 else                  Zlo_reg[r] += err;
             }
         } else {
-            for (unsigned r = 0; r < NREG; ++r) {
-                const unsigned idx = r * BLK_THR + static_cast<unsigned>(tid);
+            for (int r = 0; r < NREG; ++r) {
+                const int idx = r * BLK_THR + tid;
                 double Zhi = Zhi_lds[idx];
                 double Zlo = Zlo_lds[idx];
                 const double dc_raw = static_cast<double>(
-                    C32[r / NREG_single][static_cast<int>(r % NREG_single)]);
+                    C32[r / NREG_single][r % NREG_single]);
                 const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
                 const double hi     = dc * qhi;
                 const double new_hi = Zhi + hi;
@@ -477,7 +505,7 @@ oz2_fused_TN_kernel(
     /* ── K-loop body helper ────────────────────────────────────────────────────
      * Runs the K-loop (LDS fill, global prefetch, MFMA, drain) for one modulus.
      * Used by both sequential and pipelined S-loops.                           */
-    auto run_kloop = [&](unsigned s, mfma_acc_t (&C32)[N_TILES])
+    auto run_kloop = [&](int s, mfma_acc_t (&C32)[N_TILES])
                      __attribute__((always_inline)) {
         const int8_t* A8i_s = A8i + static_cast<size_t>(s) * stride_A_s;
         const int8_t* B8i_s = B8i + static_cast<size_t>(s) * stride_B_s;
@@ -485,13 +513,27 @@ oz2_fused_TN_kernel(
         if (k_int > 0) {
             __syncthreads();
 
-            /* Store K-block 0 (already in rA/rB) to LDS[0]. */
+            /* Store K-block 0 (already in rA/rB) to LDS[0].
+             * For LOAD_BYTES=16 (dwordx4), split into two 8-byte LDS stores
+             * because KBLK_STRIDE may not be 16-byte aligned (KBLK_PAD=8). */
             #pragma unroll
-            for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                *reinterpret_cast<int32_t*>(&A8i_lds[0][lds_off_A[ls]]) = rA[ls];
+            for (int ls = 0; ls < A_STEPS; ++ls) {
+                if constexpr (LOAD_BYTES == 16) {
+                    *reinterpret_cast<int64_t*>(&A8i_lds[0][lds_off_A[ls]])     = rA[ls].x;
+                    *reinterpret_cast<int64_t*>(&A8i_lds[0][lds_off_A[ls] + 8]) = rA[ls].y;
+                } else {
+                    *reinterpret_cast<load_t*>(&A8i_lds[0][lds_off_A[ls]]) = rA[ls];
+                }
+            }
             #pragma unroll
-            for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                *reinterpret_cast<int32_t*>(&B8i_lds[0][lds_off_B[ls]]) = rB[ls];
+            for (int ls = 0; ls < B_STEPS; ++ls) {
+                if constexpr (LOAD_BYTES == 16) {
+                    *reinterpret_cast<int64_t*>(&B8i_lds[0][lds_off_B[ls]])     = rB[ls].x;
+                    *reinterpret_cast<int64_t*>(&B8i_lds[0][lds_off_B[ls] + 8]) = rB[ls].y;
+                } else {
+                    *reinterpret_cast<load_t*>(&B8i_lds[0][lds_off_B[ls]]) = rB[ls];
+                }
+            }
 
             /* K-loop global-prefetch cursors.  Advance in place by compile-
              * time-constant KBLK_LOAD to keep per-iteration address math to
@@ -499,31 +541,43 @@ oz2_fused_TN_kernel(
             const int8_t* A_cur[A_STEPS_SAFE];
             const int8_t* B_cur[B_STEPS_SAFE];
             #pragma unroll
-            for (unsigned ls = 0; ls < A_STEPS; ++ls)
+            for (int ls = 0; ls < A_STEPS; ++ls)
                 A_cur[ls] = A8i_s + hbm_off_A[ls];
             #pragma unroll
-            for (unsigned ls = 0; ls < B_STEPS; ++ls)
+            for (int ls = 0; ls < B_STEPS; ++ls)
                 B_cur[ls] = B8i_s + hbm_off_B[ls];
 
             /* PGR=2 prologue: also load and store K-block 1 to LDS[1]. */
-            if constexpr (PGR >= 2u) {
-                if (static_cast<int>(KBLK_LOAD) < k_int) {
+            if constexpr (PGR >= 2) {
+                if (KBLK_LOAD < k_int) {
                     #pragma unroll
-                    for (unsigned ls = 0; ls < A_STEPS; ++ls) {
+                    for (int ls = 0; ls < A_STEPS; ++ls) {
                         A_cur[ls] += KBLK_LOAD;
-                        rA[ls] = *reinterpret_cast<const int32_t*>(A_cur[ls]);
+                        rA[ls] = *reinterpret_cast<const load_t*>(A_cur[ls]);
                     }
                     #pragma unroll
-                    for (unsigned ls = 0; ls < B_STEPS; ++ls) {
+                    for (int ls = 0; ls < B_STEPS; ++ls) {
                         B_cur[ls] += KBLK_LOAD;
-                        rB[ls] = *reinterpret_cast<const int32_t*>(B_cur[ls]);
+                        rB[ls] = *reinterpret_cast<const load_t*>(B_cur[ls]);
                     }
                     #pragma unroll
-                    for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                        *reinterpret_cast<int32_t*>(&A8i_lds[1][lds_off_A[ls]]) = rA[ls];
+                    for (int ls = 0; ls < A_STEPS; ++ls) {
+                        if constexpr (LOAD_BYTES == 16) {
+                            *reinterpret_cast<int64_t*>(&A8i_lds[1][lds_off_A[ls]])     = rA[ls].x;
+                            *reinterpret_cast<int64_t*>(&A8i_lds[1][lds_off_A[ls] + 8]) = rA[ls].y;
+                        } else {
+                            *reinterpret_cast<load_t*>(&A8i_lds[1][lds_off_A[ls]]) = rA[ls];
+                        }
+                    }
                     #pragma unroll
-                    for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                        *reinterpret_cast<int32_t*>(&B8i_lds[1][lds_off_B[ls]]) = rB[ls];
+                    for (int ls = 0; ls < B_STEPS; ++ls) {
+                        if constexpr (LOAD_BYTES == 16) {
+                            *reinterpret_cast<int64_t*>(&B8i_lds[1][lds_off_B[ls]])     = rB[ls].x;
+                            *reinterpret_cast<int64_t*>(&B8i_lds[1][lds_off_B[ls] + 8]) = rB[ls].y;
+                        } else {
+                            *reinterpret_cast<load_t*>(&B8i_lds[1][lds_off_B[ls]]) = rB[ls];
+                        }
+                    }
                 }
             }
 
@@ -536,41 +590,51 @@ oz2_fused_TN_kernel(
              * For PGR=2 (N_BUF=3): triple-buffer with 2 K-blocks of read-ahead,
              *   giving global reads two full MFMA cycles to complete.           */
             for (int k_off = 0;
-                 k_off + static_cast<int>(PGR * KBLK_LOAD) < k_int;
-                 k_off += static_cast<int>(KBLK_LOAD)) {
-                const int buf_store = (cur + static_cast<int>(PGR) >= static_cast<int>(N_BUF))
-                                    ? cur + static_cast<int>(PGR) - static_cast<int>(N_BUF)
-                                    : cur + static_cast<int>(PGR);
+                 k_off + PGR * KBLK_LOAD < k_int;
+                 k_off += KBLK_LOAD) {
+                const int buf_store = (cur + PGR >= N_BUF)
+                                    ? cur + PGR - N_BUF
+                                    : cur + PGR;
                 #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls) {
+                for (int ls = 0; ls < A_STEPS; ++ls) {
                     A_cur[ls] += KBLK_LOAD;
-                    rA[ls] = *reinterpret_cast<const int32_t*>(A_cur[ls]);
+                    rA[ls] = *reinterpret_cast<const load_t*>(A_cur[ls]);
                 }
                 #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls) {
+                for (int ls = 0; ls < B_STEPS; ++ls) {
                     B_cur[ls] += KBLK_LOAD;
-                    rB[ls] = *reinterpret_cast<const int32_t*>(B_cur[ls]);
+                    rB[ls] = *reinterpret_cast<const load_t*>(B_cur[ls]);
                 }
-                apply_mfma(&A8i_lds[cur][wm * static_cast<int>(WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * static_cast<int>(WaveN * TILE * KBLK_STRIDE)], C32);
+                apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)], C32);
                 #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    *reinterpret_cast<int32_t*>(
-                        &A8i_lds[buf_store][lds_off_A[ls]]) = rA[ls];
+                for (int ls = 0; ls < A_STEPS; ++ls) {
+                    if constexpr (LOAD_BYTES == 16) {
+                        *reinterpret_cast<int64_t*>(&A8i_lds[buf_store][lds_off_A[ls]])     = rA[ls].x;
+                        *reinterpret_cast<int64_t*>(&A8i_lds[buf_store][lds_off_A[ls] + 8]) = rA[ls].y;
+                    } else {
+                        *reinterpret_cast<load_t*>(&A8i_lds[buf_store][lds_off_A[ls]]) = rA[ls];
+                    }
+                }
                 #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    *reinterpret_cast<int32_t*>(
-                        &B8i_lds[buf_store][lds_off_B[ls]]) = rB[ls];
+                for (int ls = 0; ls < B_STEPS; ++ls) {
+                    if constexpr (LOAD_BYTES == 16) {
+                        *reinterpret_cast<int64_t*>(&B8i_lds[buf_store][lds_off_B[ls]])     = rB[ls].x;
+                        *reinterpret_cast<int64_t*>(&B8i_lds[buf_store][lds_off_B[ls] + 8]) = rB[ls].y;
+                    } else {
+                        *reinterpret_cast<load_t*>(&B8i_lds[buf_store][lds_off_B[ls]]) = rB[ls];
+                    }
+                }
                 __syncthreads();
-                cur = (cur + 1 >= static_cast<int>(N_BUF)) ? 0 : cur + 1;
+                cur = (cur + 1 >= N_BUF) ? 0 : cur + 1;
             }
             /* Drain remaining K-blocks (PGR=1: always 1, PGR=2: 1 or 2). */
-            apply_mfma(&A8i_lds[cur][wm * static_cast<int>(WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * static_cast<int>(WaveN * TILE * KBLK_STRIDE)], C32);
-            if constexpr (PGR >= 2u) {
+            apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)], C32);
+            if constexpr (PGR >= 2) {
                 /* Second drain only if K was large enough to fill LDS[1]. */
-                if (static_cast<int>(KBLK_LOAD) < k_int) {
+                if (KBLK_LOAD < k_int) {
                     __syncthreads();
-                    cur = (cur + 1 >= static_cast<int>(N_BUF)) ? 0 : cur + 1;
-                    apply_mfma(&A8i_lds[cur][wm * static_cast<int>(WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * static_cast<int>(WaveN * TILE * KBLK_STRIDE)], C32);
+                    cur = (cur + 1 >= N_BUF) ? 0 : cur + 1;
+                    apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)], C32);
                 }
             }
 
@@ -580,11 +644,11 @@ oz2_fused_TN_kernel(
              * KBLK_LOAD = K_UNROLL × KBLK bytes of latency per A and B.      */
             if (s + 1 < S) {
                 #pragma unroll
-                for (unsigned ls = 0; ls < A_STEPS; ++ls)
-                    rA[ls] = *reinterpret_cast<const int32_t*>(A8i + static_cast<size_t>(s + 1) * stride_A_s + hbm_off_A[ls]);
+                for (int ls = 0; ls < A_STEPS; ++ls)
+                    rA[ls] = *reinterpret_cast<const load_t*>(A8i + static_cast<size_t>(s + 1) * stride_A_s + hbm_off_A[ls]);
                 #pragma unroll
-                for (unsigned ls = 0; ls < B_STEPS; ++ls)
-                    rB[ls] = *reinterpret_cast<const int32_t*>(B8i + static_cast<size_t>(s + 1) * stride_B_s + hbm_off_B[ls]);
+                for (int ls = 0; ls < B_STEPS; ++ls)
+                    rB[ls] = *reinterpret_cast<const load_t*>(B8i + static_cast<size_t>(s + 1) * stride_B_s + hbm_off_B[ls]);
             }
         }
     };  /* end run_kloop */
@@ -593,7 +657,7 @@ oz2_fused_TN_kernel(
      * Sequential: K-loop then CRT for each modulus.  The compiler's instruction
      * scheduler naturally overlaps FP64 CRT ops with the MFMA pipeline drain
      * (confirmed by ISA analysis — see PLR investigation notes).     */
-    for (unsigned s = 0; s < S; ++s) {
+    for (int s = 0; s < S; ++s) {
         mfma_acc_t C32[N_TILES] = {};
         run_kloop(s, C32);
         do_crt(C32, s);
@@ -613,7 +677,7 @@ oz2_fused_TN_kernel(
      * of 16 lanes (different cols, same rows) hit different banks (no conflict).
      *
      * Falls back to scattered stores when LDS is too small (e.g., large TILE=32). */
-    static constexpr unsigned TILE_OUT_STRIDE = TILE + 1u;
+    static constexpr int TILE_OUT_STRIDE = TILE + 1;
     static constexpr size_t   TILE_OUT_BYTES  = static_cast<size_t>(WM * WN)
                                               * TILE * TILE_OUT_STRIDE * sizeof(double);
     static constexpr bool USE_COALESCED_OUT   = (TILE_OUT_BYTES
@@ -624,26 +688,26 @@ oz2_fused_TN_kernel(
         /* Reinterpret MFMA LDS (mfma_lds_flat, dead after S-loop) as output tile. */
         double* tile_out = reinterpret_cast<double*>(mfma_lds_flat);
 
-        for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
-            for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
-                const int m_wave_base   = m_base + static_cast<int>(wm_w * TILE);
-                const int n_wave_base   = n_base + static_cast<int>(wn_w * TILE);
-                const int mfma_col      = lane % static_cast<int>(TILE);
-                const int mfma_row_base = 4 * (lane / static_cast<int>(TILE));
-                const unsigned reg_off  = (wm_w * WaveN + wn_w) * NREG_single;
-                double* my_tile = tile_out + static_cast<unsigned>(wid) * TILE * TILE_OUT_STRIDE;
+        for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
+            for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
+                const int m_wave_base   = m_base + wm_w * TILE;
+                const int n_wave_base   = n_base + wn_w * TILE;
+                const int mfma_col      = lane % TILE;
+                const int mfma_row_base = 4 * (lane / TILE);
+                const int reg_off       = (wm_w * WaveN + wn_w) * NREG_single;
+                double* my_tile = tile_out + wid * TILE * TILE_OUT_STRIDE;
 
                 /* Phase 1: compute d_val in MFMA register order → LDS column-major.
                  * Each lane stores its NREG_single elements to
                  * my_tile[mfma_col * TILE_OUT_STRIDE + tile_row].                  */
-                for (unsigned e = 0; e < NREG_single; ++e) {
-                    const int tile_row = mfma_row_base + static_cast<int>(8u * (e / 4u) + (e % 4u));
+                for (int e = 0; e < NREG_single; ++e) {
+                    const int tile_row = mfma_row_base + 8 * (e / 4) + (e % 4);
                     const int gi = m_wave_base + tile_row;
                     const int gj = n_wave_base + mfma_col;
                     double Zhi, Zlo;
                     if constexpr (USE_LDS_ACCUM) {
-                        Zhi = Zhi_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
-                        Zlo = Zlo_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
+                        Zhi = Zhi_lds[(reg_off + e) * BLK_THR + tid];
+                        Zlo = Zlo_lds[(reg_off + e) * BLK_THR + tid];
                     } else {
                         Zhi = Zhi_reg[reg_off + e];
                         Zlo = Zlo_reg[reg_off + e];
@@ -654,8 +718,8 @@ oz2_fused_TN_kernel(
                     const int inv_sft = (gi < static_cast<int>(m) && gj < static_cast<int>(n))
                                       ? -(static_cast<int>(sftA[gi]) + static_cast<int>(sftB[gj]))
                                       : 0;
-                    my_tile[static_cast<unsigned>(mfma_col) * TILE_OUT_STRIDE
-                          + static_cast<unsigned>(tile_row)] = alpha * ldexp(X, inv_sft);
+                    my_tile[mfma_col * TILE_OUT_STRIDE + tile_row]
+                        = alpha * ldexp(X, inv_sft);
                 }
                 /* No __syncthreads() needed: each wave reads only its own LDS partition. */
 
@@ -664,15 +728,14 @@ oz2_fused_TN_kernel(
                  * Pass j: thread t handles linear element j*64 + lane.
                  * row = lin % TILE, col = lin / TILE.
                  * Threads 0..15 → rows 0..15 of the same column → coalesced!     */
-                for (unsigned j = 0; j < NREG_single; ++j) {
-                    const unsigned lin = j * 64u + static_cast<unsigned>(lane);
-                    const int r = static_cast<int>(lin % TILE);
-                    const int c = static_cast<int>(lin / TILE);
+                for (int j = 0; j < NREG_single; ++j) {
+                    const int lin = j * 64 + lane;
+                    const int r = lin % TILE;
+                    const int c = lin / TILE;
                     const int gi = m_wave_base + r;
                     const int gj = n_wave_base + c;
                     if (gi < static_cast<int>(m) && gj < static_cast<int>(n)) {
-                        double val = my_tile[static_cast<unsigned>(c) * TILE_OUT_STRIDE
-                                           + static_cast<unsigned>(r)];
+                        double val = my_tile[c * TILE_OUT_STRIDE + r];
                         if (beta != 0.0) {
                             val += beta * C[static_cast<size_t>(gi) + static_cast<size_t>(gj) * ldc];
                         }
@@ -684,21 +747,21 @@ oz2_fused_TN_kernel(
         }
     } else {
         /* Fallback: scattered stores (original path, used when LDS is too small). */
-        for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
-            for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
-                const int m_wave_base   = m_base + static_cast<int>(wm_w * TILE);
-                const int n_wave_base   = n_base + static_cast<int>(wn_w * TILE);
-                const int col_val       = n_wave_base + (lane % static_cast<int>(TILE));
-                const int lane_row_base = m_wave_base + 4 * (lane / static_cast<int>(TILE));
-                const unsigned reg_off  = (wm_w * WaveN + wn_w) * NREG_single;
-                for (unsigned e = 0; e < NREG_single; ++e) {
-                    const int ri = lane_row_base + static_cast<int>(8u * (e / 4u) + (e % 4u));
+        for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
+            for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
+                const int m_wave_base   = m_base + wm_w * TILE;
+                const int n_wave_base   = n_base + wn_w * TILE;
+                const int col_val       = n_wave_base + (lane % TILE);
+                const int lane_row_base = m_wave_base + 4 * (lane / TILE);
+                const int reg_off       = (wm_w * WaveN + wn_w) * NREG_single;
+                for (int e = 0; e < NREG_single; ++e) {
+                    const int ri = lane_row_base + 8 * (e / 4) + (e % 4);
                     const int ci = col_val;
                     if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
                     double Zhi, Zlo;
                     if constexpr (USE_LDS_ACCUM) {
-                        Zhi = Zhi_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
-                        Zlo = Zlo_lds[(reg_off + e) * BLK_THR + static_cast<unsigned>(tid)];
+                        Zhi = Zhi_lds[(reg_off + e) * BLK_THR + tid];
+                        Zlo = Zlo_lds[(reg_off + e) * BLK_THR + tid];
                     } else {
                         Zhi = Zhi_reg[reg_off + e];
                         Zlo = Zlo_reg[reg_off + e];
@@ -820,14 +883,15 @@ rocblaslt_status oz2_launch_fused_TN(
      * Macrotile M dimension = wm_v * wm_wave_v * tile_v (similarly for N).
      * Thread block size = wm_v * wn_v * 64 (WaveM/WaveN don't add threads).
      * With XCC mapping, total_blocks = m_tiles_per_xcc × n_tiles × num_xccs. */
-    auto make_grid = [&](unsigned wm_v, unsigned wn_v, unsigned tile_v,
-                         unsigned wm_wave_v = 1u, unsigned wn_wave_v = 1u) -> dim3 {
+    auto make_grid = [&](int wm_v, int wn_v, int tile_v,
+                         int wm_wave_v = 1, int wn_wave_v = 1) -> dim3 {
         const int mt = static_cast<int>(
             (m + wm_v * wm_wave_v * tile_v - 1) / (wm_v * wm_wave_v * tile_v));
         const int nt = static_cast<int>(
             (n + wn_v * wn_wave_v * tile_v - 1) / (wn_v * wn_wave_v * tile_v));
         /* Match the kernel's swizzle dimension: M for tall/square, N for wide.
-         * This ensures no excess idle blocks are launched.                      */
+         * Uses raw matrix dimensions (not tile counts) because L2 reuse depends
+         * on which matrix operand is smaller, not the macrotile shape.          */
         int total_blocks;
         if (n <= m) {
             const int m_per_xcc = (mt + num_xccs - 1) / num_xccs;
@@ -847,7 +911,7 @@ rocblaslt_status oz2_launch_fused_TN(
 #define OZ2_FUSED_LAUNCH(S_V, HL, WM_V, WN_V, TILE_V, WM_WAVE_V, WN_WAVE_V, KU_V, FVA_V, PGR_V) \
     hipLaunchKernelGGL((oz2_fused_TN_kernel<(S_V),(HL),(WM_V),(WN_V),(TILE_V),(WM_WAVE_V),(WN_WAVE_V),(KU_V),(FVA_V),(PGR_V)>), \
                        make_grid((WM_V),(WN_V),(TILE_V),(WM_WAVE_V),(WN_WAVE_V)), \
-                       dim3((WM_V)*(WN_V)*64u), 0, stream, \
+                       dim3((WM_V)*(WN_V)*64), 0, stream, \
                        A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i, \
                        C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, \
                        num_xccs)
@@ -867,7 +931,7 @@ rocblaslt_status oz2_launch_fused_TN(
  * KU=0 → auto-select K_UNROLL from LDS budget.
  * KU=2 or KU=4 → explicit K_UNROLL override (useful for MI350X tuning).       */
 
-/* Helper: dispatch one config.  FVA_V is a literal 0u or 1u (converted to
+/* Helper: dispatch one config.  FVA_V is a literal 0 or 1 (converted to
  * false/true for the bool FORCE_VGPR_ACCUM template parameter).
  * The dispatch table encodes _fva==0 / _fva==1 in the condition, so each call
  * site always passes a compile-time constant — no runtime branch needed here.  */
@@ -881,9 +945,9 @@ rocblaslt_status oz2_launch_fused_TN(
     do { \
         const char* _ov = std::getenv("OZ2_FUSED_SHAPE_OVERRIDE"); \
         if (_ov) { \
-            unsigned _wm=0,_wn=0,_wm_w=0,_wn_w=0,_t=0,_ku=0,_fva=0,_pgr=1; \
-            { std::sscanf(_ov,"%u %u %u %u %u %u %u %u",&_wm,&_wn,&_wm_w,&_wn_w,&_t,&_ku,&_fva,&_pgr); } \
-            if (_wm && _wn && (_t==16u||_t==32u)) { \
+            int _wm=0,_wn=0,_wm_w=0,_wn_w=0,_t=0,_ku=0,_fva=0,_pgr=1; \
+            { std::sscanf(_ov,"%d %d %d %d %d %d %d %d",&_wm,&_wn,&_wm_w,&_wn_w,&_t,&_ku,&_fva,&_pgr); } \
+            if (_wm && _wn && (_t==16||_t==32)) { \
                 /* OZ2_DISPATCH_SHAPE_OVERRIDE always dispatches oz2_fused_TN_kernel<16,...>. \
                  * The caller MUST fix num_moduli=16 via the emulation handle so that the \
                  * library prepares exactly 16 INT8 data sets to match the kernel's S=16 loop. \
@@ -897,152 +961,152 @@ rocblaslt_status oz2_launch_fused_TN(
                         num_moduli); \
                     std::abort(); \
                 } \
-                if      (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,4u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,4u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,4u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,4u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,4u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,4u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,4u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,4u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,4u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,4u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,4u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,4u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,4u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,4u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,4u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,4u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,4u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,4u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,4u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,4u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,4u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,2u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,2u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,2u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,2u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,2u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,2u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,2u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,2u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,2u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,2u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,2u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,2u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,2u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,2u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,2u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,2u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,2u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,2u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,2u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,2u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,2u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,2u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,2u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,2u,1u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,2u,2u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,4u,4u,1u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,4u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,4u,1u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,4u,2u,1u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,2u,4u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,4u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,2u,1u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,2u,1u,1u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,2u,1u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,1u,2u,1u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,1u,16u,2u,1u,1u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,2u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2u,1u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1u,2u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,1u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,1u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,4u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,1u,0u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,1u,1u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,16u,2u,1u,1u,1u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,16u,1u,2u,1u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,1u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,1u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,1u,1u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,32u,1u,1u,1u,1u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,1u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,1u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,32u,1u,1u,1u,1u,1u); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,2u,16u,1u,1u,1u,1u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,16u,1u,1u,1u,1u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,1u,16u,1u,1u,1u,1u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1u,4u,16u,1u,1u,1u,1u,1u); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,1u,32u,1u,1u,1u,1u,1u); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1u,4u,32u,1u,1u,1u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,4u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,2u,4u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,1u,4u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,4u,1u,2u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,4u,2u,1u,1u); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4u,4u,16u,1u,1u,2u,1u,1u); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2u,4u,32u,1u,1u,4u,1u,1u); \
+                if      (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,2,32,1,1,4,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,4,32,1,1,4,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,2,16,1,1,4,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,2,4,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,2,16,2,1,4,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,2,4,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,32,1,1,4,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,1,4,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,2,4,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,2,16,1,1,4,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,1,4,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,1,4,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,1,4,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,4,16,2,1,4,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,2,4,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,2,16,2,2,4,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,4,16,4,1,4,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,4,4,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,2,16,4,2,4,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,1,16,2,4,4,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,4,4,4,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,1,4,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,2,4,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,2,16,2,1,4,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,2,4,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,1,4,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,1,4,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,1,4,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,4,16,1,1,4,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,2,32,1,1,4,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,1,32,1,1,4,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,2,32,1,1,4,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,1,32,1,1,4,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,4,32,1,1,4,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,1,2,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,4,1,2,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,4,2,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,2,2,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,1,2,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,4,16,2,1,2,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,2,2,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,2,16,2,2,2,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,4,16,4,1,2,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,4,2,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,2,16,4,2,2,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,1,16,2,4,2,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,4,4,2,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,2,2,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,2,16,2,1,2,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,2,2,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,2,32,1,1,2,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,4,32,1,1,2,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,2,16,1,1,2,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,2,2,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,2,16,2,1,2,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,2,2,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,32,1,1,2,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,1,2,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,2,2,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,2,16,1,1,2,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,1,2,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,1,2,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,1,2,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,1,2,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,1,2,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,4,16,1,1,2,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,2,32,1,1,2,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,1,32,1,1,2,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,2,32,1,1,2,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,1,32,1,1,2,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,4,32,1,1,2,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,4,16,2,1,1,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,2,1,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,2,16,2,2,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,2,1,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,4,4,1,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,4,16,4,1,1,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,4,1,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,2,16,4,2,1,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,1,16,2,4,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,4,16,4,2,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,4,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,4,16,4,4,1,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,2,16,1,1,1,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,2,1,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,2,16,2,1,1,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,2,1,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,32,1,1,1,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,1,1,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,2,1,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,2,16,1,1,1,false,1); \
+                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,1,1,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,1,1,false,1); \
+                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,2,32,1,1,1,false,1); \
+                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,1,32,1,1,1,false,1); \
+                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,2,32,1,1,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,2,1,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,2,16,2,1,1,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,2,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,1,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,1,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,4,1,1,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,2,32,1,1,1,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2,4,32,1,1,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,4,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,32,1,1,1,false,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,1,1,false,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,1,1,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,1,1,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1,4,16,1,1,1,false,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,1,32,1,1,1,false,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1,4,32,1,1,1,false,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,2,1,true,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,2,16,2,1,1,true,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2,4,16,1,2,1,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,1,1,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,2,1,1,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,4,1,1,true,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,2,32,1,1,1,true,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2,4,32,1,1,1,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,4,1,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,32,1,1,1,true,1); \
+                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,2,16,1,1,1,true,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2,4,16,1,1,1,true,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,1,16,1,1,1,true,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1,4,16,1,1,1,true,1); \
+                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,1,32,1,1,1,true,1); \
+                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1,4,32,1,1,1,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,1,4,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,2,4,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,2,1,4,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,4,2,1,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,2,2,2,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,4,1,2,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,4,2,true,1); \
+                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,1,2,true,1); \
+                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2,4,32,1,1,4,true,1); \
                 /* ── PGR=2 (triple-buffered K-loop) — benefits larger K ──── */ \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,4u,2u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,0u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,0u,2u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,2,2,2,false,2); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,4,2,1,false,2); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,4,4,1,false,2); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,2,2,1,false,2); \
                 /* ── FVA=1 + PGR=2 (gfx950 only) ──────────────────────── */ \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,1u,2u); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,1u,2u); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,2,2,1,true,2); \
+                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,4,4,1,true,2); \
+                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,2,2,2,true,2); \
                 else { return rocblaslt_status_invalid_value; } \
                 return rocblaslt_status_success; \
             } \
@@ -1081,18 +1145,18 @@ rocblaslt_status oz2_launch_fused_TN(
              *   128×128 KU=1: 11100-42091 GFLOP/s for K < 2048           \
              *     (beats KU=2 at K≤1024: 42091 vs 36897)                  */ \
             if (m >= 8192 && n >= 8192 && k >= 8192) { \
-                _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,1u);  /* 256×256, KU=1 */ \
+                _OV_DISPATCH((S_V),4,4,16,4,4,1,false,1);  /* 256×256, KU=1 */ \
             } else if (k >= 2048) { \
-                _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,1u);  /* 128×128, KU=2 */ \
+                _OV_DISPATCH((S_V),4,4,16,2,2,2,false,1);  /* 128×128, KU=2 */ \
             } else { \
-                _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,false,1u);  /* 128×128, KU=1 */ \
+                _OV_DISPATCH((S_V),4,4,16,2,2,1,false,1);  /* 128×128, KU=1 */ \
             } \
         } else { \
             /* ── gfx942 (MI300X) tile selection ────────────────────────── */ \
             if (m >= 8192 && n >= 8192 && k >= 8192) { \
-                _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,1u);  /* 256×256, KU=1 (37237 GFLOP/s vs PGR2 36572) */ \
+                _OV_DISPATCH((S_V),4,4,16,4,4,1,false,1);  /* 256×256, KU=1 (37237 GFLOP/s vs PGR2 36572) */ \
             } else { \
-                _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,1u);  /* 128×128, KU=2 */ \
+                _OV_DISPATCH((S_V),4,4,16,2,2,2,false,1);  /* 128×128, KU=2 */ \
             } \
         } \
     } while(0)
