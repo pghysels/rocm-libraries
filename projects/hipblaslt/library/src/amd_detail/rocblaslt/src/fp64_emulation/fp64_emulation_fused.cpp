@@ -28,85 +28,85 @@
 
 
 /* =========================================================================
- * Per-architecture MFMA K-block sizes.
- * TILE=16: K_BLOCK = 32 (gfx94x) or 64 (gfx95x)
- * TILE=32: K_BLOCK = 16 (gfx94x) or 32 (gfx95x)
+ * TILE-templated MFMA traits
+ *
+ * Collects all per-TILE, per-architecture MFMA constants in one place:
+ *   kblk  – K-block size consumed per MFMA instruction
+ *   src_t – MFMA source operand type (ext_vector_type(2) on gfx95x, int64_t on gfx94x)
+ *   acc_t – MFMA accumulator output type (ext_vector_type(4) or (16))
+ *
+ * Unified oz2_load_mfma_src<TILE> / oz2_do_mfma<TILE> below use these traits
+ * so that apply_mfma can be written once without if constexpr on TILE.
+ * All resolved at compile time — zero runtime overhead.
  * ========================================================================= */
+template <unsigned TILE> struct oz2_mfma_traits;
+template<> struct oz2_mfma_traits<16u> {
 #if defined(__gfx950__)
-static constexpr unsigned OZ2_KBLK_16 = 64u;
-static constexpr unsigned OZ2_KBLK_32 = 32u;
+    static constexpr unsigned kblk = 64u;
+    typedef long src_t __attribute__((ext_vector_type(2)));
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
       || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-static constexpr unsigned OZ2_KBLK_16 = 32u;
-static constexpr unsigned OZ2_KBLK_32 = 16u;
+    static constexpr unsigned kblk = 32u;
+    using src_t = int64_t;
 #else
 #  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
-
-/* =========================================================================
- * MFMA vector output types and instruction wrappers
- * ========================================================================= */
-
-typedef int v4i32  __attribute__((ext_vector_type(4)));
-typedef int v16i32 __attribute__((ext_vector_type(16)));
-
-/* TILE=16 MFMA source type and instruction wrapper */
+    typedef int acc_t __attribute__((ext_vector_type(4)));
+};
+template<> struct oz2_mfma_traits<32u> {
 #if defined(__gfx950__)
-typedef long oz2_mfma_src16_t __attribute__((ext_vector_type(2)));
-__device__ __forceinline__ v4i32
-oz2_do_mfma_16(oz2_mfma_src16_t a, oz2_mfma_src16_t b, v4i32 c) noexcept
-{ return __builtin_amdgcn_mfma_i32_16x16x64_i8(a, b, c, 0, 0, 0); }
+    static constexpr unsigned kblk = 32u;
+    typedef long src_t __attribute__((ext_vector_type(2)));
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
       || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-typedef int64_t oz2_mfma_src16_t;
-__device__ __forceinline__ v4i32
-oz2_do_mfma_16(int64_t a, int64_t b, v4i32 c) noexcept
-{ return __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, c, 0, 0, 0); }
+    static constexpr unsigned kblk = 16u;
+    using src_t = int64_t;
 #else
 #  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
-
-/* TILE=32 MFMA source type and instruction wrapper.
- * oz2_mfma_src32_t == oz2_mfma_src16_t on all supported architectures. */
-typedef oz2_mfma_src16_t oz2_mfma_src32_t;
-#if defined(__gfx950__)
-__device__ __forceinline__ v16i32
-oz2_do_mfma_32(oz2_mfma_src32_t a, oz2_mfma_src32_t b, v16i32 c) noexcept
-{ return __builtin_amdgcn_mfma_i32_32x32x32_i8(a, b, c, 0, 0, 0); }
-#elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
-      || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-__device__ __forceinline__ v16i32
-oz2_do_mfma_32(oz2_mfma_src32_t a, oz2_mfma_src32_t b, v16i32 c) noexcept
-{ return __builtin_amdgcn_mfma_i32_32x32x16_i8(a, b, c, 0, 0, 0); }
-#else
-#  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
-#endif
+    typedef int acc_t __attribute__((ext_vector_type(16)));
+};
 
 /* ── Architecture-specific MFMA source load helper ─────────────────────────
  * On gfx95x (K_A_BYTES=16): two 8-byte loads give 2-way LDS bank conflicts
  * instead of 4-way from a single 16-byte load.
- * On gfx94x (K_A_BYTES=8): single 8-byte load is always conflict-free.       */
+ * On gfx94x (K_A_BYTES=8): single 8-byte load is always conflict-free.
+ * src16 == src32 on all architectures, so one template covers both tiles.   */
+template <unsigned TILE>
+__device__ __forceinline__ typename oz2_mfma_traits<TILE>::src_t
+oz2_load_mfma_src(const int8_t* __restrict__ ptr) noexcept {
 #if defined(__gfx950__)
-__device__ __forceinline__ oz2_mfma_src16_t
-oz2_load_mfma_src16(const int8_t* __restrict__ ptr) noexcept {
-    oz2_mfma_src16_t v;
+    typename oz2_mfma_traits<TILE>::src_t v;
     v[0] = *reinterpret_cast<const long*>(ptr);
     v[1] = *reinterpret_cast<const long*>(ptr + 8);
     return v;
-}
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
       || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-__device__ __forceinline__ oz2_mfma_src16_t
-oz2_load_mfma_src16(const int8_t* __restrict__ ptr) noexcept {
-    return *reinterpret_cast<const oz2_mfma_src16_t*>(ptr);
-}
+    return *reinterpret_cast<const typename oz2_mfma_traits<TILE>::src_t*>(ptr);
 #else
 #  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
-/* Same helper for TILE=32 source (oz2_mfma_src32_t == oz2_mfma_src16_t). */
-__device__ __forceinline__ oz2_mfma_src32_t
-oz2_load_mfma_src32(const int8_t* __restrict__ ptr) noexcept {
-    return oz2_load_mfma_src16(ptr);
+}
+
+/* ── Architecture-specific MFMA instruction wrapper ────────────────────────
+ * Dispatches to the correct v_mfma_i32 builtin based on TILE and arch.
+ * TILE=16: 16x16x32 (gfx94x) / 16x16x64 (gfx95x)
+ * TILE=32: 32x32x16 (gfx94x) / 32x32x32 (gfx95x)                         */
+template <unsigned TILE>
+__device__ __forceinline__ typename oz2_mfma_traits<TILE>::acc_t
+oz2_do_mfma(typename oz2_mfma_traits<TILE>::src_t a,
+            typename oz2_mfma_traits<TILE>::src_t b,
+            typename oz2_mfma_traits<TILE>::acc_t c) noexcept {
+#if defined(__gfx950__)
+    if constexpr (TILE == 16u) return __builtin_amdgcn_mfma_i32_16x16x64_i8(a, b, c, 0, 0, 0);
+    else                       return __builtin_amdgcn_mfma_i32_32x32x32_i8(a, b, c, 0, 0, 0);
+#elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
+      || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
+    if constexpr (TILE == 16u) return __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, c, 0, 0, 0);
+    else                       return __builtin_amdgcn_mfma_i32_32x32x16_i8(a, b, c, 0, 0, 0);
+#else
+#  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
+#endif
 }
 
 /* =========================================================================
@@ -169,9 +169,10 @@ oz2_fused_TN_kernel(
     int            num_xccs)            /* number of XCCs on this device */
 {
     /* ── Derived compile-time constants ────────────────────────────────────── */
+    using mfma_acc_t = typename oz2_mfma_traits<TILE>::acc_t;           /* v4i32 (TILE=16) or v16i32 (TILE=32)  */
     static constexpr unsigned NREG_single = TILE * TILE / 64u;          /* accumulators per thread per MFMA tile */
     static constexpr unsigned NREG        = WaveM * WaveN * NREG_single; /* total accumulators per thread         */
-    static constexpr unsigned KBLK        = (TILE == 16u) ? OZ2_KBLK_16 : OZ2_KBLK_32;
+    static constexpr unsigned KBLK        = oz2_mfma_traits<TILE>::kblk;
     /* K-loop unroll factor:
      *   gfx94x (MI300): K_UNROLL=4 — measured scratch=108B ✓
      *   gfx95x (MI350): K_UNROLL=2 — KBLK is doubled vs gfx94x; K_UNROLL=4
@@ -374,61 +375,112 @@ oz2_fused_TN_kernel(
      * C32[i*NREG_single .. (i+1)*NREG_single-1].
      * With WaveM=WaveN=1 the loop bodies execute once, identical to the
      * single-tile case.                                                        */
+    static constexpr unsigned N_TILES = WaveM * WaveN;
     auto apply_mfma = [&](const int8_t* A_wm_base, const int8_t* B_wn_base,
-                          int32_t (&C32)[NREG]) __attribute__((always_inline)) {
+                          mfma_acc_t (&C32)[N_TILES]) __attribute__((always_inline)) {
+        using src_t = typename oz2_mfma_traits<TILE>::src_t;
         const int m_col   = lane % static_cast<int>(TILE);
         const int k_base  = static_cast<int>(K_A_BYTES) * (lane / static_cast<int>(TILE));
-        /* base_off: byte offset to this lane's K-slice within any LDS row.
-         * m_col * KBLK_STRIDE selects the row; k_base selects the lane's
-         * starting K-byte within that row.  Hoisted outside the ku loop so
-         * the compiler can fold ku*KBLK as a compile-time constant into the
-         * LDS instruction's 16-bit offset field.                              */
         const int base_off = m_col * static_cast<int>(KBLK_STRIDE) + k_base;
-        /* Stride (in bytes) between consecutive M-rows of the LDS A tile. */
         static constexpr int A_ROW_STRIDE = static_cast<int>(TILE * KBLK_STRIDE);
         static constexpr int B_ROW_STRIDE = static_cast<int>(TILE * KBLK_STRIDE);
+
+        /* KU loop is outermost → each sa/sb LDS load is reused across all
+         * WaveN (for sa) or WaveM (for sb) tiles.  LDS reads reduced from
+         * WaveM×WaveN×KU×2 to (WaveM+WaveN)×KU.  Accumulators live directly
+         * in C32[] — no intermediate vx[] copy needed.
+         *
+         * The smaller of WaveM/WaveN is pre-loaded into an array to minimize
+         * VGPR usage (min(WaveM,WaveN) src_t registers).  Total LDS loads
+         * are (WaveM+WaveN)×KU regardless of ordering — reuse is symmetric. */
         #pragma unroll
-        for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
-            const int8_t* A_wm_slot = A_wm_base + wm_w * A_ROW_STRIDE;
-            #pragma unroll
-            for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
-                const int8_t* B_wn_slot = B_wn_base + wn_w * B_ROW_STRIDE;
-                const unsigned reg_off = (wm_w * WaveN + wn_w) * NREG_single;
-                if constexpr (TILE == 16u) {
-                    v4i32 vx;
-                    for (unsigned e = 0; e < NREG_single; ++e) vx[static_cast<int>(e)] = C32[reg_off + e];
+        for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
+            const int off = base_off + static_cast<int>(ku * KBLK);
+
+            if constexpr (WaveM >= WaveN) {
+                /* Pre-load B[WaveN] (the smaller-or-equal dimension).
+                 * Each sb element is reused WaveM times across the wm_w loop;
+                 * each sa scalar is reused WaveN times in the inner wn_w loop. */
+                src_t sb[WaveN];
+                #pragma unroll
+                for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w)
+                    sb[wn_w] = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
+                #pragma unroll
+                for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w) {
+                    const src_t sa = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
                     #pragma unroll
-                    for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-                        /* ku*KBLK is a compile-time constant after unroll; adding
-                         * it to base_off lets the compiler fold the result into
-                         * the LDS DS instruction's constant offset field.       */
-                        const int off = base_off + static_cast<int>(ku * KBLK);
-                        const auto sa = oz2_load_mfma_src16(A_wm_slot + off);
-                        const auto sb = oz2_load_mfma_src16(B_wn_slot + off);
-                        vx = oz2_do_mfma_16(sa, sb, vx);
-                    }
-                    for (unsigned e = 0; e < NREG_single; ++e) C32[reg_off + e] = vx[static_cast<int>(e)];
-                } else {
-                    v16i32 vx;
-                    for (unsigned e = 0; e < NREG_single; ++e) vx[static_cast<int>(e)] = C32[reg_off + e];
+                    for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w)
+                        C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa, sb[wn_w],
+                                                                       C32[wm_w * WaveN + wn_w]);
+                }
+            } else {
+                /* Pre-load A[WaveM] (the smaller dimension, since WaveN > WaveM).
+                 * Each sa element is reused WaveN times across the wn_w loop;
+                 * each sb scalar is reused WaveM times in the inner wm_w loop. */
+                src_t sa[WaveM];
+                #pragma unroll
+                for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w)
+                    sa[wm_w] = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
+                #pragma unroll
+                for (unsigned wn_w = 0; wn_w < WaveN; ++wn_w) {
+                    const src_t sb = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
                     #pragma unroll
-                    for (unsigned ku = 0; ku < K_UNROLL; ++ku) {
-                        const int off = base_off + static_cast<int>(ku * KBLK);
-                        const auto sa = oz2_load_mfma_src32(A_wm_slot + off);
-                        const auto sb = oz2_load_mfma_src32(B_wn_slot + off);
-                        vx = oz2_do_mfma_32(sa, sb, vx);
-                    }
-                    for (unsigned e = 0; e < NREG_single; ++e) C32[reg_off + e] = vx[static_cast<int>(e)];
+                    for (unsigned wm_w = 0; wm_w < WaveM; ++wm_w)
+                        C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa[wm_w], sb,
+                                                                       C32[wm_w * WaveN + wn_w]);
                 }
             }
         }
     };
 
-    /* ── Main loop: one modulus per iteration ───────────────────────────────── */
-    for (unsigned s = 0; s < S; ++s) {
+    /* ── CRT update helper ─────────────────────────────────────────────────────
+     * Factored out so both the sequential and pipelined S-loops can reuse it.
+     * Performs the TwoSum CRT accumulation for one modulus, given the MFMA
+     * results in C32[] and the per-modulus CRT coefficients.                   */
+    auto do_crt = [&](mfma_acc_t (&C32)[N_TILES], unsigned s_idx)
+                  __attribute__((always_inline)) {
+        const double nm  = oz2_neg_mod(s_idx), im = oz2_inv_mod(s_idx);
+        const double qhi = oz2_qpi_hi(S - 2, s_idx);
+        const double qlo = HAS_LO ? oz2_qpi_lo(S - 2, s_idx) : 0.0;
+        if constexpr (!USE_LDS_ACCUM) {
+            for (unsigned r = 0; r < NREG; ++r) {
+                const double dc_raw = static_cast<double>(
+                    C32[r / NREG_single][static_cast<int>(r % NREG_single)]);
+                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
+                const double hi     = dc * qhi;
+                const double new_hi = Zhi_reg[r] + hi;
+                const double err    = hi - (new_hi - Zhi_reg[r]);
+                Zhi_reg[r] = new_hi;
+                if constexpr (HAS_LO) Zlo_reg[r] = fma(dc, qlo, Zlo_reg[r] + err);
+                else                  Zlo_reg[r] += err;
+            }
+        } else {
+            for (unsigned r = 0; r < NREG; ++r) {
+                const unsigned idx = r * BLK_THR + static_cast<unsigned>(tid);
+                double Zhi = Zhi_lds[idx];
+                double Zlo = Zlo_lds[idx];
+                const double dc_raw = static_cast<double>(
+                    C32[r / NREG_single][static_cast<int>(r % NREG_single)]);
+                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
+                const double hi     = dc * qhi;
+                const double new_hi = Zhi + hi;
+                const double err    = hi - (new_hi - Zhi);
+                Zhi = new_hi;
+                if constexpr (HAS_LO) Zlo = fma(dc, qlo, Zlo + err);
+                else                  Zlo += err;
+                Zhi_lds[idx] = Zhi;
+                Zlo_lds[idx] = Zlo;
+            }
+        }
+    };
+
+    /* ── K-loop body helper ────────────────────────────────────────────────────
+     * Runs the K-loop (LDS fill, global prefetch, MFMA, drain) for one modulus.
+     * Used by both sequential and pipelined S-loops.                           */
+    auto run_kloop = [&](unsigned s, mfma_acc_t (&C32)[N_TILES])
+                     __attribute__((always_inline)) {
         const int8_t* A8i_s = A8i + static_cast<size_t>(s) * stride_A_s;
         const int8_t* B8i_s = B8i + static_cast<size_t>(s) * stride_B_s;
-        int32_t C32[NREG] = {};
 
         if (k_int > 0) {
             __syncthreads();
@@ -535,56 +587,16 @@ oz2_fused_TN_kernel(
                     rB[ls] = *reinterpret_cast<const int32_t*>(B8i + static_cast<size_t>(s + 1) * stride_B_s + hbm_off_B[ls]);
             }
         }
+    };  /* end run_kloop */
 
-        /* ── CRT update ─────────────────────────────────────────────────────────
-         * Flat loop over all NREG accumulators (no forced unroll — compiler
-         * decides based on VGPR pressure).  Two variants:
-         *   !USE_LDS_ACCUM: operates directly on Zhi_reg[r] / Zlo_reg[r].
-         *   USE_LDS_ACCUM:  loads scalar from Zhi_lds → TwoSum → stores back.
-         * No inter-thread barrier needed (each thread owns its own column).  */
-        /* Per-s CRT coefficients — hoisted ONCE per modulus (they depend only on
-         * s, not on the tile/element), so they're computed a single time instead
-         * of WaveM×WaveN times.  Kept below the K-loop so they stay dead during
-         * MFMA and add no VGPR pressure to the register-critical inner K-loop.  */
-        const double nm  = oz2_neg_mod(s), im = oz2_inv_mod(s);
-        const double qhi = oz2_qpi_hi(S - 2, s);
-        const double qlo = HAS_LO ? oz2_qpi_lo(S - 2, s) : 0.0;
-
-        if constexpr (!USE_LDS_ACCUM) {
-            /* VGPR-accum path: flat loop over all NREG accumulators.
-             * No forced unroll — let the compiler decide based on VGPR
-             * pressure (NREG is compile-time known).                            */
-            for (unsigned r = 0; r < NREG; ++r) {
-                const double dc_raw = static_cast<double>(C32[r]);
-                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-                const double hi     = dc * qhi;
-                const double new_hi = Zhi_reg[r] + hi;
-                const double err    = hi - (new_hi - Zhi_reg[r]);
-                Zhi_reg[r] = new_hi;
-                if constexpr (HAS_LO) Zlo_reg[r] = fma(dc, qlo, Zlo_reg[r] + err);
-                else                  Zlo_reg[r] += err;
-            }
-        } else {
-            /* LDS-accum path: flat loop over all NREG accumulators, one at a
-             * time via scalar LDS load → CRT TwoSum → LDS store.  No
-             * #pragma unroll — let the compiler decide based on VGPR pressure
-             * (NREG is compile-time known, so it can fully unroll when safe). */
-            for (unsigned r = 0; r < NREG; ++r) {
-                const unsigned idx = r * BLK_THR + static_cast<unsigned>(tid);
-                double Zhi = Zhi_lds[idx];
-                double Zlo = Zlo_lds[idx];
-                const double dc_raw = static_cast<double>(C32[r]);
-                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-                const double hi     = dc * qhi;
-                const double new_hi = Zhi + hi;
-                const double err    = hi - (new_hi - Zhi);
-                Zhi = new_hi;
-                if constexpr (HAS_LO) Zlo = fma(dc, qlo, Zlo + err);
-                else                  Zlo += err;
-                Zhi_lds[idx] = Zhi;
-                Zlo_lds[idx] = Zlo;
-            }
-        }  /* end CRT update */
+    /* ── S-loop: iterate over moduli ───────────────────────────────────────────
+     * Sequential: K-loop then CRT for each modulus.  The compiler's instruction
+     * scheduler naturally overlaps FP64 CRT ops with the MFMA pipeline drain
+     * (confirmed by ISA analysis — see PLR investigation notes).     */
+    for (unsigned s = 0; s < S; ++s) {
+        mfma_acc_t C32[N_TILES] = {};
+        run_kloop(s, C32);
+        do_crt(C32, s);
     }
 
     /* ── Finalize: CRT range-reduction + inverse scale + write D ─────────────
@@ -1061,16 +1073,24 @@ rocblaslt_status oz2_launch_fused_TN(
          *   elongated 256×128 branch is gfx942-only (unmeasured on gfx950).      \
          * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256.        */ \
         if (is_gfx950) { \
-            /* ── gfx950 (MI355X) tile selection ────────────────────────── */ \
+            /* ── gfx950 (MI350X) tile selection ────────────────────────── \
+             * Tuned on MI350X (Aug 2, 2026 run, 32768² shapes, S=16):     \
+             *   256×256 KU=1: 86412 GFLOP/s for M,N,K ≥ 8192             \
+             *   128×128 KU=2: 48037 GFLOP/s for K ≥ 2048 (beats KU=1     \
+             *     46407 at K=2048, 66354 vs 49817 at K=32768)             \
+             *   128×128 KU=1: 11100-42091 GFLOP/s for K < 2048           \
+             *     (beats KU=2 at K≤1024: 42091 vs 36897)                  */ \
             if (m >= 8192 && n >= 8192 && k >= 8192) { \
                 _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,1u);  /* 256×256, KU=1 */ \
+            } else if (k >= 2048) { \
+                _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,1u);  /* 128×128, KU=2 */ \
             } else { \
                 _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,1u,false,1u);  /* 128×128, KU=1 */ \
             } \
         } else { \
             /* ── gfx942 (MI300X) tile selection ────────────────────────── */ \
             if (m >= 8192 && n >= 8192 && k >= 8192) { \
-                _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,2u);  /* 256×256, KU=1, PGR=2 (+3.3%) */ \
+                _OV_DISPATCH((S_V),4u,4u,16u,4u,4u,1u,false,1u);  /* 256×256, KU=1 (37237 GFLOP/s vs PGR2 36572) */ \
             } else { \
                 _OV_DISPATCH((S_V),4u,4u,16u,2u,2u,2u,false,1u);  /* 128×128, KU=2 */ \
             } \

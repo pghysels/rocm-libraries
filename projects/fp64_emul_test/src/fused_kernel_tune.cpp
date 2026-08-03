@@ -108,7 +108,6 @@ static const KernelConfig CONFIGS[] = {
     { 2, 2, 1, 1, 16, 4, false, false, 1, "WM2WN2Wm1Wn1T16ku4" },
     { 2, 1, 1, 2, 16, 4, false, false, 1, "WM2WN1Wm1Wn2T16ku4" },
     { 1, 2, 2, 1, 16, 4, false, false, 1, "WM1WN2Wm2Wn1T16ku4" },
-    { 1, 1, 2, 2, 16, 4, false, false, 1, "WM1WN1Wm2Wn2T16ku4" },
     { 1, 1, 1, 1, 32, 4, false, false, 1, "WM1WN1Wm1Wn1T32ku4" },
     /* ── KU=4: sub-32×32 macrotile configs (16×16 / 16×32 / 32×16, TILE=16) ── */
     { 1, 1, 1, 1, 16, 4, false, false, 1, "WM1WN1Wm1Wn1T16ku4" },  /* 16×16, 64 thr, NREG=4 */
@@ -123,9 +122,6 @@ static const KernelConfig CONFIGS[] = {
     { 2, 2, 2, 2, 16, 4, false, false, 1, "WM2WN2Wm2Wn2T16ku4" },
     { 1, 4, 4, 1, 16, 4, false, false, 1, "WM1WN4Wm4Wn1T16ku4" },
     { 4, 1, 1, 4, 16, 4, false, false, 1, "WM4WN1Wm1Wn4T16ku4" },
-    { 1, 2, 4, 2, 16, 4, false, false, 1, "WM1WN2Wm4Wn2T16ku4" },
-    { 2, 1, 2, 4, 16, 4, false, false, 1, "WM2WN1Wm2Wn4T16ku4" },
-    { 1, 1, 4, 4, 16, 4, false, false, 1, "WM1WN1Wm4Wn4T16ku4" },
     /* ── KU=4: TILE=16 larger macrotiles (KU_AUTO=4 on gfx942 for all; KU_AUTO=4 on gfx950) ── */
     { 4, 4, 2, 1, 16, 4, false, false, 1, "WM4WN4Wm2Wn1T16ku4" },  /* 128×64 macrotile */
     { 4, 4, 1, 2, 16, 4, false, false, 1, "WM4WN4Wm1Wn2T16ku4" },  /* 64×128 macrotile */
@@ -155,9 +151,6 @@ static const KernelConfig CONFIGS[] = {
     { 2, 2, 2, 2, 16, 2, false, false, 1, "WM2WN2Wm2Wn2T16ku2" },
     { 1, 4, 4, 1, 16, 2, false, false, 1, "WM1WN4Wm4Wn1T16ku2" },
     { 4, 1, 1, 4, 16, 2, false, false, 1, "WM4WN1Wm1Wn4T16ku2" },
-    { 1, 2, 4, 2, 16, 2, false, false, 1, "WM1WN2Wm4Wn2T16ku2" },
-    { 2, 1, 2, 4, 16, 2, false, false, 1, "WM2WN1Wm2Wn4T16ku2" },
-    { 1, 1, 4, 4, 16, 2, false, false, 1, "WM1WN1Wm4Wn4T16ku2" },
     /* ── KU=2: TILE=16 larger macrotiles (missing from 128x64 section) ── */
     { 4, 4, 1, 2, 16, 2, false, false, 1, "WM4WN4Wm1Wn2T16ku2" },  /* 64x128 */
     { 4, 2, 2, 1, 16, 2, false, false, 1, "WM4WN2Wm2Wn1T16ku2" },  /* 128x32 */
@@ -169,7 +162,6 @@ static const KernelConfig CONFIGS[] = {
     { 2, 2, 1, 1, 16, 2, false, false, 1, "WM2WN2Wm1Wn1T16ku2" },
     { 2, 1, 1, 2, 16, 2, false, false, 1, "WM2WN1Wm1Wn2T16ku2" },
     { 1, 2, 2, 1, 16, 2, false, false, 1, "WM1WN2Wm2Wn1T16ku2" },
-    { 1, 1, 2, 2, 16, 2, false, false, 1, "WM1WN1Wm2Wn2T16ku2" },
     { 1, 1, 1, 1, 32, 2, false, false, 1, "WM1WN1Wm1Wn1T32ku2" },
     /* ── KU=2: sub-32×32 macrotile configs (16×16 / 16×32 / 32×16, TILE=16) ── */
     { 1, 1, 1, 1, 16, 2, false, false, 1, "WM1WN1Wm1Wn1T16ku2" },  /* 16×16, 64 thr, NREG=4 */
@@ -193,11 +185,8 @@ static const KernelConfig CONFIGS[] = {
     { 4, 2, 1, 2, 16, 1, false, false, 1, "WM4WN2Wm1Wn2T16ku1" },  /* A=B=1 on gfx942 */
     { 2, 2, 2, 2, 16, 1, false, false, 1, "WM2WN2Wm2Wn2T16ku1" },  /* A=B=2 on gfx942 */
     { 4, 4, 2, 2, 16, 1, false, false, 1, "WM4WN4Wm2Wn2T16ku1" },  /* A=B=1 on gfx942 */
-    { 1, 1, 4, 4, 16, 1, false, false, 1, "WM1WN1Wm4Wn4T16ku1" },  /* A=B=8 on gfx942 */
     { 1, 4, 4, 1, 16, 1, false, false, 1, "WM1WN4Wm4Wn1T16ku1" },  /* A=B=2 on gfx942 */
     { 4, 1, 1, 4, 16, 1, false, false, 1, "WM4WN1Wm1Wn4T16ku1" },  /* A=B=2 on gfx942 */
-    { 1, 2, 4, 2, 16, 1, false, false, 1, "WM1WN2Wm4Wn2T16ku1" },  /* A=B=4 on gfx942 */
-    { 2, 1, 2, 4, 16, 1, false, false, 1, "WM2WN1Wm2Wn4T16ku1" },  /* A=B=4 on gfx942 */
     /* ── KU=1: TILE=16 larger WaveM x WaveN (both-arch valid) ── */
     { 4, 4, 4, 2, 16, 1, false, false, 1, "WM4WN4Wm4Wn2T16ku1" },  /* A=2,B=1 on gfx942 */
     { 4, 4, 2, 4, 16, 1, false, false, 1, "WM4WN4Wm2Wn4T16ku1" },  /* A=1,B=2 on gfx942 */
@@ -206,7 +195,6 @@ static const KernelConfig CONFIGS[] = {
     { 2, 2, 1, 1, 16, 1, false, false, 1, "WM2WN2Wm1Wn1T16ku1" },  /* 32×32 macrotile, 256 thr, NREG=4 */
     { 2, 1, 1, 2, 16, 1, false, false, 1, "WM2WN1Wm1Wn2T16ku1" },  /* 32×32 macrotile, 128 thr, NREG=8 */
     { 1, 2, 2, 1, 16, 1, false, false, 1, "WM1WN2Wm2Wn1T16ku1" },  /* 32×32 macrotile, 128 thr, NREG=8 */
-    { 1, 1, 2, 2, 16, 1, false, false, 1, "WM1WN1Wm2Wn2T16ku1" },  /* 32×32 macrotile, 64 thr, NREG=16 */
     { 1, 1, 1, 1, 32, 1, false, false, 1, "WM1WN1Wm1Wn1T32ku1" },  /* 32×32 macrotile (TILE=32), 64 thr, NREG=16 */
     /* ── KU=1: sub-32×32 macrotile configs (both-arch valid) ── */
     { 1, 1, 1, 1, 16, 1, false, false, 1, "WM1WN1Wm1Wn1T16ku1" },  /* 16×16, 64 thr, NREG=4 */
