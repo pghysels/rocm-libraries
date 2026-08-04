@@ -562,10 +562,10 @@ oz2_fused_TN_kernel(
             if (s + 1 < S) {
                 #pragma unroll
                 for (int ls = 0; ls < A_STEPS; ++ls)
-                    rA[ls] = *reinterpret_cast<const load_t*>(A8i + static_cast<size_t>(s + 1) * stride_A_s + hbm_off_A[ls]);
+                    rA[ls] = *reinterpret_cast<const load_t*>(A8i_s + stride_A_s + hbm_off_A[ls]);
                 #pragma unroll
                 for (int ls = 0; ls < B_STEPS; ++ls)
-                    rB[ls] = *reinterpret_cast<const load_t*>(B8i + static_cast<size_t>(s + 1) * stride_B_s + hbm_off_B[ls]);
+                    rB[ls] = *reinterpret_cast<const load_t*>(B8i_s + stride_B_s + hbm_off_B[ls]);
             }
         }
     };  /* end run_kloop */
