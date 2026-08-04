@@ -232,19 +232,20 @@ oz2_fused_TN_kernel(
      * that keeps both A_STEPS and B_STEPS ≥ 1.  Wider loads reduce instruction
      * count; the limit is the smaller of the A and B tile data per thread.
      *
-     * HIGH_VGPR_PRESSURE guard: when accumulators are in registers (not LDS)
-     * and NREG is large (e.g., 256×256 on gfx942 with NREG=64), the compiler
-     * is heavily scheduling-constrained.  Wider loads reduce instruction count
-     * but also reduce scheduling flexibility (fewer, larger loads vs many small
-     * loads that can be interleaved).  Fall back to 4-byte loads to preserve
-     * the original instruction schedule for these VGPR-heavy configs.
+     * HIGH_VGPR_PRESSURE guard: when NREG is large (e.g., 256×256 with
+     * NREG=64), wider loads reduce instruction count but also reduce
+     * scheduling flexibility.  Fall back to 4-byte loads to preserve
+     * the original instruction schedule for these high-NREG configs.
+     * Applied unconditionally regardless of USE_LDS_ACCUM — benchmarked
+     * regression on both gfx942 and gfx950 when wider loads are used
+     * with NREG=64.
      *
      * gfx942 (KBLK=32): 8 B for KU≥2 symmetric with NREG≤16, 4 B otherwise.
-     * gfx950 (KBLK=64): 16 B for KU≥2 symmetric (USE_LDS_ACCUM=true → no guard). */
+     * gfx950 (KBLK=64): 16 B for NREG≤16, 4 B for NREG>16.                */
     static constexpr int MIN_WAVE_DIM    = ((WM * WaveM) < (WN * WaveN))
                                          ? (WM * WaveM) : (WN * WaveN);
     static constexpr int MIN_BYTES_PER_THR = MIN_WAVE_DIM * TILE * KBLK_LOAD / BLK_THR;
-    static constexpr bool HIGH_VGPR_PRESSURE = (!USE_LDS_ACCUM && NREG > 16);
+    static constexpr bool HIGH_VGPR_PRESSURE = (NREG > 16);
     static constexpr int LOAD_BYTES  = (!HIGH_VGPR_PRESSURE && MIN_BYTES_PER_THR >= 16) ? 16
                                      : (!HIGH_VGPR_PRESSURE && MIN_BYTES_PER_THR >=  8) ?  8
                                      :                                                      4;
