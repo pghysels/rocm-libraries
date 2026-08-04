@@ -410,54 +410,35 @@ oz2_fused_TN_kernel(
         static constexpr int A_ROW_STRIDE = TILE * KBLK_STRIDE;
         static constexpr int B_ROW_STRIDE = TILE * KBLK_STRIDE;
 
-        /* KU loop is outermost → each sa/sb LDS load is reused across all
-         * WaveN (for sa) or WaveM (for sb) tiles.  LDS reads reduced from
-         * WaveM×WaveN×KU×2 to (WaveM+WaveN)×KU.  Accumulators live directly
-         * in C32[] — no intermediate vx[] copy needed.
-         *
-         * The smaller of WaveM/WaveN is pre-loaded into an array to minimize
-         * VGPR usage (min(WaveM,WaveN) src_t registers).  Total LDS loads
-         * are (WaveM+WaveN)×KU regardless of ordering — reuse is symmetric.
-         *
-         * PLR note: software-pipelined LDS reads (prefetching next-ku sources
-         * after current-ku MFMAs) was tested but measured neutral on both
-         * gfx942 and gfx950 — the compiler's instruction scheduler already
-         * hides LDS latency via #pragma unroll + MFMA pipeline overlap.     */
         #pragma unroll
         for (int ku = 0; ku < K_UNROLL; ++ku) {
             const int off = base_off + ku * KBLK;
 
-            if constexpr (WaveM >= WaveN) {
-                /* Pre-load B[WaveN] (the smaller-or-equal dimension).
-                 * Each sb element is reused WaveM times across the wm_w loop;
-                 * each sa scalar is reused WaveN times in the inner wn_w loop. */
-                src_t sb[WaveN];
-                #pragma unroll
-                for (int wn_w = 0; wn_w < WaveN; ++wn_w)
-                    sb[wn_w] = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
+            if constexpr (WaveM < WaveN) {
+                /* No pre-load array: wm is smaller → wm outer, hoist sa.
+                 * Total LDS reads: WaveM(1+WaveN)×KU — minimized by making
+                 * the smaller dimension outer.  Only 1 src_t in register.   */
                 #pragma unroll
                 for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
                     const src_t sa = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
                     #pragma unroll
-                    for (int wn_w = 0; wn_w < WaveN; ++wn_w)
-                        C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa, sb[wn_w],
+                    for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
+                        const src_t sb = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
+                        C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa, sb,
                                                                        C32[wm_w * WaveN + wn_w]);
+                    }
                 }
             } else {
-                /* Pre-load A[WaveM] (the smaller dimension, since WaveN > WaveM).
-                 * Each sa element is reused WaveN times across the wn_w loop;
-                 * each sb scalar is reused WaveM times in the inner wm_w loop. */
-                src_t sa[WaveM];
-                #pragma unroll
-                for (int wm_w = 0; wm_w < WaveM; ++wm_w)
-                    sa[wm_w] = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
+                /* WaveM >= WaveN: wn is smaller or equal → wn outer, hoist sb. */
                 #pragma unroll
                 for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
                     const src_t sb = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
                     #pragma unroll
-                    for (int wm_w = 0; wm_w < WaveM; ++wm_w)
-                        C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa[wm_w], sb,
+                    for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
+                        const src_t sa = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
+                        C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa, sb,
                                                                        C32[wm_w * WaveN + wn_w]);
+                    }
                 }
             }
         }
