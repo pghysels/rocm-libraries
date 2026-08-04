@@ -72,7 +72,6 @@ struct KernelConfig {
     unsigned KU;           /* K_UNROLL override: 0=auto, 2=force-2, 4=force-4 */
     bool     gfx950_only;      /* skip on gfx942 */
     bool     force_vgpr_accum; /* true → FORCE_VGPR_ACCUM=1 (7th OZ2_FUSED_SHAPE_OVERRIDE param) */
-    unsigned lb;               /* LB override: 0=auto, 4/8/16=force */
     unsigned pgr;              /* PGR depth: 1=double-buffer (default), 2=triple-buffer */
     const char* label;         /* short human-readable name */
 };
@@ -81,126 +80,116 @@ static const KernelConfig CONFIGS[] = {
     /* ── PRODUCTION / IMPORTANT CONFIGS (run first) ──
      * All macrotiles ≥ 64×64.  Sub-64 configs removed (consistently
      * underperform for all benchmark shapes on both gfx942 and gfx950).     */
-    { 4, 4, 2, 2, 16, 2, false, false, 0,  1, "WM4WN4Wm2Wn2T16ku2" },  /* 128×128 KU2 — default winner */
-    { 4, 4, 4, 2, 16, 1, false, false, 0,  1, "WM4WN4Wm4Wn2T16ku1" },  /* 256×128 KU1 — tall/wide */
-    { 4, 4, 4, 4, 16, 1, false, false, 0,  1, "WM4WN4Wm4Wn4T16ku1" },  /* 256×256 KU1 — gfx950 large */
-    { 4, 4, 1, 2, 16, 4, false, false, 0,  1, "WM4WN4Wm1Wn2T16ku4" },  /* 64×128 KU4 */
-    { 4, 4, 2, 1, 16, 4, false, false, 0,  1, "WM4WN4Wm2Wn1T16ku4" },  /* 128×64 KU4 */
+    { 4, 4, 2, 2, 16, 2, false, false, 1, "WM4WN4Wm2Wn2T16ku2" },  /* 128×128 KU2 — default winner */
+    { 4, 4, 4, 2, 16, 1, false, false, 1, "WM4WN4Wm4Wn2T16ku1" },  /* 256×128 KU1 — tall/wide */
+    { 4, 4, 4, 4, 16, 1, false, false, 1, "WM4WN4Wm4Wn4T16ku1" },  /* 256×256 KU1 — gfx950 large */
+    { 4, 4, 1, 2, 16, 4, false, false, 1, "WM4WN4Wm1Wn2T16ku4" },  /* 64×128 KU4 */
+    { 4, 4, 2, 1, 16, 4, false, false, 1, "WM4WN4Wm2Wn1T16ku4" },  /* 128×64 KU4 */
 
-    /* ── LOAD_BYTES sweep for production configs ───────────────────────── */
-    { 4, 4, 2, 2, 16, 2, false, false, 4,  1, "WM4WN4Wm2Wn2T16ku2lb4" },
-    { 4, 4, 2, 2, 16, 2, false, false, 8,  1, "WM4WN4Wm2Wn2T16ku2lb8" },
-    { 4, 4, 2, 2, 16, 2, false, false, 16,  1, "WM4WN4Wm2Wn2T16ku2lb16" },
-    { 4, 4, 4, 4, 16, 1, false, false, 4,  1, "WM4WN4Wm4Wn4T16ku1lb4" },
-    { 4, 4, 4, 4, 16, 1, false, false, 8,  1, "WM4WN4Wm4Wn4T16ku1lb8" },
-    { 4, 4, 4, 4, 16, 1, false, false, 16,  1, "WM4WN4Wm4Wn4T16ku1lb16" },
-    { 4, 4, 2, 2, 16, 1, false, false, 4,  1, "WM4WN4Wm2Wn2T16ku1lb4" },
-    { 4, 4, 2, 2, 16, 1, false, false, 8,  1, "WM4WN4Wm2Wn2T16ku1lb8" },
-    { 4, 4, 2, 2, 16, 1, false, false, 16,  1, "WM4WN4Wm2Wn2T16ku1lb16" },
 
 
     /* ── PGR=2 (triple-buffered K-loop) ────────────────────────────────── */
-    { 4, 4, 2, 2, 16, 2, false, false, 0,  2, "WM4WN4Wm2Wn2T16ku2pgr2" },
-    { 4, 4, 4, 2, 16, 1, false, false, 0,  2, "WM4WN4Wm4Wn2T16ku1pgr2" },
-    { 4, 4, 4, 4, 16, 1, false, false, 0,  2, "WM4WN4Wm4Wn4T16ku1pgr2" },
-    { 4, 4, 2, 2, 16, 1, false, false, 0,  2, "WM4WN4Wm2Wn2T16ku1pgr2" },
+    { 4, 4, 2, 2, 16, 2, false, false, 2, "WM4WN4Wm2Wn2T16ku2pgr2" },
+    { 4, 4, 4, 2, 16, 1, false, false, 2, "WM4WN4Wm4Wn2T16ku1pgr2" },
+    { 4, 4, 4, 4, 16, 1, false, false, 2, "WM4WN4Wm4Wn4T16ku1pgr2" },
+    { 4, 4, 2, 2, 16, 1, false, false, 2, "WM4WN4Wm2Wn2T16ku1pgr2" },
     /* ── FVA=1 + PGR=2 (gfx950 only) ──────────────────────────────────── */
-    { 4, 4, 2, 2, 16, 1, true,  true,  0,  2, "WM4WN4Wm2Wn2T16ku1fva1pgr2" },
-    { 4, 4, 4, 4, 16, 1, true,  true,  0,  2, "WM4WN4Wm4Wn4T16ku1fva1pgr2" },
-    { 4, 4, 2, 2, 16, 2, true,  true,  0,  2, "WM4WN4Wm2Wn2T16ku2fva1pgr2" },
+    { 4, 4, 2, 2, 16, 1, true,  true,  2, "WM4WN4Wm2Wn2T16ku1fva1pgr2" },
+    { 4, 4, 4, 4, 16, 1, true,  true,  2, "WM4WN4Wm4Wn4T16ku1fva1pgr2" },
+    { 4, 4, 2, 2, 16, 2, true,  true,  2, "WM4WN4Wm2Wn2T16ku2fva1pgr2" },
 
     /* ── USE_LDS_ACCUM=true test config (fits in 64KB LDS on gfx942) ────── */
-    { 1, 1, 1, 1, 16, 4, false, false, 0,  1, "WM1WN1Wm1Wn1T16ku4" },  /* 16×16, 64 thr, NREG=4, exercises double2 Z_lds path */
+    { 1, 1, 1, 1, 16, 4, false, false, 1, "WM1WN1Wm1Wn1T16ku4" },  /* 16×16, 64 thr, NREG=4, exercises double2 Z_lds path */
 
     /* ── TILE=32 ≥64×64 configs ────────────────────────────────────────── */
-    { 4, 2, 1, 1, 32, 4, false, false, 0,  1, "WM4WN2Wm1Wn1T32ku4" },  /* 128×64 T32 */
-    { 2, 4, 1, 1, 32, 4, false, false, 0,  1, "WM2WN4Wm1Wn1T32ku4" },  /* 64×128 T32 */
-    { 2, 2, 1, 1, 32, 4, false, false, 0,  1, "WM2WN2Wm1Wn1T32ku4" },  /* 64×64 T32 */
+    { 4, 2, 1, 1, 32, 4, false, false, 1, "WM4WN2Wm1Wn1T32ku4" },  /* 128×64 T32 */
+    { 2, 4, 1, 1, 32, 4, false, false, 1, "WM2WN4Wm1Wn1T32ku4" },  /* 64×128 T32 */
+    { 2, 2, 1, 1, 32, 4, false, false, 1, "WM2WN2Wm1Wn1T32ku4" },  /* 64×64 T32 */
 
     /* ── KU=4: TILE=16 64×64 configs ───────────────────────────────────── */
-    { 4, 4, 1, 1, 16, 4, false, false, 0,  1, "WM4WN4Wm1Wn1T16ku4" },
-    { 2, 4, 2, 1, 16, 4, false, false, 0,  1, "WM2WN4Wm2Wn1T16ku4" },
-    { 4, 2, 1, 2, 16, 4, false, false, 0,  1, "WM4WN2Wm1Wn2T16ku4" },
-    { 2, 2, 2, 2, 16, 4, false, false, 0,  1, "WM2WN2Wm2Wn2T16ku4" },
-    { 1, 4, 4, 1, 16, 4, false, false, 0,  1, "WM1WN4Wm4Wn1T16ku4" },
-    { 4, 1, 1, 4, 16, 4, false, false, 0,  1, "WM4WN1Wm1Wn4T16ku4" },
+    { 4, 4, 1, 1, 16, 4, false, false, 1, "WM4WN4Wm1Wn1T16ku4" },
+    { 2, 4, 2, 1, 16, 4, false, false, 1, "WM2WN4Wm2Wn1T16ku4" },
+    { 4, 2, 1, 2, 16, 4, false, false, 1, "WM4WN2Wm1Wn2T16ku4" },
+    { 2, 2, 2, 2, 16, 4, false, false, 1, "WM2WN2Wm2Wn2T16ku4" },
+    { 1, 4, 4, 1, 16, 4, false, false, 1, "WM1WN4Wm4Wn1T16ku4" },
+    { 4, 1, 1, 4, 16, 4, false, false, 1, "WM4WN1Wm1Wn4T16ku4" },
     /* ── KU=4: TILE=16 larger macrotiles ───────────────────────────────── */
-    { 4, 4, 2, 1, 16, 4, false, false, 0,  1, "WM4WN4Wm2Wn1T16ku4" },  /* 128×64 */
-    { 4, 4, 1, 2, 16, 4, false, false, 0,  1, "WM4WN4Wm1Wn2T16ku4" },  /* 64×128 */
-    { 1, 2, 4, 2, 16, 4, true,  false, 0,  1, "WM1WN2Wm4Wn2T16ku4" },  /* 64×64, 128 thr, NREG=32 — gfx950 only (VGPR spill on gfx942) */
-    { 2, 1, 2, 4, 16, 4, true,  false, 0,  1, "WM2WN1Wm2Wn4T16ku4" },  /* 64×64, 128 thr, NREG=32 — gfx950 only */
-    { 1, 1, 4, 4, 16, 4, true,  false, 0,  1, "WM1WN1Wm4Wn4T16ku4" },  /* 64×64, 64 thr,  NREG=64 — gfx950 only */
+    { 4, 4, 2, 1, 16, 4, false, false, 1, "WM4WN4Wm2Wn1T16ku4" },  /* 128×64 */
+    { 4, 4, 1, 2, 16, 4, false, false, 1, "WM4WN4Wm1Wn2T16ku4" },  /* 64×128 */
+    { 1, 2, 4, 2, 16, 4, true,  false, 1, "WM1WN2Wm4Wn2T16ku4" },  /* 64×64, 128 thr, NREG=32 — gfx950 only (VGPR spill on gfx942) */
+    { 2, 1, 2, 4, 16, 4, true,  false, 1, "WM2WN1Wm2Wn4T16ku4" },  /* 64×64, 128 thr, NREG=32 — gfx950 only */
+    { 1, 1, 4, 4, 16, 4, true,  false, 1, "WM1WN1Wm4Wn4T16ku4" },  /* 64×64, 64 thr,  NREG=64 — gfx950 only */
 
     /* ── KU=2: 256×64, 64×256, 128×128, 128×64 ────────────────────────── */
-    { 4, 4, 2, 1, 16, 2, false, false, 0,  1, "WM4WN4Wm2Wn1T16ku2" },  /* 128×64 */
-    { 4, 4, 4, 1, 16, 2, false, false, 0,  1, "WM4WN4Wm4Wn1T16ku2" },  /* 256×64 */
-    { 4, 4, 1, 4, 16, 2, false, false, 0,  1, "WM4WN4Wm1Wn4T16ku2" },  /* 64×256 */
-    { 4, 4, 2, 2, 16, 2, false, false, 0,  1, "WM4WN4Wm2Wn2T16ku2" },  /* 128×128 */
-    { 4, 4, 1, 2, 16, 2, false, false, 0,  1, "WM4WN4Wm1Wn2T16ku2" },  /* 64×128 */
+    { 4, 4, 2, 1, 16, 2, false, false, 1, "WM4WN4Wm2Wn1T16ku2" },  /* 128×64 */
+    { 4, 4, 4, 1, 16, 2, false, false, 1, "WM4WN4Wm4Wn1T16ku2" },  /* 256×64 */
+    { 4, 4, 1, 4, 16, 2, false, false, 1, "WM4WN4Wm1Wn4T16ku2" },  /* 64×256 */
+    { 4, 4, 2, 2, 16, 2, false, false, 1, "WM4WN4Wm2Wn2T16ku2" },  /* 128×128 */
+    { 4, 4, 1, 2, 16, 2, false, false, 1, "WM4WN4Wm1Wn2T16ku2" },  /* 64×128 */
     /* ── KU=2: TILE=16 64×64 configs ───────────────────────────────────── */
-    { 4, 4, 1, 1, 16, 2, false, false, 0,  1, "WM4WN4Wm1Wn1T16ku2" },
-    { 2, 4, 2, 1, 16, 2, false, false, 0,  1, "WM2WN4Wm2Wn1T16ku2" },
-    { 4, 2, 1, 2, 16, 2, false, false, 0,  1, "WM4WN2Wm1Wn2T16ku2" },
-    { 2, 2, 2, 2, 16, 2, false, false, 0,  1, "WM2WN2Wm2Wn2T16ku2" },
-    { 1, 4, 4, 1, 16, 2, false, false, 0,  1, "WM1WN4Wm4Wn1T16ku2" },
-    { 4, 1, 1, 4, 16, 2, false, false, 0,  1, "WM4WN1Wm1Wn4T16ku2" },
-    { 1, 2, 4, 2, 16, 2, true,  false, 0,  1, "WM1WN2Wm4Wn2T16ku2" },  /* 64×64, 128 thr, NREG=32 — gfx950 only */
-    { 2, 1, 2, 4, 16, 2, true,  false, 0,  1, "WM2WN1Wm2Wn4T16ku2" },  /* 64×64, 128 thr, NREG=32 — gfx950 only */
-    { 1, 1, 4, 4, 16, 2, true,  false, 0,  1, "WM1WN1Wm4Wn4T16ku2" },  /* 64×64, 64 thr,  NREG=64 — gfx950 only */
+    { 4, 4, 1, 1, 16, 2, false, false, 1, "WM4WN4Wm1Wn1T16ku2" },
+    { 2, 4, 2, 1, 16, 2, false, false, 1, "WM2WN4Wm2Wn1T16ku2" },
+    { 4, 2, 1, 2, 16, 2, false, false, 1, "WM4WN2Wm1Wn2T16ku2" },
+    { 2, 2, 2, 2, 16, 2, false, false, 1, "WM2WN2Wm2Wn2T16ku2" },
+    { 1, 4, 4, 1, 16, 2, false, false, 1, "WM1WN4Wm4Wn1T16ku2" },
+    { 4, 1, 1, 4, 16, 2, false, false, 1, "WM4WN1Wm1Wn4T16ku2" },
+    { 1, 2, 4, 2, 16, 2, true,  false, 1, "WM1WN2Wm4Wn2T16ku2" },  /* 64×64, 128 thr, NREG=32 — gfx950 only */
+    { 2, 1, 2, 4, 16, 2, true,  false, 1, "WM2WN1Wm2Wn4T16ku2" },  /* 64×64, 128 thr, NREG=32 — gfx950 only */
+    { 1, 1, 4, 4, 16, 2, true,  false, 1, "WM1WN1Wm4Wn4T16ku2" },  /* 64×64, 64 thr,  NREG=64 — gfx950 only */
     /* ── KU=2: TILE=32 ≥64×64 ─────────────────────────────────────────── */
-    { 4, 2, 1, 1, 32, 2, false, false, 0,  1, "WM4WN2Wm1Wn1T32ku2" },  /* 128×64 T32 */
-    { 2, 4, 1, 1, 32, 2, false, false, 0,  1, "WM2WN4Wm1Wn1T32ku2" },  /* 64×128 T32 */
-    { 2, 2, 1, 1, 32, 2, false, false, 0,  1, "WM2WN2Wm1Wn1T32ku2" },  /* 64×64 T32 */
+    { 4, 2, 1, 1, 32, 2, false, false, 1, "WM4WN2Wm1Wn1T32ku2" },  /* 128×64 T32 */
+    { 2, 4, 1, 1, 32, 2, false, false, 1, "WM2WN4Wm1Wn1T32ku2" },  /* 64×128 T32 */
+    { 2, 2, 1, 1, 32, 2, false, false, 1, "WM2WN2Wm1Wn1T32ku2" },  /* 64×64 T32 */
 
     /* ── KU=1: TILE=16 ≥64×64 configs (both-arch valid) ───────────────── */
-    { 2, 4, 2, 1, 16, 1, false, false, 0,  1, "WM2WN4Wm2Wn1T16ku1" },
-    { 4, 2, 1, 2, 16, 1, false, false, 0,  1, "WM4WN2Wm1Wn2T16ku1" },
-    { 2, 2, 2, 2, 16, 1, false, false, 0,  1, "WM2WN2Wm2Wn2T16ku1" },
-    { 4, 4, 2, 2, 16, 1, false, false, 0,  1, "WM4WN4Wm2Wn2T16ku1" },
-    { 1, 4, 4, 1, 16, 1, false, false, 0,  1, "WM1WN4Wm4Wn1T16ku1" },
-    { 4, 1, 1, 4, 16, 1, false, false, 0,  1, "WM4WN1Wm1Wn4T16ku1" },
-    { 4, 4, 4, 2, 16, 1, false, false, 0,  1, "WM4WN4Wm4Wn2T16ku1" },
-    { 4, 4, 2, 4, 16, 1, false, false, 0,  1, "WM4WN4Wm2Wn4T16ku1" },
-    { 4, 4, 4, 4, 16, 1, false, false, 0,  1, "WM4WN4Wm4Wn4T16ku1" },
-    { 1, 2, 4, 2, 16, 1, true,  false, 0,  1, "WM1WN2Wm4Wn2T16ku1" },  /* gfx950 only */
-    { 2, 1, 2, 4, 16, 1, true,  false, 0,  1, "WM2WN1Wm2Wn4T16ku1" },  /* gfx950 only */
-    { 1, 1, 4, 4, 16, 1, true,  false, 0,  1, "WM1WN1Wm4Wn4T16ku1" },  /* gfx950 only */
+    { 2, 4, 2, 1, 16, 1, false, false, 1, "WM2WN4Wm2Wn1T16ku1" },
+    { 4, 2, 1, 2, 16, 1, false, false, 1, "WM4WN2Wm1Wn2T16ku1" },
+    { 2, 2, 2, 2, 16, 1, false, false, 1, "WM2WN2Wm2Wn2T16ku1" },
+    { 4, 4, 2, 2, 16, 1, false, false, 1, "WM4WN4Wm2Wn2T16ku1" },
+    { 1, 4, 4, 1, 16, 1, false, false, 1, "WM1WN4Wm4Wn1T16ku1" },
+    { 4, 1, 1, 4, 16, 1, false, false, 1, "WM4WN1Wm1Wn4T16ku1" },
+    { 4, 4, 4, 2, 16, 1, false, false, 1, "WM4WN4Wm4Wn2T16ku1" },
+    { 4, 4, 2, 4, 16, 1, false, false, 1, "WM4WN4Wm2Wn4T16ku1" },
+    { 4, 4, 4, 4, 16, 1, false, false, 1, "WM4WN4Wm4Wn4T16ku1" },
+    { 1, 2, 4, 2, 16, 1, true,  false, 1, "WM1WN2Wm4Wn2T16ku1" },  /* gfx950 only */
+    { 2, 1, 2, 4, 16, 1, true,  false, 1, "WM2WN1Wm2Wn4T16ku1" },  /* gfx950 only */
+    { 1, 1, 4, 4, 16, 1, true,  false, 1, "WM1WN1Wm4Wn4T16ku1" },  /* gfx950 only */
     /* ── KU=1: TILE=32 ≥64×64 (both-arch valid) ───────────────────────── */
-    { 2, 2, 1, 1, 32, 1, false, false, 0,  1, "WM2WN2Wm1Wn1T32ku1" },  /* 64×64 T32 */
+    { 2, 2, 1, 1, 32, 1, false, false, 1, "WM2WN2Wm1Wn1T32ku1" },  /* 64×64 T32 */
     /* ── KU=1: TILE=16 larger macrotiles (both-arch) ── */
-    { 4, 4, 4, 2, 16, 1, false, false, 0,  1, "WM4WN4Wm4Wn2T16ku1" },
-    { 4, 4, 2, 4, 16, 1, false, false, 0,  1, "WM4WN4Wm2Wn4T16ku1" },
-    { 4, 4, 4, 4, 16, 1, false, false, 0,  1, "WM4WN4Wm4Wn4T16ku1" },
+    { 4, 4, 4, 2, 16, 1, false, false, 1, "WM4WN4Wm4Wn2T16ku1" },
+    { 4, 4, 2, 4, 16, 1, false, false, 1, "WM4WN4Wm2Wn4T16ku1" },
+    { 4, 4, 4, 4, 16, 1, false, false, 1, "WM4WN4Wm4Wn4T16ku1" },
 
     /* ── gfx950-only KU=1 ≥64×64 ──────────────────────────────────────── */
-    { 4, 4, 1, 2, 16, 1, true, false, 0,  1, "WM4WN4Wm1Wn2T16ku1" },   /* 64×128 */
-    { 4, 4, 1, 1, 16, 1, true, false, 0,  1, "WM4WN4Wm1Wn1T16ku1" },   /* 64×64 */
-    { 4, 4, 2, 1, 16, 1, true, false, 0,  1, "WM4WN4Wm2Wn1T16ku1" },   /* 128×64 */
-    { 4, 4, 4, 1, 16, 1, true, false, 0,  1, "WM4WN4Wm4Wn1T16ku1" },   /* 256×64 */
-    { 4, 2, 1, 1, 32, 1, true, false, 0,  1, "WM4WN2Wm1Wn1T32ku1" },   /* 128×64 T32 */
-    { 2, 4, 1, 1, 32, 1, true, false, 0,  1, "WM2WN4Wm1Wn1T32ku1" },   /* 64×128 T32 */
-    { 4, 4, 1, 4, 16, 1, true, false, 0,  1, "WM4WN4Wm1Wn4T16ku1" },   /* 64×256 */
-    { 4, 4, 1, 1, 32, 1, true, false, 0,  1, "WM4WN4Wm1Wn1T32ku1" },   /* 128×128 T32 */
+    { 4, 4, 1, 2, 16, 1, true, false, 1, "WM4WN4Wm1Wn2T16ku1" },   /* 64×128 */
+    { 4, 4, 1, 1, 16, 1, true, false, 1, "WM4WN4Wm1Wn1T16ku1" },   /* 64×64 */
+    { 4, 4, 2, 1, 16, 1, true, false, 1, "WM4WN4Wm2Wn1T16ku1" },   /* 128×64 */
+    { 4, 4, 4, 1, 16, 1, true, false, 1, "WM4WN4Wm4Wn1T16ku1" },   /* 256×64 */
+    { 4, 2, 1, 1, 32, 1, true, false, 1, "WM4WN2Wm1Wn1T32ku1" },   /* 128×64 T32 */
+    { 2, 4, 1, 1, 32, 1, true, false, 1, "WM2WN4Wm1Wn1T32ku1" },   /* 64×128 T32 */
+    { 4, 4, 1, 4, 16, 1, true, false, 1, "WM4WN4Wm1Wn4T16ku1" },   /* 64×256 */
+    { 4, 4, 1, 1, 32, 1, true, false, 1, "WM4WN4Wm1Wn1T32ku1" },   /* 128×128 T32 */
 
     /* ── FORCE_VGPR_ACCUM=true (gfx950 only), ≥64×64 ──────────────────── */
-    { 4, 4, 1, 2, 16, 1, true, true, 0,  1, "WM4WN4Wm1Wn2T16ku1fva1" },   /* 64×128 */
-    { 4, 4, 1, 1, 16, 1, true, true, 0,  1, "WM4WN4Wm1Wn1T16ku1fva1" },   /* 64×64 */
-    { 4, 4, 2, 1, 16, 1, true, true, 0,  1, "WM4WN4Wm2Wn1T16ku1fva1" },   /* 128×64 */
-    { 4, 4, 4, 1, 16, 1, true, true, 0,  1, "WM4WN4Wm4Wn1T16ku1fva1" },   /* 256×64 */
-    { 4, 2, 1, 1, 32, 1, true, true, 0,  1, "WM4WN2Wm1Wn1T32ku1fva1" },   /* 128×64 T32 */
-    { 2, 4, 1, 1, 32, 1, true, true, 0,  1, "WM2WN4Wm1Wn1T32ku1fva1" },   /* 64×128 T32 */
-    { 4, 4, 1, 4, 16, 1, true, true, 0,  1, "WM4WN4Wm1Wn4T16ku1fva1" },   /* 64×256 */
-    { 4, 4, 1, 1, 32, 1, true, true, 0,  1, "WM4WN4Wm1Wn1T32ku1fva1" },   /* 128×128 T32 */
+    { 4, 4, 1, 2, 16, 1, true, true, 1, "WM4WN4Wm1Wn2T16ku1fva1" },   /* 64×128 */
+    { 4, 4, 1, 1, 16, 1, true, true, 1, "WM4WN4Wm1Wn1T16ku1fva1" },   /* 64×64 */
+    { 4, 4, 2, 1, 16, 1, true, true, 1, "WM4WN4Wm2Wn1T16ku1fva1" },   /* 128×64 */
+    { 4, 4, 4, 1, 16, 1, true, true, 1, "WM4WN4Wm4Wn1T16ku1fva1" },   /* 256×64 */
+    { 4, 2, 1, 1, 32, 1, true, true, 1, "WM4WN2Wm1Wn1T32ku1fva1" },   /* 128×64 T32 */
+    { 2, 4, 1, 1, 32, 1, true, true, 1, "WM2WN4Wm1Wn1T32ku1fva1" },   /* 64×128 T32 */
+    { 4, 4, 1, 4, 16, 1, true, true, 1, "WM4WN4Wm1Wn4T16ku1fva1" },   /* 64×256 */
+    { 4, 4, 1, 1, 32, 1, true, true, 1, "WM4WN4Wm1Wn1T32ku1fva1" },   /* 128×128 T32 */
     /* ── fva1: key standard configs ≥64×64 ── */
-    { 4, 4, 1, 1, 16, 4, true, true, 0,  1, "WM4WN4Wm1Wn1T16ku4fva1" },   /* 64×64 */
-    { 4, 4, 1, 2, 16, 4, true, true, 0,  1, "WM4WN4Wm1Wn2T16ku4fva1" },   /* 64×128 */
-    { 4, 4, 2, 1, 16, 4, true, true, 0,  1, "WM4WN4Wm2Wn1T16ku4fva1" },   /* 128×64 */
-    { 4, 4, 4, 2, 16, 1, true, true, 0,  1, "WM4WN4Wm4Wn2T16ku1fva1" },   /* 256×128 */
-    { 4, 4, 2, 2, 16, 2, true, true, 0,  1, "WM4WN4Wm2Wn2T16ku2fva1" },   /* 128×128 */
-    { 4, 4, 4, 1, 16, 2, true, true, 0,  1, "WM4WN4Wm4Wn1T16ku2fva1" },   /* 256×64 */
-    { 4, 4, 1, 4, 16, 2, true, true, 0,  1, "WM4WN4Wm1Wn4T16ku2fva1" },   /* 64×256 */
-    { 4, 4, 1, 1, 16, 2, true, true, 0,  1, "WM4WN4Wm1Wn1T16ku2fva1" },   /* 64×64 */
-    { 2, 4, 1, 1, 32, 4, true, true, 0,  1, "WM2WN4Wm1Wn1T32ku4fva1" },   /* 64×128 T32 */
+    { 4, 4, 1, 1, 16, 4, true, true, 1, "WM4WN4Wm1Wn1T16ku4fva1" },   /* 64×64 */
+    { 4, 4, 1, 2, 16, 4, true, true, 1, "WM4WN4Wm1Wn2T16ku4fva1" },   /* 64×128 */
+    { 4, 4, 2, 1, 16, 4, true, true, 1, "WM4WN4Wm2Wn1T16ku4fva1" },   /* 128×64 */
+    { 4, 4, 4, 2, 16, 1, true, true, 1, "WM4WN4Wm4Wn2T16ku1fva1" },   /* 256×128 */
+    { 4, 4, 2, 2, 16, 2, true, true, 1, "WM4WN4Wm2Wn2T16ku2fva1" },   /* 128×128 */
+    { 4, 4, 4, 1, 16, 2, true, true, 1, "WM4WN4Wm4Wn1T16ku2fva1" },   /* 256×64 */
+    { 4, 4, 1, 4, 16, 2, true, true, 1, "WM4WN4Wm1Wn4T16ku2fva1" },   /* 64×256 */
+    { 4, 4, 1, 1, 16, 2, true, true, 1, "WM4WN4Wm1Wn1T16ku2fva1" },   /* 64×64 */
+    { 2, 4, 1, 1, 32, 4, true, true, 1, "WM2WN4Wm1Wn1T32ku4fva1" },   /* 64×128 T32 */
 };
 static const int NUM_CONFIGS = static_cast<int>(sizeof(CONFIGS) / sizeof(CONFIGS[0]));
 
@@ -535,9 +524,9 @@ int main(int argc, char** argv)
         /* Set override env var for this config.
          * Always emit all 6 params including KU (0 = auto-select K_UNROLL). */
         char ov_str[64];
-        std::snprintf(ov_str, sizeof(ov_str), "%u %u %u %u %u %u %u %u %u",
+        std::snprintf(ov_str, sizeof(ov_str), "%u %u %u %u %u %u %u %u",
                       cfg.WM, cfg.WN, cfg.WaveM, cfg.WaveN, cfg.TILE, cfg.KU,
-                      cfg.force_vgpr_accum ? 1u : 0u, cfg.pgr, cfg.lb,
+                      cfg.force_vgpr_accum ? 1u : 0u, cfg.pgr);
         setenv("OZ2_FUSED_SHAPE_OVERRIDE", ov_str, 1);
 
         /* ── Correctness check ─────────────────────────────────────────── */
