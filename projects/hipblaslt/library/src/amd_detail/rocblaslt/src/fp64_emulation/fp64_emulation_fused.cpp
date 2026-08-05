@@ -25,6 +25,7 @@
 #include <cstdio>    /* std::fprintf */
 #include <cstdlib>   /* std::getenv, std::abort */
 #include <cstring>   /* std::strcmp  */
+#include <type_traits>  /* std::integral_constant — used by do_crt_at C++17 dispatch */
 
 
 /* =========================================================================
@@ -419,41 +420,95 @@ oz2_fused_TN_kernel(
     /* ── CRT update helper ─────────────────────────────────────────────────────
      * Factored out so both the sequential and pipelined S-loops can reuse it.
      * Performs the TwoSum CRT accumulation for one modulus, given the MFMA
-     * results in C32[] and the per-modulus CRT coefficients.                   */
+     * results in C32[] and the per-modulus CRT coefficients.
+     *
+     * Implementation: inner generic lambda do_crt_at<I> is dispatched via a
+     * switch on s_idx.  Within each case arm, I is a compile-time constant, so
+     * the compiler resolves oz2_neg_mod(I) / oz2_qpi_hi(S-2,I) / etc. to
+     * literal values (no table-load instructions), and the integer modulo
+     * raw % MOD uses the divide-by-constant (mulhi+shift) optimisation rather
+     * than a runtime FP64 rint(dc_raw * im) sequence.
+     *
+     * Symmetric-range adjustment: C '%' truncates toward zero, giving a
+     * remainder in (-MOD, MOD).  Two guarded subtractions bring it into
+     * [-MOD/2, MOD/2], matching the balanced remainder that the downstream
+     * TwoSum CRT expects.  For odd moduli (all except 256) MOD/2 is never
+     * exactly an integer accumulator value, so there is no tie-breaking
+     * ambiguity.  For MOD=256 the boundary value ±128 is treated as +128,
+     * differing from the old rint round-to-even convention by one modulus;
+     * this is absorbed by the final CRT rint reconstruction.                   */
     auto do_crt = [&](mfma_acc_t (&C32)[N_TILES], int s_idx)
                   __attribute__((always_inline)) {
-        const double nm  = oz2_neg_mod(s_idx), im = oz2_inv_mod(s_idx);
-        const double qhi = oz2_qpi_hi(S - 2, s_idx);
-        const double qlo = HAS_LO ? oz2_qpi_lo(S - 2, s_idx) : 0.0;
-        if constexpr (!USE_LDS_ACCUM) {
-            for (int r = 0; r < NREG; ++r) {
-                const double dc_raw = static_cast<double>(
-                    C32[r / NREG_single][r % NREG_single]);
-                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-                const double hi     = dc * qhi;
-                const double new_hi = Zhi_reg[r] + hi;
-                const double err    = hi - (new_hi - Zhi_reg[r]);
-                Zhi_reg[r] = new_hi;
-                if constexpr (HAS_LO) Zlo_reg[r] = fma(dc, qlo, Zlo_reg[r] + err);
-                else                  Zlo_reg[r] += err;
+        /* C++17 generic lambda: the auto parameter is std::integral_constant<int,N>,
+         * so 'constexpr int I = decltype(I_val)::value' is a compile-time constant
+         * inside the body.  The compiler constant-folds all table lookups and emits
+         * a mulhi+shift for the integer modulo — identical to the C++20 template
+         * lambda approach but compatible with -std=c++17.                       */
+        auto do_crt_at = [&](auto s_val) __attribute__((always_inline)) {
+            constexpr int s   = decltype(s_val)::value;   /* compile-time modulus index */
+            const double  qhi = oz2_qpi_hi(S - 2, s);
+            const double  qlo = HAS_LO ? oz2_qpi_lo(S - 2, s) : 0.0;
+            /* p_s is a compile-time integer constant (== modulus[s] > 0);
+             * 'raw % p_s' compiles to a mulhi+shift sequence (no runtime divide). */
+            const int32_t p_s = static_cast<int32_t>(-oz2_neg_mod(s));
+            if constexpr (!USE_LDS_ACCUM) {
+                for (int r = 0; r < NREG; ++r) {
+                    const int32_t raw = C32[r / NREG_single][r % NREG_single];
+                    int32_t rem       = raw % p_s;
+                    if (rem >  p_s / 2) rem -= p_s;     /* adjust to [-p_s/2, p_s/2] */
+                    if (rem < -p_s / 2) rem += p_s;
+                    const double dc     = static_cast<double>(rem);
+                    const double hi     = dc * qhi;
+                    const double new_hi = Zhi_reg[r] + hi;
+                    const double err    = hi - (new_hi - Zhi_reg[r]);
+                    Zhi_reg[r] = new_hi;
+                    if constexpr (HAS_LO) Zlo_reg[r] = fma(dc, qlo, Zlo_reg[r] + err);
+                    else                  Zlo_reg[r] += err;
+                }
+            } else {
+                for (int r = 0; r < NREG; ++r) {
+                    const int idx     = r * BLK_THR + tid;
+                    double Zhi        = Zhi_lds[idx];
+                    double Zlo        = Zlo_lds[idx];
+                    const int32_t raw = C32[r / NREG_single][r % NREG_single];
+                    int32_t rem       = raw % p_s;
+                    if (rem >  p_s / 2) rem -= p_s;
+                    if (rem < -p_s / 2) rem += p_s;
+                    const double dc     = static_cast<double>(rem);
+                    const double hi     = dc * qhi;
+                    const double new_hi = Zhi + hi;
+                    const double err    = hi - (new_hi - Zhi);
+                    Zhi = new_hi;
+                    if constexpr (HAS_LO) Zlo = fma(dc, qlo, Zlo + err);
+                    else                  Zlo += err;
+                    Zhi_lds[idx] = Zhi;
+                    Zlo_lds[idx] = Zlo;
+                }
             }
-        } else {
-            for (int r = 0; r < NREG; ++r) {
-                const int idx = r * BLK_THR + tid;
-                double Zhi = Zhi_lds[idx];
-                double Zlo = Zlo_lds[idx];
-                const double dc_raw = static_cast<double>(
-                    C32[r / NREG_single][r % NREG_single]);
-                const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
-                const double hi     = dc * qhi;
-                const double new_hi = Zhi + hi;
-                const double err    = hi - (new_hi - Zhi);
-                Zhi = new_hi;
-                if constexpr (HAS_LO) Zlo = fma(dc, qlo, Zlo + err);
-                else                  Zlo += err;
-                Zhi_lds[idx] = Zhi;
-                Zlo_lds[idx] = Zlo;
-            }
+        };
+        /* Uniform/scalar branch: all 64 lanes share s_idx → compiles to a scalar
+         * jump table with essentially zero per-lane overhead.
+         * std::integral_constant<int,N>{} passes N as a compile-time constant to
+         * the generic lambda (C++17 pattern replacing C++20 template lambdas).  */
+        switch (s_idx) {
+            case  0: do_crt_at(std::integral_constant<int, 0>{}); break;
+            case  1: do_crt_at(std::integral_constant<int, 1>{}); break;
+            case  2: do_crt_at(std::integral_constant<int, 2>{}); break;
+            case  3: do_crt_at(std::integral_constant<int, 3>{}); break;
+            case  4: do_crt_at(std::integral_constant<int, 4>{}); break;
+            case  5: do_crt_at(std::integral_constant<int, 5>{}); break;
+            case  6: do_crt_at(std::integral_constant<int, 6>{}); break;
+            case  7: do_crt_at(std::integral_constant<int, 7>{}); break;
+            case  8: do_crt_at(std::integral_constant<int, 8>{}); break;
+            case  9: do_crt_at(std::integral_constant<int, 9>{}); break;
+            case 10: do_crt_at(std::integral_constant<int,10>{}); break;
+            case 11: do_crt_at(std::integral_constant<int,11>{}); break;
+            case 12: do_crt_at(std::integral_constant<int,12>{}); break;
+            case 13: do_crt_at(std::integral_constant<int,13>{}); break;
+            case 14: do_crt_at(std::integral_constant<int,14>{}); break;
+            case 15: do_crt_at(std::integral_constant<int,15>{}); break;
+            case 16: do_crt_at(std::integral_constant<int,16>{}); break;
+            case 17: do_crt_at(std::integral_constant<int,17>{}); break;
         }
     };
 
@@ -573,7 +628,13 @@ oz2_fused_TN_kernel(
     /* ── S-loop: iterate over moduli ───────────────────────────────────────────
      * Sequential: K-loop then CRT for each modulus.  The compiler's instruction
      * scheduler naturally overlaps FP64 CRT ops with the MFMA pipeline drain
-     * (confirmed by ISA analysis — see PLR investigation notes).     */
+     * (confirmed by ISA analysis — see PLR investigation notes).
+     * #pragma unroll 1: prevent full unrolling of this loop.  S is a compile-time
+     * constant so without this pragma Clang/LLVM would emit S copies of the entire
+     * run_kloop+do_crt body, causing excessive binary size growth.  The switch
+     * inside do_crt already provides per-iteration compile-time constant dispatch,
+     * so unrolling the S-loop gives no additional benefit.                    */
+    #pragma unroll 1
     for (int s = 0; s < S; ++s) {
         mfma_acc_t C32[N_TILES] = {};
         run_kloop(s, C32);
