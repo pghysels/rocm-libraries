@@ -332,13 +332,17 @@ def perf_model_times(
 
     t_host = OZ2_HOST_OVERHEAD_S
 
-    # ADP (dynamic precision selection) overhead — includes two small
-    # reduction kernels and one hipStreamSynchronize round-trip.
+    # ADP (dynamic precision selection) overhead — two tiny reduction kernels
+    # followed by a hipStreamSynchronize roundtrip.
+    #   oz2_adp_reduce_A reads row_max[m]  (~m × 4 bytes, negligible)
+    #   oz2_adp_reduce_B reads col_max[n]  (~n × 4 bytes, negligible)
+    #     — col_max[] is precomputed by oz2_col_max_kernel (charged to t_refine);
+    #       adp_reduce_B no longer reads the full m×n C32i matrix.
+    # Bottleneck is entirely the CPU-GPU hipStreamSynchronize roundtrip.
     if dynamic_mode:
         t_adp = (
-            LATENCY_KERNEL                            # oz2_adp_reduce_A
-            + max(4.0 * mn / c0, LATENCY_KERNEL)     # oz2_adp_reduce_B
-            + LATENCY_SYNC                            # hipStreamSynchronize
+            2.0 * LATENCY_KERNEL   # oz2_adp_reduce_A + oz2_adp_reduce_B (both tiny)
+            + LATENCY_SYNC         # hipStreamSynchronize — dominant cost
         )
     else:
         t_adp = 0.0
