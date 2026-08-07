@@ -38,11 +38,13 @@ int main(int argc, char** argv)
 {
     int warmup = 2;
     int64_t M = 32768, N = 32768, K = 32768;
+    bool adp_mode = false;  /* --adp: use DYNAMIC mantissa control (adaptive S) instead of FIXED S=16 */
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--warmup") && i+1 < argc) warmup = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--m") && i+1 < argc) M = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--n") && i+1 < argc) N = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "--k") && i+1 < argc) K = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "--adp")) adp_mode = true;
     }
 
     /* Mandatory env vars */
@@ -60,11 +62,19 @@ int main(int argc, char** argv)
     HLT_CHECK(hipblasLtCreate(&h));
     HLT_CHECK(hipblasLtSetEmulationEnabled(h, true));
     HLT_CHECK(hipblasLtSetEmulationStrategy(h, HIPBLASLT_EMULATION_STRATEGY_EAGER));
-    /* Fix s=16 so OZ2_FUSED_SHAPE_OVERRIDE dispatches the correct kernel
-     * and the num_moduli==16 guard in oz2_launch_fused_TN does not abort. */
-    HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-        h, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
-    HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(h, 118)); /* s=16 */
+    if (adp_mode) {
+        /* Adaptive (DYNAMIC) mode: let the library choose S per-problem via ADP kernels.
+         * Do NOT fix S=16 — this enables oz2_adp_reduce_* kernel calls.             */
+        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
+            h, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC));
+        std::fprintf(stderr, "Mantissa mode: DYNAMIC (adaptive S, ADP kernels enabled)\n");
+    } else {
+        /* Fixed S=16: required for OZ2_FUSED_SHAPE_OVERRIDE and the fused kernel guard. */
+        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
+            h, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
+        HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(h, 118)); /* s=16 */
+        std::fprintf(stderr, "Mantissa mode: FIXED S=16\n");
+    }
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
