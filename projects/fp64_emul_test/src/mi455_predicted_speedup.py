@@ -70,6 +70,7 @@ _EFF = {
 }
 EFF_REFINE = 0.511
 EFF_ACCUM  = 0.775
+EFF_FUSED  = 0.66    # fused kernel INT8 MFMA efficiency (applied to compute only, not BW)
 
 # =============================================================================
 # 2.  Hardware parameter sets
@@ -154,6 +155,23 @@ def oz2_compute_chunk_size(m: int, n: int, k: int, s: int) -> int:
     return max(1, chunk)
 
 
+def oz2_compute_chunk_size_fused(m: int, n: int, k: int, s: int) -> int:
+    """
+    Fused-kernel chunk size: excludes C32i from workspace budget (INT8 products
+    stay in GPU registers).  Mirrors oz2_compute_chunk_size_fused() in
+    fp64_emulation.cpp — typically returns s for all practical shapes, so the
+    scale kernel processes all moduli in a single pass and binary-halving is
+    rarely triggered.
+    """
+    lda8i  = oz2_pad(k)
+    cola8i = oz2_pad(m)
+    slc    = lda8i * cola8i + lda8i * n   # A8i + B8i per modulus (no C32i)
+    chunk  = s
+    if slc > 0:
+        chunk = min(chunk, OZ2_CHUNK_TARGET_BYTES // slc)
+    return max(1, chunk)
+
+
 def oz2_effective_time(
     tA: bool,
     tB: bool,
@@ -163,6 +181,7 @@ def oz2_effective_time(
     num_moduli: int,
     hw: dict,
     dynamic_mode: bool = False,
+    use_fused: bool = False,
 ) -> float:
     """
     Python reimplementation of oz2_effective_time_ms() from fp64_emulation.cpp.
@@ -176,10 +195,16 @@ def oz2_effective_time(
     If t_split < t_mono the split is taken (recursively).
 
     This exactly mirrors the logic in fp64EmulatedGemmImpl / oz2_effective_time_ms.
+    When use_fused=True the fused chunk formula is used for the splitting decision,
+    mirroring the fused_forced branch in fp64EmulationWorkspaceSize.
     """
-    t_mono = perf_model_times(tA, tB, m, n, k, num_moduli, hw, dynamic_mode)["t_total"]
+    t_mono = perf_model_times(tA, tB, m, n, k, num_moduli, hw, dynamic_mode,
+                              use_fused=use_fused)["t_total"]
 
-    chunk_sz = oz2_compute_chunk_size(m, n, k, num_moduli)
+    if use_fused:
+        chunk_sz = oz2_compute_chunk_size_fused(m, n, k, num_moduli)
+    else:
+        chunk_sz = oz2_compute_chunk_size(m, n, k, num_moduli)
     n_chunks = math.ceil(num_moduli / chunk_sz)
 
     if n_chunks > 1:
@@ -188,7 +213,8 @@ def oz2_effective_time(
         half_n  = n       if split_m else n // 2
 
         t_split = 2.0 * oz2_effective_time(
-            tA, tB, half_m, half_n, k, num_moduli, hw, dynamic_mode
+            tA, tB, half_m, half_n, k, num_moduli, hw, dynamic_mode,
+            use_fused=use_fused
         )
         if t_split < t_mono:
             return t_split
@@ -208,14 +234,17 @@ def perf_model_times(
     num_moduli: int,
     hw: dict,
     dynamic_mode: bool = False,
+    use_fused: bool = False,
 ) -> dict:
     """
     Python reimplementation of fp64EmulationPerfModelTimes() from
     fp64_emulation.cpp.
 
-    Uses the MONOLITHIC path with the fused kernel DISABLED
-    (HIPBLASLT_EMULATION_FUSED=off), and no recursive splitting —
-    exactly the path described by the task specification.
+    When use_fused=False (default): monolithic path with fused kernel DISABLED.
+    When use_fused=True: models the fused MFMA+CRT kernel path.  The fused
+    kernel reads pre-scaled INT8 A8i/B8i from workspace, performs MFMA + CRT
+    accumulation in registers, and writes FP64 D directly.  The scale kernel
+    still runs; only INT8 GEMMs + accum are replaced.
 
     Parameters
     ----------
@@ -224,12 +253,13 @@ def perf_model_times(
     num_moduli    : s  (number of Ozaki-II CRT moduli)
     hw            : hardware parameter dict with keys 'latency', 'ai', 'ratio'
     dynamic_mode  : if True, include ADP hipStreamSynchronize overhead
+    use_fused     : if True, model the fused MFMA+CRT kernel
 
     Returns
     -------
     dict with keys:
         t_prelim_kern, t_prelim_gemm, t_refine_kern, t_adp,
-        t_scale_kern, t_int8_gemms, t_accum_kern, t_host,
+        t_scale_kern, t_int8_gemms, t_accum_kern, t_fused_kern, t_host,
         t_total   (sum of all emulation components, seconds)
         t_native  (predicted native DGEMM time, seconds)
     All times are in seconds.
@@ -248,7 +278,11 @@ def perf_model_times(
     kn  = float(k) * float(n)
     mnk = mn * float(k)
 
-    chunk_sz       = float(oz2_compute_chunk_size(m, n, k, num_moduli))
+    # Choose chunk formula: fused path excludes C32i, allowing a larger chunk
+    if use_fused:
+        chunk_sz = float(oz2_compute_chunk_size_fused(m, n, k, num_moduli))
+    else:
+        chunk_sz = float(oz2_compute_chunk_size(m, n, k, num_moduli))
     n_chunks       = math.ceil(s / chunk_sz)
     n_scale_chunks = n_chunks  # scale and GEMM share the same chunk
 
@@ -309,14 +343,35 @@ def perf_model_times(
     else:
         t_adp = 0.0
 
-    # ── Total emulation time (monolithic, non-fused) ─────────────────────────
+    # ── Fused kernel: replaces INT8 GEMMs + accum when faster ────────────────
+    # Reads:  s × INT8 A8i + s × INT8 B8i  (s*(mk+kn) bytes)
+    #         FP64 C input (8*mn bytes, when beta≠0) + FP64 D output (8*mn bytes)
+    # Compute: MFMA  s×2×mnk ops at INT8 throughput c2
+    #          CRT   s×8×mn  FP64 ops at FP64 throughput c1
+    # Fused kernel bandwidth: reads s×INT8 A8i/B8i, writes FP64 D (+ optional C read).
+    t_fused_bw   = (s * (mk + kn) + 16.0 * mn) / c0
+    # Fused kernel MFMA compute: s×2×mnk INT8 ops at effective throughput c2×EFF_FUSED.
+    t_fused_int8 = s * 2.0 * mnk / (c2 * EFF_FUSED)
+    # CRT FP64 accumulation is done in registers; on CDNA VALU FP64 dual-issues
+    # alongside MFMA, so CRT compute is hidden.  The non-fused t_accum_kern model
+    # also treats the CRT as BW-bound (ignoring its FP64 compute cost), so for
+    # consistency we do the same here: t_fused_fp64 is excluded from t_fused_kern.
+    t_fused_fp64 = s * 8.0 * mn / c1  # informational only — not added to t_fused_kern
+    t_fused_kern = max(t_fused_bw, t_fused_int8) + LATENCY_KERNEL
+
+    # Select GEMM+accum time: use fused when requested and faster
+    if use_fused:
+        t_gemm_accum = min(t_int8_gemms + t_accum_kern, t_fused_kern)
+    else:
+        t_gemm_accum = t_int8_gemms + t_accum_kern
+
+    # ── Total emulation time ──────────────────────────────────────────────────
     t_total = (
         t_prelim_kern
         + t_prelim_gemm
         + t_refine_kern
         + t_scale_kern
-        + t_int8_gemms
-        + t_accum_kern
+        + t_gemm_accum
         + t_host
         + t_adp
     )
@@ -337,6 +392,7 @@ def perf_model_times(
         "t_scale_kern":  t_scale_kern,
         "t_int8_gemms":  t_int8_gemms,
         "t_accum_kern":  t_accum_kern,
+        "t_fused_kern":  t_fused_kern,
         "t_host":        t_host,
         "t_total":       t_total,
         "t_native":      t_native,
@@ -346,6 +402,34 @@ def perf_model_times(
 # 5.  Heatmap computation
 # =============================================================================
 
+def compute_time_ratio_grid(
+    hw: dict,
+    mn_vals: np.ndarray,
+    k_vals:  np.ndarray,
+    num_moduli: int = 16,
+    tA: bool = True,
+    tB: bool = False,
+) -> np.ndarray:
+    """
+    Return a 2D array  ratio[i, j] = t_split_emul / t_fused_emul (unclamped).
+
+    Values > 1 where the fused kernel is faster than the non-fused
+    recursive-splitting path, < 1 where it is slower.  Unlike the clamped
+    speedup grids (which both equal 1.0 wherever emulation loses to native
+    DGEMM), this ratio varies over the full grid and exposes the fused
+    kernel's C32i I/O savings even in regions where native DGEMM wins.
+    """
+    ratio = np.empty((len(k_vals), len(mn_vals)), dtype=float)
+    for i, k in enumerate(k_vals):
+        for j, mn in enumerate(mn_vals):
+            t_split = oz2_effective_time(tA, tB, int(mn), int(mn), int(k),
+                                         num_moduli, hw, use_fused=False)
+            t_fused = oz2_effective_time(tA, tB, int(mn), int(mn), int(k),
+                                         num_moduli, hw, use_fused=True)
+            ratio[i, j] = t_split / max(t_fused, 1e-30)
+    return ratio
+
+
 def compute_speedup_grid(
     hw: dict,
     mn_vals: np.ndarray,   # m=n values (X-axis)
@@ -354,6 +438,7 @@ def compute_speedup_grid(
     tA: bool = True,
     tB: bool = False,
     use_splitting: bool = False,
+    use_fused: bool = False,
 ) -> np.ndarray:
     """
     Return a 2D array  speedup[i, j] = max(1, t_native / t_emul)
@@ -363,15 +448,17 @@ def compute_speedup_grid(
     oz2_effective_time() which mirrors the recursive binary-halving in
     oz2_effective_time_ms() / fp64EmulatedGemmImpl from fp64_emulation.cpp.
     When use_splitting=False (default) the original monolithic model is used.
+    When use_fused=True the fused MFMA+CRT kernel model is used instead of
+    the separate INT8 GEMM + accumulation kernels.
     """
     speedup = np.empty((len(k_vals), len(mn_vals)), dtype=float)
     for i, k in enumerate(k_vals):
         for j, mn in enumerate(mn_vals):
             t = perf_model_times(tA, tB, int(mn), int(mn), int(k),
-                                 num_moduli, hw)
+                                 num_moduli, hw, use_fused=use_fused)
             if use_splitting:
                 t_emul = oz2_effective_time(tA, tB, int(mn), int(mn), int(k),
-                                            num_moduli, hw)
+                                            num_moduli, hw, use_fused=use_fused)
             else:
                 t_emul = t["t_total"]
             speedup[i, j] = max(1.0, t["t_native"] / t_emul)
@@ -387,7 +474,18 @@ _LOG_CANDIDATES = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0,
 
 
 def _build_levels(sp_max: float) -> list:
-    """Discrete colour levels spanning [1, sp_max]."""
+    """Discrete colour levels spanning [1, sp_max].
+
+    For narrow speedup ranges (sp_max ≤ 3) use a 0.2-step linear grid so that
+    chips like MI355X (max ≈ 2.2×) get ~6-8 distinct colour bands rather than
+    the 3 bands that the sparse log candidates would produce.  For wider ranges
+    fall back to the log-spaced _LOG_CANDIDATES list.
+    """
+    if sp_max <= 3.0:
+        candidates = [round(1.0 + 0.1 * i, 1) for i in range(22)]  # 1.0, 1.1, …, 3.1
+        return sorted(set(
+            [l for l in candidates if 1.0 <= l <= sp_max] + [sp_max]
+        ))
     return sorted(set(
         [l for l in _LOG_CANDIDATES if l <= sp_max * 1.05] + [1.0, sp_max]
     ))
@@ -416,16 +514,6 @@ def _draw_heatmap(ax, speedup: np.ndarray, mn_vals: np.ndarray,
     im = ax.pcolormesh(k_vals, mn_vals, speedup_T, cmap=cmap, norm=norm,
                        shading="nearest")
 
-    for j_mn, mn in enumerate(mn_vals):
-        for i_k, k in enumerate(k_vals):
-            val = speedup_T[j_mn, i_k]
-            label = f"{round(val)}"
-            rgba  = np.array(cmap(norm(val)))
-            lum   = 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]
-            tcolor = "white" if lum < 0.45 else "black"
-            ax.text(k, mn, label, ha="center", va="center",
-                    fontsize=6.5, color=tcolor, fontweight="normal",
-                    transform=ax.transData)
 
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -453,7 +541,7 @@ def _draw_heatmap(ax, speedup: np.ndarray, mn_vals: np.ndarray,
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Predicted MI455 FP64 emulation speedup heatmap"
+        description="Predicted FP64 GEMM emulation speedup heatmap (all or one HW config)"
     )
     parser.add_argument("--out-dir", default="plots",
                         help="Output directory for PNG/PDF (default: plots/)")
@@ -466,6 +554,14 @@ def main() -> None:
     parser.add_argument("--recursive-split", action="store_true", default=False,
                         help="Account for recursive binary-halving (mirrors "
                              "oz2_effective_time_ms in fp64_emulation.cpp)")
+    parser.add_argument("--hw", default="all",
+                        help="Hardware config to plot. 'all' (default) generates "
+                             "plots for every entry in HW_PARAMS. Or specify one "
+                             "of: " + ", ".join(HW_PARAMS))
+    parser.add_argument("--fused", action="store_true", default=False,
+                        help="Also generate fused-kernel speedup plots, modelling "
+                             "the oz2_fused_TN_kernel that fuses INT8 MFMA + CRT "
+                             "accumulation (HIPBLASLT_EMULATION_FUSED=on path).")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -480,97 +576,176 @@ def main() -> None:
         np.logspace(np.log10(512), np.log10(65536), args.n_pts)
     ).astype(int))
 
-    hw = HW_PARAMS["MI455"]
-    s  = args.num_moduli
-
-    # ── Compute both grids ───────────────────────────────────────────────────
-    print(f"Computing {len(mn_vals)}×{len(k_vals)} monolithic speedup grid "
-          f"for MI455, s={s} …")
-    speedup_mono = compute_speedup_grid(hw, mn_vals, k_vals, num_moduli=s,
-                                        tA=True, tB=False, use_splitting=False)
-    idx_m = int(np.argmax(speedup_mono))
-    print(f"  max speedup = {speedup_mono.max():.3f}×  "
-          f"(at m=n={mn_vals[idx_m % len(mn_vals)]}, "
-          f"k={k_vals[idx_m // len(mn_vals)]})")
-    print(f"  cells with speedup > 1: "
-          f"{(speedup_mono > 1.0).sum()} / {speedup_mono.size}")
-
-    print(f"Computing {len(mn_vals)}×{len(k_vals)} recursive-splitting speedup "
-          f"grid for MI455, s={s} …")
-    speedup_split = compute_speedup_grid(hw, mn_vals, k_vals, num_moduli=s,
-                                         tA=True, tB=False, use_splitting=True)
-    idx_s = int(np.argmax(speedup_split))
-    print(f"  max speedup = {speedup_split.max():.3f}×  "
-          f"(at m=n={mn_vals[idx_s % len(mn_vals)]}, "
-          f"k={k_vals[idx_s // len(mn_vals)]})")
-    print(f"  cells with speedup > 1: "
-          f"{(speedup_split > 1.0).sum()} / {speedup_split.size}")
-
-    # Count cells that benefit from splitting
-    n_split_cells = int(np.sum(speedup_split > speedup_mono + 1e-9))
-    print(f"  cells improved by splitting: {n_split_cells} / {speedup_mono.size}")
-
-    # ── Shared colormap / levels ─────────────────────────────────────────────
-    sp_max_combined = max(speedup_mono.max(), speedup_split.max())
-    levels = _build_levels(sp_max_combined)
-    cmap   = plt.get_cmap("coolwarm")
-    norm   = BoundaryNorm(levels, ncolors=cmap.N, clip=True)
-
-    # ── Individual figures ───────────────────────────────────────────────────
-    for speedup, use_split in [(speedup_mono, False), (speedup_split, True)]:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        im = _draw_heatmap(ax, speedup, mn_vals, k_vals, cmap, norm, levels,
-                           show_ylabel=True)
-        cbar = fig.colorbar(im, ax=ax, pad=0.02, extend="neither")
-        cbar.set_label("Predicted speedup", fontsize=9)
-        cbar.set_ticks(levels)
-        cbar.set_ticklabels([f"{l:.1f}×" for l in levels])
-        cbar.ax.tick_params(labelsize=8)
-        split_suffix = ", recursive splitting" if use_split else ""
-        ax.set_title(
-            f"Predicted FP64 emulation (s={s}) speedup over native (SIMD) DGEMM"
-            f"{split_suffix}",
-            fontsize=12,
+    # ── Determine which HW configs to run ────────────────────────────────────
+    if args.hw == "all":
+        hw_configs = HW_PARAMS
+    elif args.hw in HW_PARAMS:
+        hw_configs = {args.hw: HW_PARAMS[args.hw]}
+    else:
+        raise SystemExit(
+            f"Unknown --hw '{args.hw}'. Valid choices: all, "
+            + ", ".join(HW_PARAMS)
         )
-        fig.tight_layout()
-        stem = f"mi455_predicted_speedup_s{s}" + ("_split" if use_split else "")
+
+    s = args.num_moduli
+
+    for hw_name, hw in hw_configs.items():
+        hw_slug = hw_name.lower()   # e.g. "mi455", "mi300x"
+
+        # ── Compute both grids ───────────────────────────────────────────────
+        print(f"\n[{hw_name}] Computing {len(mn_vals)}×{len(k_vals)} monolithic "
+              f"speedup grid, s={s} …")
+        speedup_mono = compute_speedup_grid(hw, mn_vals, k_vals, num_moduli=s,
+                                            tA=True, tB=False, use_splitting=False)
+        idx_m = int(np.argmax(speedup_mono))
+        print(f"  max speedup = {speedup_mono.max():.3f}×  "
+              f"(at m=n={mn_vals[idx_m % len(mn_vals)]}, "
+              f"k={k_vals[idx_m // len(mn_vals)]})")
+        print(f"  cells with speedup > 1: "
+              f"{(speedup_mono > 1.0).sum()} / {speedup_mono.size}")
+
+        print(f"[{hw_name}] Computing {len(mn_vals)}×{len(k_vals)} recursive-"
+              f"splitting speedup grid, s={s} …")
+        speedup_split = compute_speedup_grid(hw, mn_vals, k_vals, num_moduli=s,
+                                             tA=True, tB=False, use_splitting=True)
+        idx_s = int(np.argmax(speedup_split))
+        print(f"  max speedup = {speedup_split.max():.3f}×  "
+              f"(at m=n={mn_vals[idx_s % len(mn_vals)]}, "
+              f"k={k_vals[idx_s // len(mn_vals)]})")
+        print(f"  cells with speedup > 1: "
+              f"{(speedup_split > 1.0).sum()} / {speedup_split.size}")
+
+        # Count cells that benefit from splitting
+        n_split_cells = int(np.sum(speedup_split > speedup_mono + 1e-9))
+        print(f"  cells improved by splitting: {n_split_cells} / {speedup_mono.size}")
+
+        # ── Optional fused-kernel grid ───────────────────────────────────────
+        speedup_fused = None
+        if args.fused:
+            print(f"[{hw_name}] Computing {len(mn_vals)}×{len(k_vals)} fused-"
+                  f"kernel speedup grid, s={s} …")
+            speedup_fused = compute_speedup_grid(hw, mn_vals, k_vals, num_moduli=s,
+                                                 tA=True, tB=False,
+                                                 use_splitting=True, use_fused=True)
+            idx_f = int(np.argmax(speedup_fused))
+            print(f"  max speedup = {speedup_fused.max():.3f}×  "
+                  f"(at m=n={mn_vals[idx_f % len(mn_vals)]}, "
+                  f"k={k_vals[idx_f // len(mn_vals)]})")
+            print(f"  cells with speedup > 1: "
+                  f"{(speedup_fused > 1.0).sum()} / {speedup_fused.size}")
+            n_fused_better = int(np.sum(speedup_fused > speedup_split + 1e-9))
+            print(f"  cells improved by fused kernel: {n_fused_better} / {speedup_mono.size}")
+
+        # ── Shared colormap / levels ─────────────────────────────────────────
+        all_grids = [speedup_mono, speedup_split]
+        if speedup_fused is not None:
+            all_grids.append(speedup_fused)
+        sp_max_combined = max(g.max() for g in all_grids)
+        levels = _build_levels(sp_max_combined)
+        cmap   = plt.get_cmap("coolwarm")
+        norm   = BoundaryNorm(levels, ncolors=cmap.N, clip=True)
+
+        title_base = (
+            f"Predicted FP64 emulation (s={s}) speedup over native DGEMM"
+            f" — {hw_name}"
+        )
+
+        def _save_individual(speedup, label, stem_suffix):
+            fig, ax = plt.subplots(figsize=(8, 6))
+            im = _draw_heatmap(ax, speedup, mn_vals, k_vals, cmap, norm, levels,
+                               show_ylabel=True)
+            cbar = fig.colorbar(im, ax=ax, pad=0.02, extend="neither")
+            cbar.set_label("Predicted speedup", fontsize=9)
+            cbar.set_ticks(levels)
+            cbar.set_ticklabels([f"{l:.1f}×" for l in levels])
+            cbar.ax.tick_params(labelsize=8)
+            ax.set_title(title_base + (f", {label}" if label else ""), fontsize=11)
+            fig.tight_layout()
+            stem = f"{hw_slug}_predicted_speedup_s{s}{stem_suffix}"
+            for ext in ("png", "pdf"):
+                out = os.path.join(args.out_dir, f"{stem}.{ext}")
+                fig.savefig(out, dpi=150, bbox_inches="tight")
+                print(f"Saved  {out}")
+            plt.close(fig)
+
+        # ── Individual figures ───────────────────────────────────────────────
+        _save_individual(speedup_mono,  "",                    "")
+        _save_individual(speedup_split, "recursive splitting", "_split")
+        if speedup_fused is not None:
+            _save_individual(speedup_fused, "fused kernel", "_fused")
+
+        # ── Combined comparison figure ────────────────────────────────────────
+        if speedup_fused is not None:
+            # Ratio: raw emulation-time ratio t_split / t_fused (unclamped).
+            # Uses actual emulation times so the ratio varies everywhere —
+            # not just in cells where emulation beats native DGEMM.
+            print(f"[{hw_name}] Computing {len(mn_vals)}×{len(k_vals)} "
+                  f"fused/non-fused time ratio grid, s={s} …")
+            ratio_grid   = compute_time_ratio_grid(hw, mn_vals, k_vals, num_moduli=s,
+                                                   tA=True, tB=False)
+            ratio_max    = max(ratio_grid.max(), 1.001)
+            ratio_levels = _build_levels(ratio_max)
+            ratio_cmap   = plt.get_cmap("YlOrRd")
+            ratio_norm   = BoundaryNorm(ratio_levels, ncolors=ratio_cmap.N, clip=True)
+
+            # 2×2 layout: (a) mono  | (b) split
+            #              (c) fused | (d) fused/non-fused ratio
+            fig2, axes2 = plt.subplots(2, 2, figsize=(10, 8), constrained_layout=True)
+            ax_a, ax_b = axes2[0]
+            ax_c, ax_d = axes2[1]
+
+            im_a = _draw_heatmap(ax_a, speedup_mono,  mn_vals, k_vals, cmap, norm,
+                                 levels, show_ylabel=True)
+            im_b = _draw_heatmap(ax_b, speedup_split, mn_vals, k_vals, cmap, norm,
+                                 levels, show_ylabel=True)
+            im_c = _draw_heatmap(ax_c, speedup_fused, mn_vals, k_vals, cmap, norm,
+                                 levels, show_ylabel=True)
+            im_d = _draw_heatmap(ax_d, ratio_grid, mn_vals, k_vals,
+                                 ratio_cmap, ratio_norm, ratio_levels, show_ylabel=True)
+
+            ax_a.set_title("(a) Monolithic", fontsize=11)
+            ax_b.set_title("(b) Recursive splitting", fontsize=11)
+            ax_c.set_title("(c) Fused kernel", fontsize=11)
+            ax_d.set_title("(d) Fused / non-fused ratio", fontsize=11)
+
+            # Individual colorbars per panel
+            for ax_p, im_p, lev, clabel, fmt in [
+                (ax_a, im_a, levels,       "Speedup over native DGEMM", "{:.1f}×"),
+                (ax_b, im_b, levels,       "Speedup over native DGEMM", "{:.1f}×"),
+                (ax_c, im_c, levels,       "Speedup over native DGEMM", "{:.1f}×"),
+                (ax_d, im_d, ratio_levels, "Fused / non-fused ratio",   "{:.2f}×"),
+            ]:
+                cb = fig2.colorbar(im_p, ax=ax_p, pad=0.02, extend="neither")
+                cb.set_label(clabel, fontsize=8)
+                cb.set_ticks(lev)
+                cb.set_ticklabels([fmt.format(l) for l in lev])
+                cb.ax.tick_params(labelsize=7)
+
+        else:
+            # Two-panel: monolithic | recursive splitting
+            fig2, (ax_mono2, ax_split2) = plt.subplots(
+                1, 2, figsize=(8, 4), constrained_layout=True)
+            _draw_heatmap(ax_mono2,  speedup_mono,  mn_vals, k_vals, cmap, norm,
+                          levels, show_ylabel=True)
+            im2 = _draw_heatmap(ax_split2, speedup_split, mn_vals, k_vals, cmap, norm,
+                                levels, show_ylabel=False)
+            ax_mono2.set_title("(a) Monolithic", fontsize=11)
+            ax_split2.set_title("(b) Recursive splitting", fontsize=11)
+
+            cbar2 = fig2.colorbar(im2, ax=ax_split2, pad=0.02, extend="neither")
+            cbar2.set_label("Predicted speedup over native DGEMM", fontsize=9)
+            cbar2.set_ticks(levels)
+            cbar2.set_ticklabels([f"{l:.1f}×" for l in levels])
+            cbar2.ax.tick_params(labelsize=8)
+
+        fig2.suptitle(title_base, fontsize=12)
+
+        stem2 = f"{hw_slug}_predicted_speedup_s{s}_comparison"
         for ext in ("png", "pdf"):
-            out = os.path.join(args.out_dir, f"{stem}.{ext}")
-            fig.savefig(out, dpi=150, bbox_inches="tight")
-            print(f"Saved  {out}")
-        plt.close(fig)
-
-    # ── Combined side-by-side figure ─────────────────────────────────────────
-    fig2, (ax_mono, ax_split) = plt.subplots(
-        1, 2, figsize=(8, 4), constrained_layout=True
-    )
-
-    _draw_heatmap(ax_mono,  speedup_mono,  mn_vals, k_vals, cmap, norm, levels,
-                  show_ylabel=True)
-    im2 = _draw_heatmap(ax_split, speedup_split, mn_vals, k_vals, cmap, norm, levels,
-                        show_ylabel=False)
-
-    ax_mono.set_title("(a) Monolithic", fontsize=11)
-    ax_split.set_title("(b) Recursive splitting", fontsize=11)
-
-    # Single shared colorbar to the right of the right panel
-    cbar2 = fig2.colorbar(im2, ax=ax_split, pad=0.02, extend="neither")
-    cbar2.set_label("Predicted speedup over native (SIMD) DGEMM", fontsize=9)
-    cbar2.set_ticks(levels)
-    cbar2.set_ticklabels([f"{l:.1f}×" for l in levels])
-    cbar2.ax.tick_params(labelsize=8)
-
-    fig2.suptitle(
-        f"Predicted FP64 emulation (s={s}) speedup over native (SIMD) DGEMM",
-        fontsize=12,
-    )
-
-    stem2 = f"mi455_predicted_speedup_s{s}_comparison"
-    for ext in ("png", "pdf"):
-        out2 = os.path.join(args.out_dir, f"{stem2}.{ext}")
-        fig2.savefig(out2, dpi=150, bbox_inches="tight")
-        print(f"Saved  {out2}")
-    plt.close(fig2)
+            out2 = os.path.join(args.out_dir, f"{stem2}.{ext}")
+            fig2.savefig(out2, dpi=150, bbox_inches="tight")
+            print(f"Saved  {out2}")
+        plt.close(fig2)
 
 
 if __name__ == "__main__":
