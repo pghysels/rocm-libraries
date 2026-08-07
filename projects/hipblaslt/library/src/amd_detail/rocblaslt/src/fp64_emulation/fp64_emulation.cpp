@@ -1723,7 +1723,7 @@ oz2_accum_finalize_kernel_rt(const int32_t* __restrict__ C32i_batch,
 template <bool HAS_LO, unsigned CHUNK_SIZE, bool IS_FIRST_CHUNK>
 __global__ static void
 oz2_chunk_accum_kernel(const int32_t* __restrict__ C32i_batch,
-                       double* __restrict__ Zhi, double* __restrict__ Zlo,
+                       double* __restrict__ Zhi_out, double* __restrict__ Zlo_out,
                        int64_t m, int64_t n, size_t ldc32i, unsigned chunk_start, unsigned effective_s)
 {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1731,27 +1731,39 @@ oz2_chunk_accum_kernel(const int32_t* __restrict__ C32i_batch,
     if(i >= m || l >= n) return;
     const size_t idx          = static_cast<size_t>(i) + static_cast<size_t>(l) * ldc32i;
     const size_t slice_stride = ldc32i * static_cast<size_t>(n);
-    double local_hi = 0.0, local_lo = 0.0;
+    /* Two-pass: dc_s[CS] caches balanced residues from independent HBM loads.
+     * Pass 1: all CS loads + rint+fma issued simultaneously (MLP, ~200cy latency);
+     *   FP64 compute overlaps HBM latency. Uses CS×2 VGPRs (~52 for CS=16).
+     * Pass 2: pure register TwoSum, loop-carried dep through Zhi only.
+     * Note: storing dc as int32 (dc_int_s) was tested — same performance at all
+     * sizes (kernel is HBM-bandwidth-limited; higher occupancy does not help). */
+    double dc_s[CHUNK_SIZE];
     #pragma unroll
     for(unsigned t_local = 0; t_local < CHUNK_SIZE; ++t_local) {
         const unsigned t    = chunk_start + t_local;
         const double dc_raw = static_cast<double>(C32i_batch[t_local * slice_stride + idx]);
-        const double dc     = fma(oz2_neg_mod(t), rint(dc_raw * oz2_inv_mod(t)), dc_raw);
+        dc_s[t_local]       = fma(oz2_neg_mod(t), rint(dc_raw * oz2_inv_mod(t)), dc_raw);
+    }
+    double Zhi = 0.0, Zlo = 0.0;
+    #pragma unroll
+    for(unsigned t_local = 0; t_local < CHUNK_SIZE; ++t_local) {
+        const unsigned t    = chunk_start + t_local;
+        const double dc     = dc_s[t_local];
         const double hi     = dc * oz2_qpi_hi(effective_s - 2, t);
-        const double new_hi = local_hi + hi;
-        const double err    = hi - (new_hi - local_hi);
-        local_hi = new_hi;
-        if constexpr (HAS_LO) local_lo = fma(dc, oz2_qpi_lo(effective_s - 2, t), local_lo + err);
-        else                   local_lo += err;
+        const double new_hi = Zhi + hi;
+        const double err    = hi - (new_hi - Zhi);
+        Zhi = new_hi;
+        if constexpr (HAS_LO) Zlo = fma(dc, oz2_qpi_lo(effective_s - 2, t), Zlo + err);
+        else                   Zlo += err;
     }
     if constexpr (IS_FIRST_CHUNK) {
-        __builtin_nontemporal_store(local_hi, Zhi + idx);
-        __builtin_nontemporal_store(local_lo, Zlo + idx);
+        __builtin_nontemporal_store(Zhi, Zhi_out + idx);
+        __builtin_nontemporal_store(Zlo, Zlo_out + idx);
     } else {
-        const double old_hi = Zhi[idx];
-        const double s_hi   = old_hi + local_hi;
-        const double err    = local_hi - (s_hi - old_hi);
-        Zhi[idx] = s_hi; Zlo[idx] += err + local_lo;
+        const double old_hi = Zhi_out[idx];
+        const double s_hi   = old_hi + Zhi;
+        const double err    = Zhi - (s_hi - old_hi);
+        Zhi_out[idx] = s_hi; Zlo_out[idx] += err + Zlo;
     }
 }
 
@@ -1770,29 +1782,37 @@ oz2_accum_finalize_kernel(const int32_t* __restrict__ C32i_batch,
     if(i >= m || l >= n) return;
     const size_t idx          = static_cast<size_t>(i) + static_cast<size_t>(l) * ldc32i;
     const size_t slice_stride = ldc32i * static_cast<size_t>(n);
-    double local_hi = 0.0, local_lo = 0.0;
+    double dc_s[CHUNK_SIZE];
     #pragma unroll
     for(unsigned t_local = 0; t_local < CHUNK_SIZE; ++t_local) {
         const unsigned t    = chunk_start + t_local;
         const double dc_raw = static_cast<double>(C32i_batch[t_local * slice_stride + idx]);
-        const double dc     = fma(oz2_neg_mod(t), rint(dc_raw * oz2_inv_mod(t)), dc_raw);
+        dc_s[t_local]       = fma(oz2_neg_mod(t), rint(dc_raw * oz2_inv_mod(t)), dc_raw);
+    }
+    double Zhi = 0.0, Zlo = 0.0;
+    #pragma unroll
+    for(unsigned t_local = 0; t_local < CHUNK_SIZE; ++t_local) {
+        const unsigned t    = chunk_start + t_local;
+        const double dc     = dc_s[t_local];
         const double hi     = dc * oz2_qpi_hi(effective_s - 2, t);
-        const double new_hi = local_hi + hi;
-        const double err    = hi - (new_hi - local_hi);
-        local_hi = new_hi;
-        if constexpr (HAS_LO) local_lo = fma(dc, oz2_qpi_lo(effective_s - 2, t), local_lo + err);
-        else                   local_lo += err;
+        const double new_hi = Zhi + hi;
+        const double err    = hi - (new_hi - Zhi);
+        Zhi = new_hi;
+        if constexpr (HAS_LO) Zlo = fma(dc, oz2_qpi_lo(effective_s - 2, t), Zlo + err);
+        else                   Zlo += err;
     }
-    double Zh, Zl;
-    if constexpr (IS_FIRST_CHUNK) { Zh = local_hi; Zl = local_lo; }
-    else {
+    /* IS_FIRST_CHUNK=true: Zhi/Zlo already hold the final value (no prior chunk).
+     * IS_FIRST_CHUNK=false: fold the prior Zhi_in/Zlo_in into Zhi/Zlo in-place. */
+    if constexpr (!IS_FIRST_CHUNK) {
         const double old_hi = Zhi_in[idx];
-        const double s_hi   = old_hi + local_hi;
-        const double err    = local_hi - (s_hi - old_hi);
-        Zh = s_hi; Zl = Zlo_in[idx] + err + local_lo;
+        const double s_hi   = old_hi + Zhi;
+        const double err    = Zhi - (s_hi - old_hi);
+        Zhi = s_hi;
+        Zlo = Zlo_in[idx] + err + Zlo;
     }
-    const double q = rint((Zh + Zl) * oz2_inv_P(effective_s - 2));
-    const double X = fma(oz2_P_lo(effective_s - 2), q, fma(oz2_P_hi(effective_s - 2), q, Zh) + Zl);
+    const double q = rint((Zhi + Zlo) * oz2_inv_P(effective_s - 2));
+    const double X = fma(oz2_P_lo(effective_s - 2), q,
+                         fma(oz2_P_hi(effective_s - 2), q, Zhi) + Zlo);
     const int inv_sft = -(static_cast<int>(sftA[i]) + static_cast<int>(sftB[l]));
     const size_t d_idx = static_cast<size_t>(i) + static_cast<size_t>(l) * static_cast<size_t>(ldd);
     double d_val = alpha * ldexp(X, inv_sft);
