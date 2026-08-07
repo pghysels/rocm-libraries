@@ -362,16 +362,16 @@ static Fp64PerfModelTimes fp64EmulationPerfModelTimes(bool tA, bool tB,
     const double t_gemm_accum  = (oz2_fused_mode() != Oz2FusedMode::OFF)
                                ? std::min(t_int8_gemms + t_accum_kern, t_fused)
                                : t_int8_gemms + t_accum_kern;
-    /* ADP (dynamic-mode) overhead: two small reduction kernels (oz2_adp_reduce_A
-     * reads m ints; oz2_adp_reduce_B reads the full m×n C32i matrix), followed by
-     * a hipStreamSynchronize that blocks the CPU until the GPU drains so the host
-     * can inspect the results and choose effective_s.
-     * LATENCY_SYNC is the CPU-GPU roundtrip latency (distinct from the GPU-side
-     * LATENCY_KERNEL or LATENCY_MATMUL scheduling overheads).                  */
+    /* ADP (dynamic-mode) overhead: two tiny reduction kernels followed by a
+     * hipStreamSynchronize that blocks the CPU until the GPU drains.
+     *   oz2_adp_reduce_A reads row_max[m]  (~m × 4 bytes, negligible)
+     *   oz2_adp_reduce_B reads col_max[n]  (~n × 4 bytes, negligible)
+     *     — col_max[] was precomputed by oz2_col_max_kernel (charged to t_refine);
+     *       adp_reduce_B no longer reads the full m×n C32i matrix.
+     * Bottleneck is entirely the CPU-GPU hipStreamSynchronize roundtrip.       */
     const double t_adp = dynamic_mode
-        ? LATENCY_KERNEL                            /* oz2_adp_reduce_A  */
-        + std::max(4.0 * mn / c0, LATENCY_KERNEL)  /* oz2_adp_reduce_B  */
-        + LATENCY_SYNC                              /* hipStreamSynchronize */
+        ? 2.0 * LATENCY_KERNEL   /* oz2_adp_reduce_A + oz2_adp_reduce_B (both tiny) */
+        + LATENCY_SYNC            /* hipStreamSynchronize — dominant cost             */
         : 0.0;
     const double t_total       = t_prelim_kern + t_prelim_gemm + t_refine_kern
                                + t_scale_kern  + t_gemm_accum  + t_host + t_adp;
@@ -720,9 +720,10 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
            + cola8i * sizeof(int16_t)
            + padn   * sizeof(int16_t)
            + sizeof(uint32_t)
-           + cola8i * sizeof(int32_t)
-           + 2 * sizeof(float)      /* ADP float buffer: adp_buf[0..1] (bias ±200) */
-           + OZ2_INT8_GEMM_WS_BYTES; /* INT8 GEMM workspace (preliminary + batch)  */
+           + cola8i * sizeof(int32_t)   /* row_max[m] */
+           + padn   * sizeof(int32_t)   /* col_max[n] — precomputed by partial kernel */
+           + 2 * sizeof(float)          /* ADP float buffer: adp_buf[0..1] (bias ±200) */
+           + OZ2_INT8_GEMM_WS_BYTES;    /* INT8 GEMM workspace (preliminary + batch)  */
 }
 
 unsigned fp64EmulationNumModuli()
@@ -1228,6 +1229,31 @@ oz2_refine_sftA_partial_kernel(const int32_t* __restrict__ C32i,
     if(local_max > 0) atomicMax(row_max + static_cast<size_t>(row), local_max);
 }
 
+/* oz2_col_max_kernel — computes per-column max of |C32i_prelim| and writes col_max[n].
+ * Reads C32i in column-major order (one block per column, 256 threads reduce over rows).
+ * Avoids LDS atomic contention by using a standard block reduction.
+ * Runs in the same stream as oz2_refine_sftA_partial_kernel so both C32i reads
+ * are pipelined; downstream adp_reduce_B and refine_sftB read only the tiny col_max[n]
+ * array (n×4 bytes) instead of the full m×n C32i matrix (reducing ADP overhead ~1.2ms).
+ * Launch: dim3(n) blocks × dim3(256) threads.                                        */
+__global__ static void
+oz2_col_max_kernel(const int32_t* __restrict__ C32i,
+                   int64_t m, size_t ldc32i,
+                   int32_t* __restrict__ col_max)
+{
+    __shared__ int32_t s_wmax[8];
+    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    int32_t local_max = 0;
+    for(int64_t i = threadIdx.x; i < m; i += blockDim.x) {
+        int32_t v  = C32i[static_cast<size_t>(i) + static_cast<size_t>(col) * ldc32i];
+        int32_t av = v < 0 ? -v : v;
+        if(av > local_max) local_max = av;
+    }
+    local_max = warp_reduce_max_abs_i32(local_max);
+    local_max = block_reduce_max_i32(local_max, s_wmax);
+    if(threadIdx.x == 0) col_max[col] = local_max;   /* direct write, no atomicMax needed */
+}
+
 /* ── ADP (Adaptive Precision) helpers ────────────────────────────────────── */
 /* atomicMax for non-negative floats: IEEE 754 positive floats are totally ordered
  * by their integer bit representation, so int-based atomicMax is correct.
@@ -1301,32 +1327,27 @@ oz2_refine_sftA_apply_kernel(const int32_t* __restrict__ row_max,
     sftA[row] += static_cast<int16_t>(floorf(-0.5f * log2f(static_cast<float>(max_val)) + log2P));
 }
 
-/* Computes global max of  (52 − sftB_init[j]) + 0.5·log2(col_max[j]) + 200
- * over all columns j ∈ [0, n).  col_max[j] is the per-column max of |C32i[i,j]|.
- * Does NOT modify sftB[].  Must be launched BEFORE oz2_refine_sftB_kernel
- * so that sftB[] still holds sftB_init (the initial values from step 1b).     */
+/* oz2_adp_reduce_B_kernel — reads the precomputed col_max[j] (NOT the full C32i
+ * matrix) to compute the B-side ADP log2P requirement.  col_max[] is filled by
+ * oz2_refine_sftA_partial_kernel in the same pass that computes row_max[], so
+ * C32i is read only ONCE total instead of three times.
+ *
+ * Each thread handles one column independently — no inter-thread reduction needed.
+ * Launch config: ceil(n/256) blocks × 256 threads.                              */
 __global__ static void
-oz2_adp_reduce_B_kernel(const int32_t* __restrict__ C32i,
-                         int64_t m, int64_t n, size_t ldc32i,
+oz2_adp_reduce_B_kernel(const int32_t* __restrict__ col_max,
+                         int64_t n,
                          const int16_t* __restrict__ sftB_init,
                          float* __restrict__ adp_B_out)
 {
-    __shared__ int32_t s_wmax[8];
-    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    const int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                      + static_cast<int64_t>(threadIdx.x);
     if(col >= n) return;
-    int32_t local_max = 0;
-    for(int64_t i = threadIdx.x; i < m; i += blockDim.x) {
-        int32_t v  = C32i[static_cast<size_t>(i) + static_cast<size_t>(col) * ldc32i];
-        int32_t av = v < 0 ? -v : v;
-        if(av > local_max) local_max = av;
-    }
-    local_max = warp_reduce_max_abs_i32(local_max);
-    local_max = block_reduce_max_i32(local_max, s_wmax);
-    /* Skip zero columns for the same reason as zero rows in the A-side kernel:
-     * col_max == 0 means all preliminary products for this column are zero,
-     * so no CRT precision is needed (leaves adp_B_out at its init value 0.0f). */
-    if(threadIdx.x == 0 && local_max > 0) {
-        const float sftB_f = static_cast<float>(sftB_init[col]);
+    const int32_t local_max = col_max[col];
+    /* Skip zero columns: col_max==0 means all preliminary products for that
+     * column are zero, so no CRT precision is needed for it.                 */
+    if(local_max > 0) {
+        const float sftB_f     = static_cast<float>(sftB_init[col]);
         const float req_biased = (52.0f - sftB_f)
                                + 0.5f * log2f(static_cast<float>(local_max))
                                + 200.0f;
@@ -1334,30 +1355,20 @@ oz2_adp_reduce_B_kernel(const int32_t* __restrict__ C32i,
     }
 }
 
-/* oz2_refine_sftB_kernel — computes per-column max of |C32i_prelim| and applies
- * the shift-refinement delta to sftB[col].  When used in dynamic (ADP) mode, the
- * log2P argument is already the correct value for effective_s (chosen after the
- * ADP reduction above); no separate ADP output is needed here.                */
+/* oz2_refine_sftB_kernel — reads the precomputed col_max[j] (NOT the full C32i
+ * matrix) to apply the shift-refinement delta to sftB[col].
+ * Launch config: ceil(n/256) blocks × 256 threads.                              */
 __global__ static void
-oz2_refine_sftB_kernel(const int32_t* __restrict__ C32i,
-                       int64_t m, int64_t n, size_t ldc32i,
+oz2_refine_sftB_kernel(const int32_t* __restrict__ col_max,
+                       int64_t n,
                        int16_t* __restrict__ sftB, float log2P)
 {
-    __shared__ int32_t s_wmax[8];
-    const int64_t col = static_cast<int64_t>(blockIdx.x);
+    const int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                      + static_cast<int64_t>(threadIdx.x);
     if(col >= n) return;
-    int32_t local_max = 0;
-    for(int64_t i = threadIdx.x; i < m; i += blockDim.x) {
-        int32_t v  = C32i[static_cast<size_t>(i) + static_cast<size_t>(col) * ldc32i];
-        int32_t av = v < 0 ? -v : v;
-        if(av > local_max) local_max = av;
-    }
-    local_max = warp_reduce_max_abs_i32(local_max);
-    local_max = block_reduce_max_i32(local_max, s_wmax);
-    if(threadIdx.x == 0) {
-        if(local_max < 1) local_max = 1;
-        sftB[col] += static_cast<int16_t>(floorf(-0.5f * log2f(static_cast<float>(local_max)) + log2P));
-    }
+    int32_t local_max = col_max[col];
+    if(local_max < 1) local_max = 1;
+    sftB[col] += static_cast<int16_t>(floorf(-0.5f * log2f(static_cast<float>(local_max)) + log2P));
 }
 
 /* =========================================================================
@@ -2068,6 +2079,7 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
     const size_t szSftB  = padn;
     const size_t szNanFlag = 1;
     const size_t szRowMax  = cola8i;
+    const size_t szColMax  = padn;    /* col_max[n] — precomputed by partial kernel */
 
     const size_t wsBytes =
           szA8i    * sizeof(int8_t)
@@ -2099,10 +2111,11 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
     int16_t*  const sftB       = sftA + szSftA;
     uint32_t* const nan_flag   = reinterpret_cast<uint32_t*>(sftB + szSftB);
     int32_t*  const row_max    = reinterpret_cast<int32_t*>(nan_flag + szNanFlag);
-    /* adp_buf and int8_ws follow row_max in the workspace layout.
+    int32_t*  const col_max    = row_max + szRowMax;  /* per-column prelim GEMM maxima */
+    /* adp_buf and int8_ws follow col_max in the workspace layout.
      * Declared here so they are in scope for both the preliminary GEMM
      * and the ADP kernels that come later.                               */
-    float*    const adp_buf    = reinterpret_cast<float*>(row_max + szRowMax);
+    float*    const adp_buf    = reinterpret_cast<float*>(col_max + szColMax);
     void*     const int8_ws    = static_cast<void*>(adp_buf + 2);
     constexpr size_t int8_ws_size = OZ2_INT8_GEMM_WS_BYTES;
     int32_t*  const C32i       = C32i_batch;
@@ -2247,8 +2260,14 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
     unsigned effective_s = num_moduli;
 
     (void)hipMemsetAsync(row_max, 0, szRowMax * sizeof(int32_t), stream);
+    /* col_max is written directly by oz2_col_max_kernel (no atomicMax → no memset needed). */
     hipLaunchKernelGGL(oz2_refine_sftA_partial_kernel, dim3(sftA_m_blks, sftA_n_blks), dim3(64), 0, stream,
                        C32i, m, n, ldc32i, row_max);
+    /* Compute col_max[n] from C32i in a separate kernel (column-major read, no LDS contention).
+     * Runs concurrently with the above in the same stream; both read the same C32i buffer.
+     * adp_reduce_B and refine_sftB then read col_max instead of C32i, saving ~1.2ms in ADP mode. */
+    hipLaunchKernelGGL(oz2_col_max_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, stream,
+                       C32i, m, ldc32i, col_max);
     _pstop(_t_refine);  /* partial: refine_sftA_partial only */
 
     /* ADP (dynamic mode): determine effective_s from the preliminary GEMM result
@@ -2262,9 +2281,10 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
         /* A-side: reads row_max[] and sftA[] before apply_kernel modifies sftA. */
         hipLaunchKernelGGL(oz2_adp_reduce_A_kernel, dim3(sftA_m_blks), dim3(OZ2_PRELIM_COALESC_THRS), 0, stream,
                            row_max, sftA, m, adp_buf + 0);
-        /* B-side: reads C32i and sftB[] before refine_sftB_kernel modifies sftB. */
-        hipLaunchKernelGGL(oz2_adp_reduce_B_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, stream,
-                           C32i, m, n, ldc32i, sftB, adp_buf + 1);
+        /* B-side: reads precomputed col_max[] (not C32i) before refine_sftB_kernel modifies sftB. */
+        hipLaunchKernelGGL(oz2_adp_reduce_B_kernel,
+                           dim3((static_cast<unsigned>(n) + 255u) / 256u), dim3(256), 0, stream,
+                           col_max, n, sftB, adp_buf + 1);
 
         /* Sync, copy 2 floats, compute effective_s on host.
          * hipGetLastError() clears any sticky thread-level error that may have
@@ -2320,8 +2340,9 @@ fp64EmulatedGemmImpl(const _rocblaslt_handle*     h,
     _pstart();
     hipLaunchKernelGGL(oz2_refine_sftA_apply_kernel, dim3(sftA_m_blks), dim3(64), 0, stream,
                        row_max, sftA, m, refine_log2P);
-    hipLaunchKernelGGL(oz2_refine_sftB_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, stream,
-                       C32i, m, n, ldc32i, sftB, refine_log2P);
+    hipLaunchKernelGGL(oz2_refine_sftB_kernel,
+                       dim3((static_cast<unsigned>(n) + 255u) / 256u), dim3(256), 0, stream,
+                       col_max, n, sftB, refine_log2P);
     _pstop(_t_refine);  /* partial: refine_sftA_apply + refine_sftB */
 
     /* ── Scale + Fused/non-fused dispatch ────────────────────────────────────
