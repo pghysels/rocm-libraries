@@ -33,6 +33,7 @@ target_compile_definitions(hipblaslt-fp64-emulation PRIVATE
 target_include_directories(hipblaslt-fp64-emulation PRIVATE
     "${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/include"
     "${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/include"
+    "${PROJECT_SOURCE_DIR}/library/src/amd_detail/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 target_link_libraries(hipblaslt PRIVATE hipblaslt-fp64-emulation)

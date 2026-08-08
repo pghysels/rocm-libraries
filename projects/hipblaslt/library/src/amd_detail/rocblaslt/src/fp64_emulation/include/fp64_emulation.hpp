@@ -13,46 +13,24 @@
  * Environment variable:
  *   HIPBLASLT_EMULATE_DOUBLE_PRECISION=1   enables emulation
  *
- * Performance model (in fp64_emulation.cpp — fp64EmulationPerformanceCheck):
- *   A Roofline-based estimate comparing t_emulation vs t_native_DGEMM.
- *   Calibrated for MI350 (HBM_BW=6.4 TB/s, INT8_PEAK=3050 TOPS,
- *   FP64_EFF=70 TFLOPS effective).  Update the hardware constants for
- *   other architectures.
+ * See docs/how-to/fp64-emulation.rst
  */
 
 #include "rocblaslt.h"
 #include <hip/hip_runtime_api.h>
 
-<<<<<<< HEAD:projects/hipblaslt/library/src/amd_detail/rocblaslt/src/include/fp64_emulation.hpp
-
-=======
-/* =========================================================================
- * General emulation constants (shared by all translation units)
- * ========================================================================= */
-
-/* Maximum number of moduli supported (s = 2..OZ2_S_MAX). */
-inline constexpr unsigned OZ2_S_MAX = 18;
-
-/* Alignment for INT8 arrays (128 bytes = 128 INT8 elements). */
-inline constexpr size_t OZ2_ALIGN = 128;
-
-/* Round n up to the nearest multiple of OZ2_ALIGN. */
-inline __host__ __device__ size_t oz2_pad(size_t n)
-{
-    return (n + OZ2_ALIGN - 1) / OZ2_ALIGN * OZ2_ALIGN;
-}
-
 /* =========================================================================
  * Environment variable parsing infrastructure
  * ========================================================================= */
->>>>>>> efe16b65b4 (Add fused kernel template parameter overwrite for kernel tuning runs):projects/hipblaslt/library/src/amd_detail/rocblaslt/src/fp64_emulation/include/fp64_emulation.hpp
-enum Fp64EmulationEnvState {
-    FP64_EMULATION_ENV_UNSET = 0,
-    FP64_EMULATION_ENV_VALID = 1,
+enum Fp64EmulationEnvState
+{
+    FP64_EMULATION_ENV_UNSET   = 0,
+    FP64_EMULATION_ENV_VALID   = 1,
     FP64_EMULATION_ENV_INVALID = 2,
 };
 
-struct Fp64EmulationEnvValue {
+struct Fp64EmulationEnvValue
+{
     Fp64EmulationEnvState state;
     unsigned int          value;
 };
@@ -62,12 +40,16 @@ Fp64EmulationEnvValue fp64EmulationParseEnabledEnv(const char* value);
 Fp64EmulationEnvValue fp64EmulationParseStrategyEnv(const char* value);
 Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value);
 Fp64EmulationEnvValue fp64EmulationParseMantissaBitCountEnv(const char* value);
-bool                 fp64EmulationIsValidMantissaBitCount(int value);
+bool                  fp64EmulationIsValidMantissaBitCount(int value);
 
 /* Returns true when HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 is set.
  * The environment variable is read once and cached. Invalid values are reported
  * through fp64EmulationDecision(), not through this legacy bool helper. */
 bool fp64EmulationIsEnabled();
+
+/* Forward declaration — callers already include handle.h which provides the full
+ * definition.  Declared here so the functions below can use the type.       */
+struct _rocblaslt_handle;
 
 /* Returns true when the emulation is estimated to be at least as fast as
  * native FP64 DGEMM for the given problem size.
@@ -108,20 +90,24 @@ unsigned fp64EmulationNumModuli();
 /* =========================================================================
  * Decision struct and gate function — status-propagating
  * ========================================================================= */
-struct Fp64EmulationDecision {
-    rocblaslt_status status;       /* rocblaslt_status_invalid_value on bad env   */
-    bool             apply;        /* true → use emulation; false → native path  */
-    unsigned int     num_moduli;   /* resolved moduli count to pass to settings  */
-    unsigned int     sv_mask;      /* resolved special-values mask               */
+struct Fp64EmulationDecision
+{
+    rocblaslt_status status; /* rocblaslt_status_invalid_value on bad env   */
+    bool             apply; /* true → use emulation; false → native path  */
+    unsigned int     num_moduli; /* resolved moduli count to pass to settings  */
+    unsigned int     sv_mask; /* resolved special-values mask               */
     bool             dynamic_mode; /* true when DYNAMIC (ADP) mode selected      */
 };
 
 /* Status-returning FP64 emulation gate. Invalid env-var values return
  * rocblaslt_status_invalid_value so callers do not silently fall back to
  * native FP64. On success, apply=false means the native path should be used
- * without error. */
+ * without error.
+ * opA/opB select per-transpose efficiency factors in the performance model. */
 Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
                                             hipDataType              type_a,
+                                            hipblasOperation_t       opA,
+                                            hipblasOperation_t       opB,
                                             int64_t                  m,
                                             int64_t                  n,
                                             int64_t                  k,
@@ -137,7 +123,7 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h);
 
 /* Returns the byte count of the emulation workspace for the given problem.
- * The decision is used to derive the layout moduli (OZ2_S_MAX=18 in ADP mode,
+ * The decision is used to derive the layout moduli (18 in ADP mode,
  * decision.num_moduli otherwise) and the handle to obtain the device for the
  * performance model.
  * Use this to check whether a caller-provided workspace is sufficient. */
@@ -152,12 +138,13 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
 /* Per-call emulation settings.
  * Fields with sentinel values (0 for num_moduli, ~0u for sv_mask) cause the
  * function to fall back to the process-wide env var defaults.              */
-struct Fp64EmulationSettings {
-    unsigned int      num_moduli;      /* 2..18; 0 = derive from env var          */
-    unsigned int      sv_mask;         /* special-values mask; ~0u = env var      */
-    bool              dynamic_mode;    /* true when ADP (Adaptive Precision) mode */
-    void*             workspace;       /* caller workspace; nullptr = allocate     */
-    size_t            workspace_bytes; /* size of caller workspace                */
+struct Fp64EmulationSettings
+{
+    unsigned int num_moduli; /* 2..18; 0 = derive from env var          */
+    unsigned int sv_mask; /* special-values mask; ~0u = env var      */
+    bool         dynamic_mode; /* true when ADP (Adaptive Precision) mode */
+    void*        workspace; /* caller workspace; nullptr = allocate     */
+    size_t       workspace_bytes; /* size of caller workspace                */
 };
 
 /* Run an emulated FP64 GEMM using Ozaki Scheme II (accurate mode).

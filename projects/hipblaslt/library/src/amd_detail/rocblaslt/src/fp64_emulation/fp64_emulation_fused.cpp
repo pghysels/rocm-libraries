@@ -22,10 +22,11 @@
 #include "fp64_emulation_fused.hpp"
 #include "fp64_emulation_tables.hpp"
 
-#include <cstdio>    /* std::fprintf */
-#include <cstdlib>   /* std::getenv, std::abort */
-#include <cstring>   /* std::strcmp  */
+#include "hipblaslt_ostream.hpp" /* hipblaslt_cerr */
+#include <cstdlib> /* std::getenv, std::abort */
+#include <cstring> /* std::strcmp  */
 
+using namespace FP64Emulation; /* table functions: neg_mod, qpi_hi, etc. */
 
 /* =========================================================================
  * TILE-templated MFMA traits
@@ -39,38 +40,43 @@
  * so that apply_mfma can be written once without if constexpr on TILE.
  * All resolved at compile time — zero runtime overhead.
  * ========================================================================= */
-template <int TILE> struct oz2_mfma_traits;
-template<> struct oz2_mfma_traits<16> {
+template <int TILE>
+struct oz2_mfma_traits;
+template <>
+struct oz2_mfma_traits<16>
+{
 #if defined(__gfx950__)
     static constexpr int    kblk       = 64;
     static constexpr size_t lds_budget = 160 * 1024;
     static constexpr int    ku_max     = 4;
-    typedef long src_t __attribute__((ext_vector_type(2)));
+    typedef long            src_t __attribute__((ext_vector_type(2)));
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
-      || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
+    || !defined(__HIP_DEVICE_COMPILE__) /* host compilation pass */
     static constexpr int    kblk       = 32;
     static constexpr size_t lds_budget = 64 * 1024;
     static constexpr int    ku_max     = 4;
-    using src_t = int64_t;
+    using src_t                        = int64_t;
 #else
-#  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
+#error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
     typedef int acc_t __attribute__((ext_vector_type(4)));
 };
-template<> struct oz2_mfma_traits<32> {
+template <>
+struct oz2_mfma_traits<32>
+{
 #if defined(__gfx950__)
     static constexpr int    kblk       = 32;
     static constexpr size_t lds_budget = 160 * 1024;
-    static constexpr int    ku_max     = 2;   /* KU=4 → scratch=424B on gfx950 T32 */
-    typedef long src_t __attribute__((ext_vector_type(2)));
+    static constexpr int    ku_max     = 2; /* KU=4 → scratch=424B on gfx950 T32 */
+    typedef long            src_t __attribute__((ext_vector_type(2)));
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
-      || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
+    || !defined(__HIP_DEVICE_COMPILE__) /* host compilation pass */
     static constexpr int    kblk       = 16;
     static constexpr size_t lds_budget = 64 * 1024;
     static constexpr int    ku_max     = 4;
-    using src_t = int64_t;
+    using src_t                        = int64_t;
 #else
-#  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
+#error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
     typedef int acc_t __attribute__((ext_vector_type(16)));
 };
@@ -82,17 +88,18 @@ template<> struct oz2_mfma_traits<32> {
  * src16 == src32 on all architectures, so one template covers both tiles.   */
 template <int TILE>
 __device__ __forceinline__ typename oz2_mfma_traits<TILE>::src_t
-oz2_load_mfma_src(const int8_t* __restrict__ ptr) noexcept {
+           oz2_load_mfma_src(const int8_t* __restrict__ ptr) noexcept
+{
 #if defined(__gfx950__)
     typename oz2_mfma_traits<TILE>::src_t v;
     v[0] = *reinterpret_cast<const long*>(ptr);
     v[1] = *reinterpret_cast<const long*>(ptr + 8);
     return v;
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
-      || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
+    || !defined(__HIP_DEVICE_COMPILE__) /* host compilation pass */
     return *reinterpret_cast<const typename oz2_mfma_traits<TILE>::src_t*>(ptr);
 #else
-#  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
+#error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
 }
 
@@ -102,18 +109,23 @@ oz2_load_mfma_src(const int8_t* __restrict__ ptr) noexcept {
  * TILE=32: 32x32x16 (gfx94x) / 32x32x32 (gfx95x)                         */
 template <int TILE>
 __device__ __forceinline__ typename oz2_mfma_traits<TILE>::acc_t
-oz2_do_mfma(typename oz2_mfma_traits<TILE>::src_t a,
-            typename oz2_mfma_traits<TILE>::src_t b,
-            typename oz2_mfma_traits<TILE>::acc_t c) noexcept {
+           oz2_do_mfma(typename oz2_mfma_traits<TILE>::src_t a,
+                       typename oz2_mfma_traits<TILE>::src_t b,
+                       typename oz2_mfma_traits<TILE>::acc_t c) noexcept
+{
 #if defined(__gfx950__)
-    if constexpr (TILE == 16) return __builtin_amdgcn_mfma_i32_16x16x64_i8(a, b, c, 0, 0, 0);
-    else                      return __builtin_amdgcn_mfma_i32_32x32x32_i8(a, b, c, 0, 0, 0);
+    if constexpr(TILE == 16)
+        return __builtin_amdgcn_mfma_i32_16x16x64_i8(a, b, c, 0, 0, 0);
+    else
+        return __builtin_amdgcn_mfma_i32_32x32x32_i8(a, b, c, 0, 0, 0);
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) \
-      || !defined(__HIP_DEVICE_COMPILE__)  /* host compilation pass */
-    if constexpr (TILE == 16) return __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, c, 0, 0, 0);
-    else                      return __builtin_amdgcn_mfma_i32_32x32x16_i8(a, b, c, 0, 0, 0);
+    || !defined(__HIP_DEVICE_COMPILE__) /* host compilation pass */
+    if constexpr(TILE == 16)
+        return __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, c, 0, 0, 0);
+    else
+        return __builtin_amdgcn_mfma_i32_32x32x16_i8(a, b, c, 0, 0, 0);
 #else
-#  error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
+#error "fp64_emulation_fused: unsupported GPU architecture (gfx940/941/942 or gfx950 required)"
 #endif
 }
 
@@ -143,7 +155,7 @@ oz2_do_mfma(typename oz2_mfma_traits<TILE>::src_t a,
  *   TILE=32: v_mfma_i32_32x32x16_i8 (gfx94x) / v_mfma_i32_32x32x32_i8 (gfx95x)
  *
  * Template parameters:
- *   S      – number of moduli (2..OZ2_S_MAX)
+ *   S      – number of moduli (2..S_MAX)
  *   HAS_LO – true when S > 7 (double-double CRT accumulation)
  *   WM     – wavefronts in M direction (default 4)
  *   WN     – wavefronts in N direction (default 4)
@@ -156,52 +168,67 @@ oz2_do_mfma(typename oz2_mfma_traits<TILE>::src_t a,
  * ========================================================================= */
 /* KU_PARAM=0 means "auto-select K_UNROLL from LDS budget" (the default).
  * Set KU_PARAM=1,2,4 via OZ2_FUSED_SHAPE_OVERRIDE to override for tuning. */
-template <int S, bool HAS_LO, int WM = 4, int WN = 4, int TILE = 16,
-          int WaveM = 1, int WaveN = 1, int KU_PARAM = 0,
-          bool FORCE_VGPR_ACCUM = false, int PGR = 1>
+template <int  S,
+          bool HAS_LO,
+          int  WM               = 4,
+          int  WN               = 4,
+          int  TILE             = 16,
+          int  WaveM            = 1,
+          int  WaveN            = 1,
+          int  KU_PARAM         = 0,
+          bool FORCE_VGPR_ACCUM = false,
+          int  PGR              = 1>
 __global__ static void
-oz2_fused_TN_kernel(
-    const int8_t*  __restrict__ A8i,   /* [S × lda8i × cola8i] INT8 A  */
-    size_t         stride_A_s,          /* lda8i × cola8i               */
-    size_t         lda8i,               /* padded k                      */
-    const int8_t*  __restrict__ B8i,   /* [S × ldb8i × n]  INT8 B      */
-    size_t         stride_B_s,          /* ldb8i × n                    */
-    size_t         ldb8i,               /* padded k                      */
-    const double*  __restrict__ C,
-    double*        __restrict__ D,
-    int64_t m, int64_t n, int64_t k,
-    int64_t ldc, int64_t ldd,
-    double alpha, double beta,
-    const int16_t* __restrict__ sftA,
-    const int16_t* __restrict__ sftB,
-    int            num_xccs)            /* number of XCCs on this device */
+    oz2_fused_TN_kernel(const int8_t* __restrict__ A8i, /* [S × lda8i × cola8i] INT8 A  */
+                        size_t stride_A_s, /* lda8i × cola8i               */
+                        size_t lda8i, /* padded k                      */
+                        const int8_t* __restrict__ B8i, /* [S × ldb8i × n]  INT8 B      */
+                        size_t stride_B_s, /* ldb8i × n                    */
+                        size_t ldb8i, /* padded k                      */
+                        const double* __restrict__ C,
+                        double* __restrict__ D,
+                        int64_t m,
+                        int64_t n,
+                        int64_t k,
+                        int64_t ldc,
+                        int64_t ldd,
+                        double  alpha,
+                        double  beta,
+                        const int16_t* __restrict__ sftA,
+                        const int16_t* __restrict__ sftB,
+                        int num_xccs) /* number of XCCs on this device */
 {
     /* ── Derived compile-time constants ────────────────────────────────────── */
-    using mfma_acc_t = typename oz2_mfma_traits<TILE>::acc_t;           /* v4i32 (TILE=16) or v16i32 (TILE=32)  */
-    static constexpr int NREG_single = TILE * TILE / 64;                /* accumulators per thread per MFMA tile */
-    static constexpr int NREG        = WaveM * WaveN * NREG_single;    /* total accumulators per thread         */
-    static constexpr int KBLK        = oz2_mfma_traits<TILE>::kblk;
+    using mfma_acc_t =
+        typename oz2_mfma_traits<TILE>::acc_t; /* v4i32 (TILE=16) or v16i32 (TILE=32)  */
+    static constexpr int NREG_single = TILE * TILE / 64; /* accumulators per thread per MFMA tile */
+    static constexpr int NREG
+        = WaveM * WaveN * NREG_single; /* total accumulators per thread         */
+    static constexpr int KBLK = oz2_mfma_traits<TILE>::kblk;
     /* K-loop unroll factor: auto-selected from LDS budget and per-arch
      * register-pressure ceiling (ku_max), or overridden via KU_PARAM.
      * All arch-specific values come from oz2_mfma_traits — no #ifdef here. */
-    static constexpr size_t   LDS_BUDGET    = oz2_mfma_traits<TILE>::lds_budget;
-    static constexpr size_t   LDS_MFMA_K4   = 2 * (WM * WaveM * TILE * (KBLK * 4)
-                                                   + WN * WaveN * TILE * (KBLK * 4));
-    static constexpr int K_UNROLL_LDS   = (LDS_MFMA_K4 <= LDS_BUDGET) ? 4 : 2;
-    static constexpr int K_UNROLL_AUTO  = (K_UNROLL_LDS < oz2_mfma_traits<TILE>::ku_max)
-                                        ? K_UNROLL_LDS : oz2_mfma_traits<TILE>::ku_max;
-    static constexpr int K_UNROLL = (KU_PARAM > 0) ? KU_PARAM : K_UNROLL_AUTO;
-    static constexpr int KBLK_LOAD   = KBLK * K_UNROLL;
-    static constexpr int K_A_BYTES   = KBLK * TILE / 64;
-    static constexpr int KBLK_PAD_UNIT = (K_A_BYTES == 16) ? 8 : K_A_BYTES;
-    static constexpr size_t   LDS_BYTES_OLD = 2 * (WM * WaveM * TILE * KBLK_LOAD
-                                                  + WN * WaveN * TILE * KBLK_LOAD);
+    static constexpr size_t LDS_BUDGET = oz2_mfma_traits<TILE>::lds_budget;
+    static constexpr size_t LDS_MFMA_K4
+        = 2 * (WM * WaveM * TILE * (KBLK * 4) + WN * WaveN * TILE * (KBLK * 4));
+    static constexpr int    K_UNROLL_LDS  = (LDS_MFMA_K4 <= LDS_BUDGET) ? 4 : 2;
+    static constexpr int    K_UNROLL_AUTO = (K_UNROLL_LDS < oz2_mfma_traits<TILE>::ku_max)
+                                                ? K_UNROLL_LDS
+                                                : oz2_mfma_traits<TILE>::ku_max;
+    static constexpr int    K_UNROLL      = (KU_PARAM > 0) ? KU_PARAM : K_UNROLL_AUTO;
+    static constexpr int    KBLK_LOAD     = KBLK * K_UNROLL;
+    static constexpr int    K_A_BYTES     = KBLK * TILE / 64;
+    static constexpr int    KBLK_PAD_UNIT = (K_A_BYTES == 16) ? 8 : K_A_BYTES;
+    static constexpr size_t LDS_BYTES_OLD
+        = 2 * (WM * WaveM * TILE * KBLK_LOAD + WN * WaveN * TILE * KBLK_LOAD);
     /* Pad LDS stride so that apply_mfma's 64-lane reads at m_col*KBLK_STRIDE
      * land on distinct LDS banks (conflict-free).                             */
-    static constexpr int KBLK_PAD    = (LDS_BYTES_OLD + KBLK_PAD_UNIT * TILE * (WM * WaveM + WN * WaveN) * 2
-                                         <= LDS_BUDGET) ? KBLK_PAD_UNIT : 0;
+    static constexpr int KBLK_PAD
+        = (LDS_BYTES_OLD + KBLK_PAD_UNIT * TILE * (WM * WaveM + WN * WaveN) * 2 <= LDS_BUDGET)
+              ? KBLK_PAD_UNIT
+              : 0;
     static constexpr int KBLK_STRIDE = KBLK_LOAD + KBLK_PAD;
-    static constexpr int BLK_THR    = WM * WN * 64;
+    static constexpr int BLK_THR     = WM * WN * 64;
 
     /* ── LDS accumulator decision (computed early — needed by LOAD_BYTES) ───
      * Store Zhi/Zlo in LDS when the combined budget (MFMA tiles + accumulators
@@ -209,28 +236,29 @@ oz2_fused_TN_kernel(
      * configurations (e.g., WM=1,WN=1,WaveM=4,WaveN=4 on MI350) that would
      * otherwise spill registers.  When false (e.g., all current MI300 configs),
      * accumulators stay in VGPRs with zero overhead.                          */
-    static constexpr int  N_BUF       = PGR + 1;   /* 2 for PGR=1, 3 for PGR=2 */
-    static constexpr size_t LDS_MFMA      = N_BUF * (WM * WaveM * TILE * KBLK_STRIDE
-                                                    + WN * WaveN * TILE * KBLK_STRIDE);
-    static constexpr size_t LDS_ZHI_ZLO   = 2 * BLK_THR * NREG * sizeof(double);
-    static constexpr bool   FITS_IN_LDS   = (LDS_MFMA + LDS_ZHI_ZLO <= LDS_BUDGET);
+    static constexpr int    N_BUF = PGR + 1; /* 2 for PGR=1, 3 for PGR=2 */
+    static constexpr size_t LDS_MFMA
+        = N_BUF * (WM * WaveM * TILE * KBLK_STRIDE + WN * WaveN * TILE * KBLK_STRIDE);
+    static constexpr size_t LDS_ZHI_ZLO = 2 * BLK_THR * NREG * sizeof(double);
+    static constexpr bool   FITS_IN_LDS = (LDS_MFMA + LDS_ZHI_ZLO <= LDS_BUDGET);
     /* USE_LDS_ACCUM: use LDS for Zhi/Zlo only when LDS has room AND FORCE_VGPR_ACCUM is not set.
      * FORCE_VGPR_ACCUM=true keeps accumulators in registers even when LDS has space,
      * which can be faster when NREG is small enough to avoid VGPR spilling.             */
-    static constexpr bool   USE_LDS_ACCUM = FITS_IN_LDS && !FORCE_VGPR_ACCUM;
+    static constexpr bool USE_LDS_ACCUM = FITS_IN_LDS && !FORCE_VGPR_ACCUM;
 
     /* Global load width: always use 4-byte (dword) loads.  Wider loads (8/16B)
      * were benchmarked and showed zero improvement on both gfx942 and gfx950. */
     static constexpr int LOAD_BYTES = 4;
-    using load_t = int32_t;
+    using load_t                    = int32_t;
     static constexpr int KDIM       = KBLK_LOAD / 4;
     static constexpr int A_STEPS    = (WM * WaveM * TILE * KDIM) / BLK_THR;
     static constexpr int B_STEPS    = (WN * WaveN * TILE * KDIM) / BLK_THR;
     /* VALID_CONFIG: false when A_STEPS or B_STEPS < 1 (gfx950-only KU=1 on gfx942). */
     static constexpr int  A_STEPS_SAFE = (A_STEPS > 0) ? A_STEPS : 1;
     static constexpr int  B_STEPS_SAFE = (B_STEPS > 0) ? B_STEPS : 1;
-    static constexpr bool VALID_CONFIG  = (A_STEPS >= 1 && B_STEPS >= 1);
-    if constexpr (!VALID_CONFIG) return; /* bail early for invalid arch/config combos */
+    static constexpr bool VALID_CONFIG = (A_STEPS >= 1 && B_STEPS >= 1);
+    if constexpr(!VALID_CONFIG)
+        return; /* bail early for invalid arch/config combos */
 
     /* ── Static LDS ────────────────────────────────────────────────────────── */
     static constexpr int A_BUF_BYTES = WM * WaveM * TILE * KBLK_STRIDE;
@@ -238,11 +266,11 @@ oz2_fused_TN_kernel(
     /* A8i_lds and B8i_lds are declared as a single contiguous flat buffer so
      * that the finalize section can safely reinterpret the combined region as
      * a double* tile_out for the coalesced output transpose.                  */
-    __shared__ int8_t  mfma_lds_flat[N_BUF * (A_BUF_BYTES + B_BUF_BYTES)];
-    auto (&A8i_lds)[N_BUF][A_BUF_BYTES] =
-        *reinterpret_cast<int8_t(*)[N_BUF][A_BUF_BYTES]>(mfma_lds_flat);
-    auto (&B8i_lds)[N_BUF][B_BUF_BYTES] =
-        *reinterpret_cast<int8_t(*)[N_BUF][B_BUF_BYTES]>(mfma_lds_flat + N_BUF * A_BUF_BYTES);
+    __shared__ int8_t mfma_lds_flat[N_BUF * (A_BUF_BYTES + B_BUF_BYTES)];
+    auto(&A8i_lds)[N_BUF][A_BUF_BYTES]
+        = *reinterpret_cast<int8_t(*)[N_BUF][A_BUF_BYTES]>(mfma_lds_flat);
+    auto(&B8i_lds)[N_BUF][B_BUF_BYTES]
+        = *reinterpret_cast<int8_t(*)[N_BUF][B_BUF_BYTES]>(mfma_lds_flat + N_BUF * A_BUF_BYTES);
     /* CRT accumulator LDS — flat layout [e * BLK_THR + tid].
      * Thread tid owns column tid for accumulator row e, giving consecutive
      * intra-wavefront access (2-way bank conflict; unavoidable for 64-lane
@@ -252,21 +280,19 @@ oz2_fused_TN_kernel(
     __shared__ double Zlo_lds[USE_LDS_ACCUM ? NREG * BLK_THR : 1];
 
     /* ── Thread decomposition ───────────────────────────────────────────────── */
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int wid  = tid / 64;
-    const int wm   = wid / WN;
-    const int wn   = wid % WN;
-    const int lane = tid % 64;
+    const int tid   = static_cast<int>(threadIdx.x);
+    const int wid   = tid / 64;
+    const int wm    = wid / WN;
+    const int wn    = wid % WN;
+    const int lane  = tid % 64;
     const int k_int = static_cast<int>(k);
 
     /* ── XCC-aware block tile mapping ───────────────────────────────────────── */
     static constexpr int SWIZZLE_B8i_PREF = 4;
 
-    const int m_tiles_total   = (static_cast<int>(m) + WM * WaveM * TILE - 1)
-                                / (WM * WaveM * TILE);
-    const int n_tiles_total   = (static_cast<int>(n) + WN * WaveN * TILE - 1)
-                                / (WN * WaveN * TILE);
-    uint32_t hw_xcc_id = 0u;
+    const int m_tiles_total = (static_cast<int>(m) + WM * WaveM * TILE - 1) / (WM * WaveM * TILE);
+    const int n_tiles_total = (static_cast<int>(n) + WN * WaveN * TILE - 1) / (WN * WaveN * TILE);
+    uint32_t  hw_xcc_id     = 0u;
     asm volatile("s_getreg_b32 %0, hwreg(20)" : "=s"(hw_xcc_id));
 
     const int linear_block = static_cast<int>(blockIdx.x);
@@ -274,44 +300,55 @@ oz2_fused_TN_kernel(
     const int intra_xcc    = linear_block / num_xccs;
 
     int m_tile, n_tile;
-    if (n <= static_cast<int64_t>(m)) {
+    if(n <= static_cast<int64_t>(m))
+    {
         /* Tall / square: swizzle M — B8i L2 reuse (groups of swizzle_eff M-tiles
          * share the same N-range, keeping B8i hot in L2).                      */
         const int m_tiles_per_xcc = (m_tiles_total + num_xccs - 1) / num_xccs;
-        const int swizzle_eff     = (SWIZZLE_B8i_PREF < m_tiles_per_xcc) ? SWIZZLE_B8i_PREF : m_tiles_per_xcc;
-        const int tiles_per_xcc   = m_tiles_per_xcc * n_tiles_total;
-        if (intra_xcc >= tiles_per_xcc) return;
+        const int swizzle_eff
+            = (SWIZZLE_B8i_PREF < m_tiles_per_xcc) ? SWIZZLE_B8i_PREF : m_tiles_per_xcc;
+        const int tiles_per_xcc = m_tiles_per_xcc * n_tiles_total;
+        if(intra_xcc >= tiles_per_xcc)
+            return;
         const int swizzle_group = intra_xcc / swizzle_eff;
         const int m_local       = intra_xcc % swizzle_eff;
-        n_tile = swizzle_group % n_tiles_total;
+        n_tile                  = swizzle_group % n_tiles_total;
         m_tile = xcc_id * m_tiles_per_xcc + (swizzle_group / n_tiles_total) * swizzle_eff + m_local;
-        if (m_tile >= m_tiles_total) return;
-    } else {
+        if(m_tile >= m_tiles_total)
+            return;
+    }
+    else
+    {
         /* Wide: swizzle N — A8i L2 reuse (groups of swizzle_eff N-tiles
          * share the same M-range, keeping A8i hot in L2).                      */
         const int n_tiles_per_xcc = (n_tiles_total + num_xccs - 1) / num_xccs;
-        const int swizzle_eff     = (SWIZZLE_B8i_PREF < n_tiles_per_xcc) ? SWIZZLE_B8i_PREF : n_tiles_per_xcc;
-        const int tiles_per_xcc   = m_tiles_total * n_tiles_per_xcc;
-        if (intra_xcc >= tiles_per_xcc) return;
+        const int swizzle_eff
+            = (SWIZZLE_B8i_PREF < n_tiles_per_xcc) ? SWIZZLE_B8i_PREF : n_tiles_per_xcc;
+        const int tiles_per_xcc = m_tiles_total * n_tiles_per_xcc;
+        if(intra_xcc >= tiles_per_xcc)
+            return;
         const int swizzle_group = intra_xcc / swizzle_eff;
         const int n_local       = intra_xcc % swizzle_eff;
-        m_tile = swizzle_group % m_tiles_total;
+        m_tile                  = swizzle_group % m_tiles_total;
         n_tile = xcc_id * n_tiles_per_xcc + (swizzle_group / m_tiles_total) * swizzle_eff + n_local;
-        if (n_tile >= n_tiles_total) return;
+        if(n_tile >= n_tiles_total)
+            return;
     }
 
     const int block_m_base = m_tile * (WM * WaveM * TILE);
     const int block_n_base = n_tile * (WN * WaveN * TILE);
-    const int m_base = block_m_base + wm * (WaveM * TILE);
-    const int n_base = block_n_base + wn * (WaveN * TILE);
+    const int m_base       = block_m_base + wm * (WaveM * TILE);
+    const int n_base       = block_n_base + wn * (WaveN * TILE);
 
     /* ── CRT accumulators ───────────────────────────────────────────────────
      * Size-1 placeholder when USE_LDS_ACCUM=true (never accessed).
      * Each thread owns its own Zhi/Zlo elements — no barrier needed for init. */
     double Zhi_reg[USE_LDS_ACCUM ? 1 : NREG] = {};
     double Zlo_reg[USE_LDS_ACCUM ? 1 : NREG] = {};
-    if constexpr (USE_LDS_ACCUM) {
-        for (int e = 0; e < NREG; ++e) {
+    if constexpr(USE_LDS_ACCUM)
+    {
+        for(int e = 0; e < NREG; ++e)
+        {
             Zhi_lds[e * BLK_THR + tid] = 0.0;
             Zlo_lds[e * BLK_THR + tid] = 0.0;
         }
@@ -319,8 +356,8 @@ oz2_fused_TN_kernel(
 
     /* ── Flat LDS/HBM offsets ──────────────────────────────────────────────── */
     /* Each thread precomputes its LDS write offset and HBM read offset once.  */
-    int    lds_off_A[A_STEPS_SAFE];  /* flat LDS byte offset within one buffer */
-    size_t hbm_off_A[A_STEPS_SAFE];  /* flat HBM byte offset from A8i base   */
+    int    lds_off_A[A_STEPS_SAFE]; /* flat LDS byte offset within one buffer */
+    size_t hbm_off_A[A_STEPS_SAFE]; /* flat HBM byte offset from A8i base   */
     int    lds_off_B[B_STEPS_SAFE];
     size_t hbm_off_B[B_STEPS_SAFE];
     /* ── Pre-fetch modulus s=0 prologue into registers ─────────────────────── */
@@ -331,39 +368,43 @@ oz2_fused_TN_kernel(
     load_t rA[A_STEPS_SAFE];
     load_t rB[B_STEPS_SAFE];
     {
-        /* Compute flat LDS + HBM offsets, then prefetch first K-block. */
-        #pragma unroll
-        for (int ls = 0; ls < A_STEPS; ++ls) {
-            const int flat = static_cast<int>(threadIdx.x) + ls * BLK_THR;
+/* Compute flat LDS + HBM offsets, then prefetch first K-block. */
+#pragma unroll
+        for(int ls = 0; ls < A_STEPS; ++ls)
+        {
+            const int flat     = static_cast<int>(threadIdx.x) + ls * BLK_THR;
             const int tile_dim = TILE * KDIM;
-            const int wm  = flat / tile_dim;
-            const int ml  = (flat % tile_dim) / KDIM;
-            const int kd  = (flat % tile_dim) % KDIM;
-            lds_off_A[ls] = (wm * TILE + ml) * KBLK_STRIDE + kd * LOAD_BYTES;
-            const int mi = block_m_base + wm * TILE + ml;
+            const int wm       = flat / tile_dim;
+            const int ml       = (flat % tile_dim) / KDIM;
+            const int kd       = (flat % tile_dim) % KDIM;
+            lds_off_A[ls]      = (wm * TILE + ml) * KBLK_STRIDE + kd * LOAD_BYTES;
+            const int mi       = block_m_base + wm * TILE + ml;
             hbm_off_A[ls] = static_cast<size_t>(mi) * lda8i + static_cast<size_t>(kd) * LOAD_BYTES;
         }
-        #pragma unroll
-        for (int ls = 0; ls < B_STEPS; ++ls) {
-            const int flat = static_cast<int>(threadIdx.x) + ls * BLK_THR;
+#pragma unroll
+        for(int ls = 0; ls < B_STEPS; ++ls)
+        {
+            const int flat     = static_cast<int>(threadIdx.x) + ls * BLK_THR;
             const int tile_dim = TILE * KDIM;
-            const int wn  = flat / tile_dim;
-            const int nl  = (flat % tile_dim) / KDIM;
-            const int kd  = (flat % tile_dim) % KDIM;
-            lds_off_B[ls] = (wn * TILE + nl) * KBLK_STRIDE + kd * LOAD_BYTES;
-            const int ni = block_n_base + wn * TILE + nl;
+            const int wn       = flat / tile_dim;
+            const int nl       = (flat % tile_dim) / KDIM;
+            const int kd       = (flat % tile_dim) % KDIM;
+            lds_off_B[ls]      = (wn * TILE + nl) * KBLK_STRIDE + kd * LOAD_BYTES;
+            const int ni       = block_n_base + wn * TILE + nl;
             hbm_off_B[ls] = static_cast<size_t>(ni) * ldb8i + static_cast<size_t>(kd) * LOAD_BYTES;
         }
-        if (k_int > 0) {
-            #pragma unroll
-            for (int ls = 0; ls < A_STEPS; ++ls)
+        if(k_int > 0)
+        {
+#pragma unroll
+            for(int ls = 0; ls < A_STEPS; ++ls)
                 rA[ls] = *reinterpret_cast<const load_t*>(A8i + hbm_off_A[ls]);
-            #pragma unroll
-            for (int ls = 0; ls < B_STEPS; ++ls)
+#pragma unroll
+            for(int ls = 0; ls < B_STEPS; ++ls)
                 rB[ls] = *reinterpret_cast<const load_t*>(B8i + hbm_off_B[ls]);
         }
     }
-    if constexpr (USE_LDS_ACCUM) __syncthreads(); /* sync Zhi_lds/Zlo_lds init */
+    if constexpr(USE_LDS_ACCUM)
+        __syncthreads(); /* sync Zhi_lds/Zlo_lds init */
 
     /* ── MFMA helper ──────────────────────────────────────────────────────────
      * A_wm_base: pointer to A8i_lds[cur][wm*WaveM][0][0]
@@ -373,43 +414,55 @@ oz2_fused_TN_kernel(
      * With WaveM=WaveN=1 the loop bodies execute once, identical to the
      * single-tile case.                                                        */
     static constexpr int N_TILES = WaveM * WaveN;
-    auto apply_mfma = [&](const int8_t* A_wm_base, const int8_t* B_wn_base,
-                          mfma_acc_t (&C32)[N_TILES]) __attribute__((always_inline)) {
-        using src_t = typename oz2_mfma_traits<TILE>::src_t;
-        const int m_col   = lane % TILE;
-        const int k_base  = K_A_BYTES * (lane / TILE);
-        const int base_off = m_col * KBLK_STRIDE + k_base;
+    auto                 apply_mfma
+        = [&](const int8_t* A_wm_base, const int8_t* B_wn_base, mfma_acc_t(&C32)[N_TILES])
+            __attribute__((always_inline))
+    {
+        using src_t                       = typename oz2_mfma_traits<TILE>::src_t;
+        const int            m_col        = lane % TILE;
+        const int            k_base       = K_A_BYTES * (lane / TILE);
+        const int            base_off     = m_col * KBLK_STRIDE + k_base;
         static constexpr int A_ROW_STRIDE = TILE * KBLK_STRIDE;
         static constexpr int B_ROW_STRIDE = TILE * KBLK_STRIDE;
 
-        #pragma unroll
-        for (int ku = 0; ku < K_UNROLL; ++ku) {
+#pragma unroll
+        for(int ku = 0; ku < K_UNROLL; ++ku)
+        {
             const int off = base_off + ku * KBLK;
 
-            if constexpr (WaveM < WaveN) {
-                /* No pre-load array: wm is smaller → wm outer, hoist sa.
+            if constexpr(WaveM < WaveN)
+            {
+/* No pre-load array: wm is smaller → wm outer, hoist sa.
                  * Total LDS reads: WaveM(1+WaveN)×KU — minimized by making
                  * the smaller dimension outer.  Only 1 src_t in register.   */
-                #pragma unroll
-                for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
+#pragma unroll
+                for(int wm_w = 0; wm_w < WaveM; ++wm_w)
+                {
                     const src_t sa = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
-                    #pragma unroll
-                    for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
-                        const src_t sb = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
-                        C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa, sb,
-                                                                       C32[wm_w * WaveN + wn_w]);
+#pragma unroll
+                    for(int wn_w = 0; wn_w < WaveN; ++wn_w)
+                    {
+                        const src_t sb
+                            = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
+                        C32[wm_w * WaveN + wn_w]
+                            = oz2_do_mfma<TILE>(sa, sb, C32[wm_w * WaveN + wn_w]);
                     }
                 }
-            } else {
-                /* WaveM >= WaveN: wn is smaller or equal → wn outer, hoist sb. */
-                #pragma unroll
-                for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
+            }
+            else
+            {
+/* WaveM >= WaveN: wn is smaller or equal → wn outer, hoist sb. */
+#pragma unroll
+                for(int wn_w = 0; wn_w < WaveN; ++wn_w)
+                {
                     const src_t sb = oz2_load_mfma_src<TILE>(B_wn_base + wn_w * B_ROW_STRIDE + off);
-                    #pragma unroll
-                    for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
-                        const src_t sa = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
-                        C32[wm_w * WaveN + wn_w] = oz2_do_mfma<TILE>(sa, sb,
-                                                                       C32[wm_w * WaveN + wn_w]);
+#pragma unroll
+                    for(int wm_w = 0; wm_w < WaveM; ++wm_w)
+                    {
+                        const src_t sa
+                            = oz2_load_mfma_src<TILE>(A_wm_base + wm_w * A_ROW_STRIDE + off);
+                        C32[wm_w * WaveN + wn_w]
+                            = oz2_do_mfma<TILE>(sa, sb, C32[wm_w * WaveN + wn_w]);
                     }
                 }
             }
@@ -420,37 +473,44 @@ oz2_fused_TN_kernel(
      * Factored out so both the sequential and pipelined S-loops can reuse it.
      * Performs the TwoSum CRT accumulation for one modulus, given the MFMA
      * results in C32[] and the per-modulus CRT coefficients.                   */
-    auto do_crt = [&](mfma_acc_t (&C32)[N_TILES], int s_idx)
-                  __attribute__((always_inline)) {
-        const double nm  = oz2_neg_mod(s_idx), im = oz2_inv_mod(s_idx);
-        const double qhi = oz2_qpi_hi(S - 2, s_idx);
-        const double qlo = HAS_LO ? oz2_qpi_lo(S - 2, s_idx) : 0.0;
-        if constexpr (!USE_LDS_ACCUM) {
-            for (int r = 0; r < NREG; ++r) {
-                const double dc_raw = static_cast<double>(
-                    C32[r / NREG_single][r % NREG_single]);
+    auto do_crt = [&](mfma_acc_t(&C32)[N_TILES], int s_idx) __attribute__((always_inline))
+    {
+        const double nm = neg_mod(s_idx), im = inv_mod(s_idx);
+        const double qhi = qpi_hi(S - 2, s_idx);
+        const double qlo = HAS_LO ? qpi_lo(S - 2, s_idx) : 0.0;
+        if constexpr(!USE_LDS_ACCUM)
+        {
+            for(int r = 0; r < NREG; ++r)
+            {
+                const double dc_raw = static_cast<double>(C32[r / NREG_single][r % NREG_single]);
                 const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
                 const double hi     = dc * qhi;
                 const double new_hi = Zhi_reg[r] + hi;
                 const double err    = hi - (new_hi - Zhi_reg[r]);
-                Zhi_reg[r] = new_hi;
-                if constexpr (HAS_LO) Zlo_reg[r] = fma(dc, qlo, Zlo_reg[r] + err);
-                else                  Zlo_reg[r] += err;
+                Zhi_reg[r]          = new_hi;
+                if constexpr(HAS_LO)
+                    Zlo_reg[r] = fma(dc, qlo, Zlo_reg[r] + err);
+                else
+                    Zlo_reg[r] += err;
             }
-        } else {
-            for (int r = 0; r < NREG; ++r) {
-                const int idx = r * BLK_THR + tid;
-                double Zhi = Zhi_lds[idx];
-                double Zlo = Zlo_lds[idx];
-                const double dc_raw = static_cast<double>(
-                    C32[r / NREG_single][r % NREG_single]);
+        }
+        else
+        {
+            for(int r = 0; r < NREG; ++r)
+            {
+                const int    idx    = r * BLK_THR + tid;
+                double       Zhi    = Zhi_lds[idx];
+                double       Zlo    = Zlo_lds[idx];
+                const double dc_raw = static_cast<double>(C32[r / NREG_single][r % NREG_single]);
                 const double dc     = fma(nm, rint(dc_raw * im), dc_raw);
                 const double hi     = dc * qhi;
                 const double new_hi = Zhi + hi;
                 const double err    = hi - (new_hi - Zhi);
-                Zhi = new_hi;
-                if constexpr (HAS_LO) Zlo = fma(dc, qlo, Zlo + err);
-                else                  Zlo += err;
+                Zhi                 = new_hi;
+                if constexpr(HAS_LO)
+                    Zlo = fma(dc, qlo, Zlo + err);
+                else
+                    Zlo += err;
                 Zhi_lds[idx] = Zhi;
                 Zlo_lds[idx] = Zlo;
             }
@@ -460,20 +520,21 @@ oz2_fused_TN_kernel(
     /* ── K-loop body helper ────────────────────────────────────────────────────
      * Runs the K-loop (LDS fill, global prefetch, MFMA, drain) for one modulus.
      * Used by both sequential and pipelined S-loops.                           */
-    auto run_kloop = [&](int s, mfma_acc_t (&C32)[N_TILES])
-                     __attribute__((always_inline)) {
+    auto run_kloop = [&](int s, mfma_acc_t(&C32)[N_TILES]) __attribute__((always_inline))
+    {
         const int8_t* A8i_s = A8i + static_cast<size_t>(s) * stride_A_s;
         const int8_t* B8i_s = B8i + static_cast<size_t>(s) * stride_B_s;
 
-        if (k_int > 0) {
+        if(k_int > 0)
+        {
             __syncthreads();
 
-            /* Store K-block 0 (already in rA/rB) to LDS[0]. */
-            #pragma unroll
-            for (int ls = 0; ls < A_STEPS; ++ls)
+/* Store K-block 0 (already in rA/rB) to LDS[0]. */
+#pragma unroll
+            for(int ls = 0; ls < A_STEPS; ++ls)
                 *reinterpret_cast<load_t*>(&A8i_lds[0][lds_off_A[ls]]) = rA[ls];
-            #pragma unroll
-            for (int ls = 0; ls < B_STEPS; ++ls)
+#pragma unroll
+            for(int ls = 0; ls < B_STEPS; ++ls)
                 *reinterpret_cast<load_t*>(&B8i_lds[0][lds_off_B[ls]]) = rB[ls];
 
             /* K-loop global-prefetch cursors.  Advance in place by compile-
@@ -481,31 +542,35 @@ oz2_fused_TN_kernel(
              * a single add per pointer.                                       */
             const int8_t* A_cur[A_STEPS_SAFE];
             const int8_t* B_cur[B_STEPS_SAFE];
-            #pragma unroll
-            for (int ls = 0; ls < A_STEPS; ++ls)
+#pragma unroll
+            for(int ls = 0; ls < A_STEPS; ++ls)
                 A_cur[ls] = A8i_s + hbm_off_A[ls];
-            #pragma unroll
-            for (int ls = 0; ls < B_STEPS; ++ls)
+#pragma unroll
+            for(int ls = 0; ls < B_STEPS; ++ls)
                 B_cur[ls] = B8i_s + hbm_off_B[ls];
 
             /* PGR=2 prologue: also load and store K-block 1 to LDS[1]. */
-            if constexpr (PGR >= 2) {
-                if (KBLK_LOAD < k_int) {
-                    #pragma unroll
-                    for (int ls = 0; ls < A_STEPS; ++ls) {
+            if constexpr(PGR >= 2)
+            {
+                if(KBLK_LOAD < k_int)
+                {
+#pragma unroll
+                    for(int ls = 0; ls < A_STEPS; ++ls)
+                    {
                         A_cur[ls] += KBLK_LOAD;
                         rA[ls] = *reinterpret_cast<const load_t*>(A_cur[ls]);
                     }
-                    #pragma unroll
-                    for (int ls = 0; ls < B_STEPS; ++ls) {
+#pragma unroll
+                    for(int ls = 0; ls < B_STEPS; ++ls)
+                    {
                         B_cur[ls] += KBLK_LOAD;
                         rB[ls] = *reinterpret_cast<const load_t*>(B_cur[ls]);
                     }
-                    #pragma unroll
-                    for (int ls = 0; ls < A_STEPS; ++ls)
+#pragma unroll
+                    for(int ls = 0; ls < A_STEPS; ++ls)
                         *reinterpret_cast<load_t*>(&A8i_lds[1][lds_off_A[ls]]) = rA[ls];
-                    #pragma unroll
-                    for (int ls = 0; ls < B_STEPS; ++ls)
+#pragma unroll
+                    for(int ls = 0; ls < B_STEPS; ++ls)
                         *reinterpret_cast<load_t*>(&B8i_lds[1][lds_off_B[ls]]) = rB[ls];
                 }
             }
@@ -518,40 +583,47 @@ oz2_fused_TN_kernel(
              * For PGR=1 (N_BUF=2): identical to the original double-buffer loop.
              * For PGR=2 (N_BUF=3): triple-buffer with 2 K-blocks of read-ahead,
              *   giving global reads two full MFMA cycles to complete.           */
-            for (int k_off = 0;
-                 k_off + PGR * KBLK_LOAD < k_int;
-                 k_off += KBLK_LOAD) {
-                const int buf_store = (cur + PGR >= N_BUF)
-                                    ? cur + PGR - N_BUF
-                                    : cur + PGR;
-                #pragma unroll
-                for (int ls = 0; ls < A_STEPS; ++ls) {
+            for(int k_off = 0; k_off + PGR * KBLK_LOAD < k_int; k_off += KBLK_LOAD)
+            {
+                const int buf_store = (cur + PGR >= N_BUF) ? cur + PGR - N_BUF : cur + PGR;
+#pragma unroll
+                for(int ls = 0; ls < A_STEPS; ++ls)
+                {
                     A_cur[ls] += KBLK_LOAD;
                     rA[ls] = *reinterpret_cast<const load_t*>(A_cur[ls]);
                 }
-                #pragma unroll
-                for (int ls = 0; ls < B_STEPS; ++ls) {
+#pragma unroll
+                for(int ls = 0; ls < B_STEPS; ++ls)
+                {
                     B_cur[ls] += KBLK_LOAD;
                     rB[ls] = *reinterpret_cast<const load_t*>(B_cur[ls]);
                 }
-                apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)], C32);
-                #pragma unroll
-                for (int ls = 0; ls < A_STEPS; ++ls)
+                apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)],
+                           &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)],
+                           C32);
+#pragma unroll
+                for(int ls = 0; ls < A_STEPS; ++ls)
                     *reinterpret_cast<load_t*>(&A8i_lds[buf_store][lds_off_A[ls]]) = rA[ls];
-                #pragma unroll
-                for (int ls = 0; ls < B_STEPS; ++ls)
+#pragma unroll
+                for(int ls = 0; ls < B_STEPS; ++ls)
                     *reinterpret_cast<load_t*>(&B8i_lds[buf_store][lds_off_B[ls]]) = rB[ls];
                 __syncthreads();
                 cur = (cur + 1 >= N_BUF) ? 0 : cur + 1;
             }
             /* Drain remaining K-blocks (PGR=1: always 1, PGR=2: 1 or 2). */
-            apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)], C32);
-            if constexpr (PGR >= 2) {
+            apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)],
+                       &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)],
+                       C32);
+            if constexpr(PGR >= 2)
+            {
                 /* Second drain only if K was large enough to fill LDS[1]. */
-                if (KBLK_LOAD < k_int) {
+                if(KBLK_LOAD < k_int)
+                {
                     __syncthreads();
                     cur = (cur + 1 >= N_BUF) ? 0 : cur + 1;
-                    apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)], &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)], C32);
+                    apply_mfma(&A8i_lds[cur][wm * (WaveM * TILE * KBLK_STRIDE)],
+                               &B8i_lds[cur][wn * (WaveN * TILE * KBLK_STRIDE)],
+                               C32);
                 }
             }
 
@@ -559,23 +631,25 @@ oz2_fused_TN_kernel(
              * Reuse them to preload the next modulus's first K-block from HBM.
              * The global loads overlap with the CRT FP64 work below, hiding
              * KBLK_LOAD = K_UNROLL × KBLK bytes of latency per A and B.      */
-            if (s + 1 < S) {
-                #pragma unroll
-                for (int ls = 0; ls < A_STEPS; ++ls)
+            if(s + 1 < S)
+            {
+#pragma unroll
+                for(int ls = 0; ls < A_STEPS; ++ls)
                     rA[ls] = *reinterpret_cast<const load_t*>(A8i_s + stride_A_s + hbm_off_A[ls]);
-                #pragma unroll
-                for (int ls = 0; ls < B_STEPS; ++ls)
+#pragma unroll
+                for(int ls = 0; ls < B_STEPS; ++ls)
                     rB[ls] = *reinterpret_cast<const load_t*>(B8i_s + stride_B_s + hbm_off_B[ls]);
             }
         }
-    };  /* end run_kloop */
+    }; /* end run_kloop */
 
-    /* ── S-loop: iterate over moduli ───────────────────────────────────────────
+/* ── S-loop: iterate over moduli ───────────────────────────────────────────
      * Sequential: K-loop then CRT for each modulus.  The compiler's instruction
      * scheduler naturally overlaps FP64 CRT ops with the MFMA pipeline drain
      * (confirmed by ISA analysis — see PLR investigation notes).     */
-    #pragma unroll 1
-    for (int s = 0; s < S; ++s) {
+#pragma unroll 1
+    for(int s = 0; s < S; ++s)
+    {
         mfma_acc_t C32[N_TILES] = {};
         run_kloop(s, C32);
         do_crt(C32, s);
@@ -595,49 +669,55 @@ oz2_fused_TN_kernel(
      * of 16 lanes (different cols, same rows) hit different banks (no conflict).
      *
      * Falls back to scattered stores when LDS is too small (e.g., large TILE=32). */
-    static constexpr int TILE_OUT_STRIDE = TILE + 1;
-    static constexpr size_t   TILE_OUT_BYTES  = static_cast<size_t>(WM * WN)
-                                              * TILE * TILE_OUT_STRIDE * sizeof(double);
-    static constexpr bool USE_COALESCED_OUT   = (TILE_OUT_BYTES
-                                              <= static_cast<size_t>(N_BUF) * (A_BUF_BYTES + B_BUF_BYTES));
+    static constexpr int    TILE_OUT_STRIDE = TILE + 1;
+    static constexpr size_t TILE_OUT_BYTES
+        = static_cast<size_t>(WM * WN) * TILE * TILE_OUT_STRIDE * sizeof(double);
+    static constexpr bool USE_COALESCED_OUT
+        = (TILE_OUT_BYTES <= static_cast<size_t>(N_BUF) * (A_BUF_BYTES + B_BUF_BYTES));
 
-    if constexpr (USE_COALESCED_OUT) {
-        __syncthreads();  /* ensure all waves done with CRT / K-loop LDS before reuse */
+    if constexpr(USE_COALESCED_OUT)
+    {
+        __syncthreads(); /* ensure all waves done with CRT / K-loop LDS before reuse */
         /* Reinterpret MFMA LDS (mfma_lds_flat, dead after S-loop) as output tile. */
         double* tile_out = reinterpret_cast<double*>(mfma_lds_flat);
 
-        for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
-            for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
+        for(int wm_w = 0; wm_w < WaveM; ++wm_w)
+        {
+            for(int wn_w = 0; wn_w < WaveN; ++wn_w)
+            {
                 const int m_wave_base   = m_base + wm_w * TILE;
                 const int n_wave_base   = n_base + wn_w * TILE;
                 const int mfma_col      = lane % TILE;
                 const int mfma_row_base = 4 * (lane / TILE);
                 const int reg_off       = (wm_w * WaveN + wn_w) * NREG_single;
-                double* my_tile = tile_out + wid * TILE * TILE_OUT_STRIDE;
+                double*   my_tile       = tile_out + wid * TILE * TILE_OUT_STRIDE;
 
                 /* Phase 1: compute d_val in MFMA register order → LDS column-major.
                  * Each lane stores its NREG_single elements to
                  * my_tile[mfma_col * TILE_OUT_STRIDE + tile_row].                  */
-                for (int e = 0; e < NREG_single; ++e) {
+                for(int e = 0; e < NREG_single; ++e)
+                {
                     const int tile_row = mfma_row_base + 8 * (e / 4) + (e % 4);
-                    const int gi = m_wave_base + tile_row;
-                    const int gj = n_wave_base + mfma_col;
-                    double Zhi, Zlo;
-                    if constexpr (USE_LDS_ACCUM) {
+                    const int gi       = m_wave_base + tile_row;
+                    const int gj       = n_wave_base + mfma_col;
+                    double    Zhi, Zlo;
+                    if constexpr(USE_LDS_ACCUM)
+                    {
                         Zhi = Zhi_lds[(reg_off + e) * BLK_THR + tid];
                         Zlo = Zlo_lds[(reg_off + e) * BLK_THR + tid];
-                    } else {
+                    }
+                    else
+                    {
                         Zhi = Zhi_reg[reg_off + e];
                         Zlo = Zlo_reg[reg_off + e];
                     }
-                    const double q = rint((Zhi + Zlo) * oz2_inv_P(S - 2));
-                    const double X = fma(oz2_P_lo(S - 2), q,
-                                         fma(oz2_P_hi(S - 2), q, Zhi) + Zlo);
-                    const int inv_sft = (gi < static_cast<int>(m) && gj < static_cast<int>(n))
-                                      ? -(static_cast<int>(sftA[gi]) + static_cast<int>(sftB[gj]))
-                                      : 0;
-                    my_tile[mfma_col * TILE_OUT_STRIDE + tile_row]
-                        = alpha * ldexp(X, inv_sft);
+                    const double q = rint((Zhi + Zlo) * inv_P(S - 2));
+                    const double X = fma(P_lo(S - 2), q, fma(P_hi(S - 2), q, Zhi) + Zlo);
+                    const int    inv_sft
+                        = (gi < static_cast<int>(m) && gj < static_cast<int>(n))
+                              ? -(static_cast<int>(sftA[gi]) + static_cast<int>(sftB[gj]))
+                              : 0;
+                    my_tile[mfma_col * TILE_OUT_STRIDE + tile_row] = alpha * ldexp(X, inv_sft);
                 }
                 /* No __syncthreads() needed: each wave reads only its own LDS partition. */
 
@@ -646,53 +726,66 @@ oz2_fused_TN_kernel(
                  * Pass j: thread t handles linear element j*64 + lane.
                  * row = lin % TILE, col = lin / TILE.
                  * Threads 0..15 → rows 0..15 of the same column → coalesced!     */
-                for (int j = 0; j < NREG_single; ++j) {
+                for(int j = 0; j < NREG_single; ++j)
+                {
                     const int lin = j * 64 + lane;
-                    const int r = lin % TILE;
-                    const int c = lin / TILE;
-                    const int gi = m_wave_base + r;
-                    const int gj = n_wave_base + c;
-                    if (gi < static_cast<int>(m) && gj < static_cast<int>(n)) {
+                    const int r   = lin % TILE;
+                    const int c   = lin / TILE;
+                    const int gi  = m_wave_base + r;
+                    const int gj  = n_wave_base + c;
+                    if(gi < static_cast<int>(m) && gj < static_cast<int>(n))
+                    {
                         double val = my_tile[c * TILE_OUT_STRIDE + r];
-                        if (beta != 0.0) {
-                            val += beta * C[static_cast<size_t>(gi) + static_cast<size_t>(gj) * ldc];
+                        if(beta != 0.0)
+                        {
+                            val += beta
+                                   * C[static_cast<size_t>(gi) + static_cast<size_t>(gj) * ldc];
                         }
-                        __builtin_nontemporal_store(val,
-                            D + static_cast<size_t>(gi) + static_cast<size_t>(gj) * ldd);
+                        __builtin_nontemporal_store(
+                            val, D + static_cast<size_t>(gi) + static_cast<size_t>(gj) * ldd);
                     }
                 }
             }
         }
-    } else {
+    }
+    else
+    {
         /* Fallback: scattered stores (original path, used when LDS is too small). */
-        for (int wm_w = 0; wm_w < WaveM; ++wm_w) {
-            for (int wn_w = 0; wn_w < WaveN; ++wn_w) {
+        for(int wm_w = 0; wm_w < WaveM; ++wm_w)
+        {
+            for(int wn_w = 0; wn_w < WaveN; ++wn_w)
+            {
                 const int m_wave_base   = m_base + wm_w * TILE;
                 const int n_wave_base   = n_base + wn_w * TILE;
                 const int col_val       = n_wave_base + (lane % TILE);
                 const int lane_row_base = m_wave_base + 4 * (lane / TILE);
                 const int reg_off       = (wm_w * WaveN + wn_w) * NREG_single;
-                for (int e = 0; e < NREG_single; ++e) {
+                for(int e = 0; e < NREG_single; ++e)
+                {
                     const int ri = lane_row_base + 8 * (e / 4) + (e % 4);
                     const int ci = col_val;
-                    if (ri >= static_cast<int>(m) || ci >= static_cast<int>(n)) continue;
+                    if(ri >= static_cast<int>(m) || ci >= static_cast<int>(n))
+                        continue;
                     double Zhi, Zlo;
-                    if constexpr (USE_LDS_ACCUM) {
+                    if constexpr(USE_LDS_ACCUM)
+                    {
                         Zhi = Zhi_lds[(reg_off + e) * BLK_THR + tid];
                         Zlo = Zlo_lds[(reg_off + e) * BLK_THR + tid];
-                    } else {
+                    }
+                    else
+                    {
                         Zhi = Zhi_reg[reg_off + e];
                         Zlo = Zlo_reg[reg_off + e];
                     }
-                    const double q = rint((Zhi + Zlo) * oz2_inv_P(S - 2));
-                    const double X = fma(oz2_P_lo(S - 2), q,
-                                         fma(oz2_P_hi(S - 2), q, Zhi) + Zlo);
-                    const int inv_sft = -(static_cast<int>(sftA[ri])
-                                         + static_cast<int>(sftB[ci]));
+                    const double q     = rint((Zhi + Zlo) * inv_P(S - 2));
+                    const double X     = fma(P_lo(S - 2), q, fma(P_hi(S - 2), q, Zhi) + Zlo);
+                    const int inv_sft  = -(static_cast<int>(sftA[ri]) + static_cast<int>(sftB[ci]));
                     const size_t d_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldd;
-                    double d_val = alpha * ldexp(X, inv_sft);
-                    if (beta != 0.0) {
-                        const size_t c_idx = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
+                    double       d_val = alpha * ldexp(X, inv_sft);
+                    if(beta != 0.0)
+                    {
+                        const size_t c_idx
+                            = static_cast<size_t>(ri) + static_cast<size_t>(ci) * ldc;
                         d_val += beta * C[c_idx];
                     }
                     __builtin_nontemporal_store(d_val, D + d_idx);
@@ -713,12 +806,13 @@ oz2_fused_TN_kernel(
 Oz2FusedMode oz2_fused_mode()
 {
     const char* e = std::getenv("HIPBLASLT_EMULATION_FUSED");
-    if(e == nullptr) return Oz2FusedMode::OFF;   /* disabled by default */
+    if(e == nullptr)
+        return Oz2FusedMode::OFF; /* disabled by default */
     if(std::strcmp(e, "on") == 0 || std::strcmp(e, "force") == 0)
         return Oz2FusedMode::ON;
     if(std::strcmp(e, "off") == 0 || std::strcmp(e, "never") == 0)
         return Oz2FusedMode::OFF;
-    return Oz2FusedMode::AUTO;   /* "auto", "performant", or unrecognized */
+    return Oz2FusedMode::AUTO; /* "auto", "performant", or unrecognized */
 }
 
 /* =========================================================================
@@ -747,19 +841,24 @@ Oz2FusedMode oz2_fused_mode()
  * and for future MI350 re-evaluation where USE_LDS_ACCUM=true may remove
  * the VGPR spilling penalty that makes TILE=32 ~10× slower on gfx942.
  * ========================================================================= */
-rocblaslt_status oz2_launch_fused_TN(
-    const int8_t*  A8i,
-    const int8_t*  B8i,
-    size_t         lda8i,
-    size_t         cola8i,
-    size_t         ldb8i,
-    const double*  C,
-    double*        D,
-    int64_t m, int64_t n, int64_t k,
-    int64_t ldc, int64_t ldd,
-    double alpha, double beta,
-    const int16_t* sftA, const int16_t* sftB,
-    unsigned num_moduli, hipStream_t stream)
+rocblaslt_status oz2_launch_fused_TN(const int8_t*  A8i,
+                                     const int8_t*  B8i,
+                                     size_t         lda8i,
+                                     size_t         cola8i,
+                                     size_t         ldb8i,
+                                     const double*  C,
+                                     double*        D,
+                                     int64_t        m,
+                                     int64_t        n,
+                                     int64_t        k,
+                                     int64_t        ldc,
+                                     int64_t        ldd,
+                                     double         alpha,
+                                     double         beta,
+                                     const int16_t* sftA,
+                                     const int16_t* sftB,
+                                     unsigned       num_moduli,
+                                     hipStream_t    stream)
 {
     const size_t stride_A_s = lda8i * cola8i;
     const size_t stride_B_s = ldb8i * static_cast<size_t>(n);
@@ -786,37 +885,43 @@ rocblaslt_status oz2_launch_fused_TN(
         int gfx950_chip_id = 0;
         (void)hipDeviceGetAttribute(&gfx950_chip_id, hipDeviceAttributePciChipId, cur_dev);
         const uint32_t pci_id = static_cast<uint32_t>(gfx950_chip_id) & 0xFFFFu;
-        is_gfx950 = (pci_id == 0x75a3u || pci_id == 0x75b3u     /* MI350X */
-                  || pci_id == 0x75a0u || pci_id == 0x75b0u) ? 1 : 0;  /* MI355X */
+        is_gfx950             = (pci_id == 0x75a3u || pci_id == 0x75b3u /* MI350X */
+                     || pci_id == 0x75a0u || pci_id == 0x75b0u)
+                                    ? 1
+                                    : 0; /* MI355X */
     }
-    (void)is_gfx950;                  /* reserved for future gfx950-specific tuning */
+    (void)is_gfx950; /* reserved for future gfx950-specific tuning */
     /* Query number of XCCs (Graphics Compute Dies) on the current device. */
     int num_xccs = 1;
     {
         (void)hipDeviceGetAttribute(&num_xccs, hipDeviceAttributeNumberOfXccs, cur_dev);
-        if(num_xccs <= 0) num_xccs = 1;
+        if(num_xccs <= 0)
+            num_xccs = 1;
     }
 
     /* Compute 1D grid for a given macrotile configuration.
      * Macrotile M dimension = wm_v * wm_wave_v * tile_v (similarly for N).
      * Thread block size = wm_v * wn_v * 64 (WaveM/WaveN don't add threads).
      * With XCC mapping, total_blocks = m_tiles_per_xcc × n_tiles × num_xccs. */
-    auto make_grid = [&](int wm_v, int wn_v, int tile_v,
-                         int wm_wave_v = 1, int wn_wave_v = 1) -> dim3 {
-        const int mt = static_cast<int>(
-            (m + wm_v * wm_wave_v * tile_v - 1) / (wm_v * wm_wave_v * tile_v));
-        const int nt = static_cast<int>(
-            (n + wn_v * wn_wave_v * tile_v - 1) / (wn_v * wn_wave_v * tile_v));
+    auto make_grid
+        = [&](int wm_v, int wn_v, int tile_v, int wm_wave_v = 1, int wn_wave_v = 1) -> dim3 {
+        const int mt
+            = static_cast<int>((m + wm_v * wm_wave_v * tile_v - 1) / (wm_v * wm_wave_v * tile_v));
+        const int nt
+            = static_cast<int>((n + wn_v * wn_wave_v * tile_v - 1) / (wn_v * wn_wave_v * tile_v));
         /* Match the kernel's swizzle dimension: M for tall/square, N for wide.
          * Uses raw matrix dimensions (not tile counts) because L2 reuse depends
          * on which matrix operand is smaller, not the macrotile shape.          */
         int total_blocks;
-        if (n <= m) {
+        if(n <= m)
+        {
             const int m_per_xcc = (mt + num_xccs - 1) / num_xccs;
-            total_blocks = m_per_xcc * nt * num_xccs;
-        } else {
+            total_blocks        = m_per_xcc * nt * num_xccs;
+        }
+        else
+        {
             const int n_per_xcc = (nt + num_xccs - 1) / num_xccs;
-            total_blocks = mt * n_per_xcc * num_xccs;
+            total_blocks        = mt * n_per_xcc * num_xccs;
         }
         return dim3(static_cast<unsigned>(total_blocks), 1u);
     };
@@ -827,13 +932,38 @@ rocblaslt_status oz2_launch_fused_TN(
  * FVA_V=false → use LDS accumulators when they fit (default).
  * FVA_V=true  → force VGPR-based accumulators even when LDS has space.        */
 #define OZ2_FUSED_LAUNCH(S_V, HL, WM_V, WN_V, TILE_V, WM_WAVE_V, WN_WAVE_V, KU_V, FVA_V, PGR_V) \
-    hipLaunchKernelGGL((oz2_fused_TN_kernel<(S_V),(HL),(WM_V),(WN_V),(TILE_V),(WM_WAVE_V),(WN_WAVE_V),(KU_V),(FVA_V),(PGR_V)>), \
-                       make_grid((WM_V),(WN_V),(TILE_V),(WM_WAVE_V),(WN_WAVE_V)), \
-                       dim3((WM_V)*(WN_V)*64), 0, stream, \
-                       A8i, stride_A_s, lda8i, B8i, stride_B_s, ldb8i, \
-                       C, D, m, n, k, ldc, ldd, alpha, beta, sftA, sftB, \
+    hipLaunchKernelGGL((oz2_fused_TN_kernel<(S_V),                                              \
+                                            (HL),                                               \
+                                            (WM_V),                                             \
+                                            (WN_V),                                             \
+                                            (TILE_V),                                           \
+                                            (WM_WAVE_V),                                        \
+                                            (WN_WAVE_V),                                        \
+                                            (KU_V),                                             \
+                                            (FVA_V),                                            \
+                                            (PGR_V)>),                                          \
+                       make_grid((WM_V), (WN_V), (TILE_V), (WM_WAVE_V), (WN_WAVE_V)),           \
+                       dim3((WM_V) * (WN_V) * 64),                                              \
+                       0,                                                                       \
+                       stream,                                                                  \
+                       A8i,                                                                     \
+                       stride_A_s,                                                              \
+                       lda8i,                                                                   \
+                       B8i,                                                                     \
+                       stride_B_s,                                                              \
+                       ldb8i,                                                                   \
+                       C,                                                                       \
+                       D,                                                                       \
+                       m,                                                                       \
+                       n,                                                                       \
+                       k,                                                                       \
+                       ldc,                                                                     \
+                       ldd,                                                                     \
+                       alpha,                                                                   \
+                       beta,                                                                    \
+                       sftA,                                                                    \
+                       sftB,                                                                    \
                        num_xccs)
-
 
 /* ── OZ2_DISPATCH_SHAPE: normal shape selection macro ──────────────────────────
  * Used for the per-num_moduli switch below when OZ2_FUSED_SHAPE_OVERRIDE is not
@@ -853,186 +983,498 @@ rocblaslt_status oz2_launch_fused_TN(
  * false/true for the bool FORCE_VGPR_ACCUM template parameter).
  * The dispatch table encodes _fva==0 / _fva==1 in the condition, so each call
  * site always passes a compile-time constant — no runtime branch needed here.  */
-#define _OV_DISPATCH(S_V,WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V,PGR_V) \
-    do { \
-        if(has_lo) OZ2_FUSED_LAUNCH((S_V),true, WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V,PGR_V); \
-        else       OZ2_FUSED_LAUNCH((S_V),false,WM_V,WN_V,T_V,WMW_V,WNW_V,KU_V,FVA_V,PGR_V); \
+#define _OV_DISPATCH(S_V, WM_V, WN_V, T_V, WMW_V, WNW_V, KU_V, FVA_V, PGR_V)                   \
+    do                                                                                         \
+    {                                                                                          \
+        if(has_lo)                                                                             \
+            OZ2_FUSED_LAUNCH((S_V), true, WM_V, WN_V, T_V, WMW_V, WNW_V, KU_V, FVA_V, PGR_V);  \
+        else                                                                                   \
+            OZ2_FUSED_LAUNCH((S_V), false, WM_V, WN_V, T_V, WMW_V, WNW_V, KU_V, FVA_V, PGR_V); \
     } while(0)
 
-#define OZ2_DISPATCH_SHAPE_OVERRIDE(S_V) \
-    do { \
-        const char* _ov = std::getenv("OZ2_FUSED_SHAPE_OVERRIDE"); \
-        if (_ov) { \
-            int _wm=0,_wn=0,_wm_w=0,_wn_w=0,_t=0,_ku=0,_fva=0,_pgr=1; \
-            { std::sscanf(_ov,"%d %d %d %d %d %d %d %d",&_wm,&_wn,&_wm_w,&_wn_w,&_t,&_ku,&_fva,&_pgr); } \
-            if (_wm && _wn && (_t==16||_t==32)) { \
+#define OZ2_DISPATCH_SHAPE_OVERRIDE(S_V)                                                                                          \
+    do                                                                                                                            \
+    {                                                                                                                             \
+        const char* _ov = std::getenv("OZ2_FUSED_SHAPE_OVERRIDE");                                                                \
+        if(_ov)                                                                                                                   \
+        {                                                                                                                         \
+            int _wm = 0, _wn = 0, _wm_w = 0, _wn_w = 0, _t = 0, _ku = 0, _fva = 0, _pgr = 1;                                      \
+            {                                                                                                                     \
+                std::sscanf(_ov,                                                                                                  \
+                            "%d %d %d %d %d %d %d %d",                                                                            \
+                            &_wm,                                                                                                 \
+                            &_wn,                                                                                                 \
+                            &_wm_w,                                                                                               \
+                            &_wn_w,                                                                                               \
+                            &_t,                                                                                                  \
+                            &_ku,                                                                                                 \
+                            &_fva,                                                                                                \
+                            &_pgr);                                                                                               \
+            }                                                                                                                     \
+            if(_wm && _wn && (_t == 16 || _t == 32))                                                                              \
+            {                                                                                                                     \
                 /* OZ2_DISPATCH_SHAPE_OVERRIDE always dispatches oz2_fused_TN_kernel<16,...>. \
                  * The caller MUST fix num_moduli=16 via the emulation handle so that the \
                  * library prepares exactly 16 INT8 data sets to match the kernel's S=16 loop. \
-                 * Abort loudly rather than silently reading out-of-bounds GPU memory. */ \
-                if (num_moduli != 16u) { \
-                    std::fprintf(stderr, \
-                        "[oz2_launch_fused_TN] FATAL: OZ2_FUSED_SHAPE_OVERRIDE is set but " \
-                        "num_moduli=%u (expected 16). Fix the emulation handle: call " \
-                        "hipblasLtSetFixedPointEmulationMantissaControl(FIXED) and " \
-                        "hipblasLtSetFixedPointEmulationMaxMantissaBitCount(118).\n", \
-                        num_moduli); \
-                    std::abort(); \
-                } \
-                if      (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,2,32,1,1,4,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,4,32,1,1,4,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,2,16,1,1,4,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,2,4,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,2,16,2,1,4,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,2,4,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,32,1,1,4,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,1,4,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,2,4,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,2,16,1,1,4,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,1,4,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,1,4,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,1,4,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,4,16,2,1,4,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,2,4,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,2,16,2,2,4,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,4,16,4,1,4,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,4,4,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,2,16,4,2,4,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,1,16,2,4,4,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,1,16,4,4,4,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,1,4,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,2,4,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,2,16,2,1,4,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,2,4,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,1,4,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,1,4,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,1,4,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,4,16,1,1,4,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,2,32,1,1,4,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),2,1,32,1,1,4,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,2,32,1,1,4,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),4,1,32,1,1,4,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&_fva==0) _OV_DISPATCH((S_V),1,4,32,1,1,4,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,1,2,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,4,1,2,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,4,2,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,2,2,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,1,2,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,4,16,2,1,2,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,2,2,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,2,16,2,2,2,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,4,16,4,1,2,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,4,2,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,2,16,4,2,2,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,1,16,2,4,2,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,4,4,2,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,2,2,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,2,16,2,1,2,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,2,2,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,2,32,1,1,2,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,4,32,1,1,2,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,2,16,1,1,2,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,2,2,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,2,16,2,1,2,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,2,2,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,32,1,1,2,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,1,2,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,2,2,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,2,16,1,1,2,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,1,2,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,1,2,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,1,2,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,1,2,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,1,2,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,4,16,1,1,2,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,2,32,1,1,2,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),2,1,32,1,1,2,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,2,32,1,1,2,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),4,1,32,1,1,2,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==2&&_fva==0) _OV_DISPATCH((S_V),1,4,32,1,1,2,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,4,16,2,1,1,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,2,1,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,2,16,2,2,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,2,1,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,4,4,1,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,4,16,4,1,1,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,4,1,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,2,16,4,2,1,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,1,16,2,4,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,4,16,4,2,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,4,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),4,4,16,4,4,1,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,2,16,1,1,1,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,2,1,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,2,16,2,1,1,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,2,1,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,32,1,1,1,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,1,1,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,1,2,1,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,2,16,1,1,1,false,1); \
-                else if (_wm==1&&_wn==1&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,1,16,2,1,1,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,1,16,1,1,1,false,1); \
-                else if (_wm==2&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,2,32,1,1,1,false,1); \
-                else if (_wm==2&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),2,1,32,1,1,1,false,1); \
-                else if (_wm==1&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&_fva==0) _OV_DISPATCH((S_V),1,2,32,1,1,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,2,1,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,2,16,2,1,1,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,2,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,1,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,2,1,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,4,1,1,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,2,32,1,1,1,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2,4,32,1,1,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,16,1,4,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,4,32,1,1,1,false,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,2,16,1,1,1,false,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),2,4,16,1,1,1,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,1,16,1,1,1,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1,4,16,1,1,1,false,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),4,1,32,1,1,1,false,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==0) _OV_DISPATCH((S_V),1,4,32,1,1,1,false,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,2,1,true,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,2,16,2,1,1,true,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2,4,16,1,2,1,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,1,1,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,2,1,1,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,4,1,1,true,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,2,32,1,1,1,true,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2,4,32,1,1,1,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,4,1,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,32,1,1,1,true,1); \
-                else if (_wm==4&&_wn==2&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,2,16,1,1,1,true,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2,4,16,1,1,1,true,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,1,16,1,1,1,true,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1,4,16,1,1,1,true,1); \
-                else if (_wm==4&&_wn==1&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,1,32,1,1,1,true,1); \
-                else if (_wm==1&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),1,4,32,1,1,1,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,1,4,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==2&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,2,4,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==1&&_t==16&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,2,1,4,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,4,2,1,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,2,2,2,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,4,1,2,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==4&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,4,2,true,1); \
-                else if (_wm==4&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==16&&_ku==2&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),4,4,16,1,1,2,true,1); \
-                else if (_wm==2&&_wn==4&&_wm_w==1&&_wn_w==1&&_t==32&&_ku==4&&is_gfx950&&_fva==1) _OV_DISPATCH((S_V),2,4,32,1,1,4,true,1); \
-                /* ── PGR=2 (triple-buffered K-loop) — benefits larger K ──── */ \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,2,2,2,false,2); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==2&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,4,2,1,false,2); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,4,4,1,false,2); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&_fva==0&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,2,2,1,false,2); \
+                 * Abort loudly rather than silently reading out-of-bounds GPU memory. */                                   \
+                if(num_moduli != 16u)                                                                                             \
+                {                                                                                                                 \
+                    hipblaslt_cerr                                                                                                \
+                        << "[oz2_launch_fused_TN] FATAL: OZ2_FUSED_SHAPE_OVERRIDE is set but "                                    \
+                           "num_moduli="                                                                                          \
+                        << num_moduli                                                                                             \
+                        << " (expected 16). Fix the emulation handle: call "                                                      \
+                           "hipblasLtSetFixedPointEmulationMantissaControl(FIXED) and "                                           \
+                           "hipblasLtSetFixedPointEmulationMaxMantissaBitCount(118)."                                             \
+                        << std::endl;                                                                                             \
+                    std::abort();                                                                                                 \
+                }                                                                                                                 \
+                if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                       \
+                   && _fva == 0)                                                                                                  \
+                    _OV_DISPATCH((S_V), 4, 2, 32, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 32, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 1, 2, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 2, 1, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 2, 2, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 32, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 1, 2, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 2, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 2, 1, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 1, 2, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 16, 2, 2, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 4 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 4, 16, 4, 1, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 4 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 1, 16, 1, 4, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 4 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 4, 2, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 2 && _wn_w == 4 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 2, 4, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 4 && _wn_w == 4 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 4, 4, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 1, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 2, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 2, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 1, 2, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 1, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 4, 16, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 32, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 32, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 32, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 1, 32, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 4, 32, 1, 1, 4, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 1, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 1, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 4 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 4, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 2, 1, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 1, 2, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 16, 2, 2, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 4 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 4, 16, 4, 1, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 4 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 1, 16, 1, 4, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 4 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 4, 2, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 2 && _wn_w == 4 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 2, 4, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 4 && _wn_w == 4 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 4, 4, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 2, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 2, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 1, 2, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 2, 32, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 32, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 1, 2, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 2, 1, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 2, 2, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 32, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 1, 2, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 2, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 1, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 4, 16, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 32, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 32, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 32, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 1, 32, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 2                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 4, 32, 1, 1, 2, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 2, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 1, 2, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 16, 2, 2, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 4 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 4, 4, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 4 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 4, 16, 4, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 1, 16, 1, 4, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 4 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 4, 2, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 2 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 2, 4, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 2, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 4, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 4, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 1, 2, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 2, 1, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 2, 2, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 1, 2, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 1 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 1, 16, 2, 1, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 2, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 2, 1, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && _fva == 0)                                                                                             \
+                    _OV_DISPATCH((S_V), 1, 2, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 2, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 2, 1, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 1, 2, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 2, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 2, 4, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 4, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 1, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 1, 4, 16, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 1, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 0)                                                                                \
+                    _OV_DISPATCH((S_V), 1, 4, 32, 1, 1, 1, false, 1);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 2, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 2, 1, 1, true, 1);                                                              \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 1, 2, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 1, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 1, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 2, 32, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 2, 4, 32, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 4, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 32, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 2 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 2, 16, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 2, 4, 16, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 1, 16, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 1, 4, 16, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 1 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 1, 32, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 1 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 1, 4, 32, 1, 1, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 1, 4, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 2 && _t == 16 && _ku == 4                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 2, 4, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 1 && _t == 16 && _ku == 4                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 1, 4, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 2, 1, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 2, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 1, 2, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 4 && _t == 16 && _ku == 2                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 4, 2, true, 1);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 16 && _ku == 2                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 1, 1, 2, true, 1);                                                              \
+                else if(_wm == 2 && _wn == 4 && _wm_w == 1 && _wn_w == 1 && _t == 32 && _ku == 4                                  \
+                        && is_gfx950 && _fva == 1)                                                                                \
+                    _OV_DISPATCH((S_V), 2, 4, 32, 1, 1, 4, true, 1);                                                              \
+                /* ── PGR=2 (triple-buffered K-loop) — benefits larger K ──── */                                    \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && _fva == 0 && _pgr == 2)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 2, false, 2);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0 && _pgr == 2)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 2, 1, false, 2);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0 && _pgr == 2)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 4, 1, false, 2);                                                             \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && _fva == 0 && _pgr == 2)                                                                                \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 1, false, 2);                                                             \
                 /* ── FVA=1 + PGR=2 (gfx950 only) ──────────────────────── */ \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==1&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,2,2,1,true,2); \
-                else if (_wm==4&&_wn==4&&_wm_w==4&&_wn_w==4&&_t==16&&_ku==1&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,4,4,1,true,2); \
-                else if (_wm==4&&_wn==4&&_wm_w==2&&_wn_w==2&&_t==16&&_ku==2&&is_gfx950&&_fva==1&&_pgr==2) _OV_DISPATCH((S_V),4,4,16,2,2,2,true,2); \
-                else { return rocblaslt_status_invalid_value; } \
-                return rocblaslt_status_success; \
-            } \
-        } \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1 && _pgr == 2)                                                                   \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 1, true, 2);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 4 && _wn_w == 4 && _t == 16 && _ku == 1                                  \
+                        && is_gfx950 && _fva == 1 && _pgr == 2)                                                                   \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 4, 4, 1, true, 2);                                                              \
+                else if(_wm == 4 && _wn == 4 && _wm_w == 2 && _wn_w == 2 && _t == 16 && _ku == 2                                  \
+                        && is_gfx950 && _fva == 1 && _pgr == 2)                                                                   \
+                    _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 2, true, 2);                                                              \
+                else                                                                                                              \
+                {                                                                                                                 \
+                    return rocblaslt_status_invalid_value;                                                                        \
+                }                                                                                                                 \
+                return rocblaslt_status_success;                                                                                  \
+            }                                                                                                                     \
+        }                                                                                                                         \
     } while(0)
 
-#define OZ2_DISPATCH_SHAPE(S_V) \
-        do { /* Shape heuristic — two architectures, one macro.                        \
+#define OZ2_DISPATCH_SHAPE(S_V)                                                                                                        \
+    do                                                                                                                                 \
+    { /* Shape heuristic — two architectures, one macro.                        \
          * gfx942 (MI300X):                                                       \
          *   DEFAULT: WM4WN4Wm2Wn2T16ku2 (128×128, KU=2) wins for all square     \
          *     and near-square shapes across the full K range (K=64..32768).      \
@@ -1052,30 +1494,49 @@ rocblaslt_status oz2_launch_fused_TN(
          * gfx950 (MI355X): 128×128 KU=2 for small-K / tall / wide; 256×256 KU=1 \
          *   for large symmetric shapes (M,N,K ≥ 8192, +23%).  The gfx942        \
          *   elongated 256×128 branch is gfx942-only (unmeasured on gfx950).      \
-         * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256.        */ \
-        if (is_gfx950) { \
+         * Threshold M,N,K ≥ 8192 ensures ≥1024 output tiles for 256×256.        */                                                    \
+        if(is_gfx950)                                                                                                                  \
+        {                                                                                                                              \
             /* ── gfx950 (MI350X) tile selection ────────────────────────── \
              * Tuned on MI350X (Aug 2, 2026 run, 32768² shapes, S=16):     \
              *   256×256 KU=1: 86412 GFLOP/s for M,N,K ≥ 8192             \
              *   128×128 KU=2: 48037 GFLOP/s for K ≥ 2048 (beats KU=1     \
              *     46407 at K=2048, 66354 vs 49817 at K=32768)             \
              *   128×128 KU=1: 11100-42091 GFLOP/s for K < 2048           \
-             *     (beats KU=2 at K≤1024: 42091 vs 36897)                  */ \
-            if (m >= 8192 && n >= 8192 && k >= 8192) { \
-                _OV_DISPATCH((S_V),4,4,16,4,4,1,false,1);  /* 256×256, KU=1 */ \
-            } else if (k >= 2048) { \
-                _OV_DISPATCH((S_V),4,4,16,2,2,2,false,1);  /* 128×128, KU=2 */ \
-            } else { \
-                _OV_DISPATCH((S_V),4,4,16,2,2,1,false,1);  /* 128×128, KU=1 */ \
-            } \
-        } else { \
+             *     (beats KU=2 at K≤1024: 42091 vs 36897)                  */  \
+            if(m >= 8192 && n >= 8192 && k >= 8192)                                                                                    \
+            {                                                                                                                          \
+                _OV_DISPATCH((S_V), 4, 4, 16, 4, 4, 1, false, 1); /* 256×256, KU=1 */                                                 \
+            }                                                                                                                          \
+            else if(k >= 2048)                                                                                                         \
+            {                                                                                                                          \
+                _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 2, false, 1); /* 128×128, KU=2 */                                                 \
+            }                                                                                                                          \
+            else                                                                                                                       \
+            {                                                                                                                          \
+                _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 1, false, 1); /* 128×128, KU=1 */                                                 \
+            }                                                                                                                          \
+        }                                                                                                                              \
+        else                                                                                                                           \
+        {                                                                                                                              \
             /* ── gfx942 (MI300X) tile selection ────────────────────────── */ \
-            if (m >= 8192 && n >= 8192 && k >= 8192) { \
-                _OV_DISPATCH((S_V),4,4,16,4,4,1,false,1);  /* 256×256, KU=1 (37237 GFLOP/s vs PGR2 36572) */ \
-            } else { \
-                _OV_DISPATCH((S_V),4,4,16,2,2,2,false,1);  /* 128×128, KU=2 */ \
-            } \
-        } \
+            if(m >= 8192 && n >= 8192 && k >= 8192)                                                                                    \
+            {                                                                                                                          \
+                _OV_DISPATCH((S_V),                                                                                                    \
+                             4,                                                                                                        \
+                             4,                                                                                                        \
+                             16,                                                                                                       \
+                             4,                                                                                                        \
+                             4,                                                                                                        \
+                             1,                                                                                                        \
+                             false,                                                                                                    \
+                             1); /* 256×256, KU=1 (37237 GFLOP/s vs PGR2 36572) */                                                    \
+            }                                                                                                                          \
+            else                                                                                                                       \
+            {                                                                                                                          \
+                _OV_DISPATCH((S_V), 4, 4, 16, 2, 2, 2, false, 1); /* 128×128, KU=2 */                                                 \
+            }                                                                                                                          \
+        }                                                                                                                              \
     } while(0)
 
     /* Shape override: always dispatches oz2_fused_TN_kernel<16,...>.
@@ -1084,25 +1545,61 @@ rocblaslt_status oz2_launch_fused_TN(
      * num_moduli=16 so the kernel's S=16 loop matches the allocated INT8 data. */
     OZ2_DISPATCH_SHAPE_OVERRIDE(16);
 
-    switch(num_moduli) {
-        case  2: OZ2_DISPATCH_SHAPE( 2); break;
-        case  3: OZ2_DISPATCH_SHAPE( 3); break;
-        case  4: OZ2_DISPATCH_SHAPE( 4); break;
-        case  5: OZ2_DISPATCH_SHAPE( 5); break;
-        case  6: OZ2_DISPATCH_SHAPE( 6); break;
-        case  7: OZ2_DISPATCH_SHAPE( 7); break;
-        case  8: OZ2_DISPATCH_SHAPE( 8); break;
-        case  9: OZ2_DISPATCH_SHAPE( 9); break;
-        case 10: OZ2_DISPATCH_SHAPE(10); break;
-        case 11: OZ2_DISPATCH_SHAPE(11); break;
-        case 12: OZ2_DISPATCH_SHAPE(12); break;
-        case 13: OZ2_DISPATCH_SHAPE(13); break;
-        case 14: OZ2_DISPATCH_SHAPE(14); break;
-        case 15: OZ2_DISPATCH_SHAPE(15); break;
-        case 16: OZ2_DISPATCH_SHAPE(16); break;
-        case 17: OZ2_DISPATCH_SHAPE(17); break;
-        case 18: OZ2_DISPATCH_SHAPE(18); break;
-        default: return rocblaslt_status_invalid_value;
+    switch(num_moduli)
+    {
+    case 2:
+        OZ2_DISPATCH_SHAPE(2);
+        break;
+    case 3:
+        OZ2_DISPATCH_SHAPE(3);
+        break;
+    case 4:
+        OZ2_DISPATCH_SHAPE(4);
+        break;
+    case 5:
+        OZ2_DISPATCH_SHAPE(5);
+        break;
+    case 6:
+        OZ2_DISPATCH_SHAPE(6);
+        break;
+    case 7:
+        OZ2_DISPATCH_SHAPE(7);
+        break;
+    case 8:
+        OZ2_DISPATCH_SHAPE(8);
+        break;
+    case 9:
+        OZ2_DISPATCH_SHAPE(9);
+        break;
+    case 10:
+        OZ2_DISPATCH_SHAPE(10);
+        break;
+    case 11:
+        OZ2_DISPATCH_SHAPE(11);
+        break;
+    case 12:
+        OZ2_DISPATCH_SHAPE(12);
+        break;
+    case 13:
+        OZ2_DISPATCH_SHAPE(13);
+        break;
+    case 14:
+        OZ2_DISPATCH_SHAPE(14);
+        break;
+    case 15:
+        OZ2_DISPATCH_SHAPE(15);
+        break;
+    case 16:
+        OZ2_DISPATCH_SHAPE(16);
+        break;
+    case 17:
+        OZ2_DISPATCH_SHAPE(17);
+        break;
+    case 18:
+        OZ2_DISPATCH_SHAPE(18);
+        break;
+    default:
+        return rocblaslt_status_invalid_value;
     }
 
 #undef _OV_DISPATCH
