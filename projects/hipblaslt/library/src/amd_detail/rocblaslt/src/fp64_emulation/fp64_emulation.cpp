@@ -111,39 +111,47 @@ namespace FP64Emulation
         return static_cast<unsigned>(std::max(size_t(1u), chunk));
     }
 
-    /* =========================================================================
-     * Architecture-specific performance-model parameters
-     *
-     * Keyed on hipDeviceProp_t::pciDeviceID — unique per silicon SKU.
-     * If the running device is not in the table, emulation is disabled and
-     * native DGEMM is used instead (avoids unvalidated perf predictions).
-     * ========================================================================= */
-    struct PerfModelParams
+    /* Kernel efficiency factors and latency constants calibrated on MI355X. */
+    struct PerfModelKernelEffs
+    {
+        static constexpr double eff_prelim[2][2] = {{0.622, 0.550},   /* [N][N], [N][T] */
+                                                   {0.797, 0.628}};  /* [T][N], [T][T] */
+        static constexpr double eff_scale[2][2]  = {{0.405, 0.354},
+                                                   {0.461, 0.401}};
+        static constexpr double eff_refine        = 0.511;
+        static constexpr double eff_accum         = 0.775;
+        static constexpr double eff_fused         = 0.333;
+        static constexpr double host_overhead_s  = 1.0e-4;   /* host overhead (s) = 0.1 ms           */
+        static constexpr double latency_kernel_s = 5.0e-6;   /* GPU kernel scheduling overhead (s)   */
+        static constexpr double latency_matmul_s = 10.0e-6;  /* hipBLASLt matmul launch overhead (s) */
+        static constexpr double latency_memset_s = 2.0e-6;   /* hipMemsetAsync overhead (s)          */
+        static constexpr double latency_sync_s   = 50.0e-6;  /* hipStreamSynchronize cost (s)        */
+    };
+
+    struct PerfModelDeviceParams
     {
         double ai;
         double ratio;
         double latency;
     };
 
-    static const std::unordered_map<uint32_t, PerfModelParams> hw_params_by_pci_id = {
-        {0x74a0u, {2.63868, 168.411, 3.93e7}},
-        {0x74a1u, {2.63868, 168.411, 3.93e7}},
-        {0x74a9u, {2.63868, 168.411, 3.93e7}},
-
-        {0x75a0u, {11.2237, 46.4678, 6.08e7}},
-        {0x75b0u, {11.2237, 46.4678, 6.08e7}},
-
-        {0x75a3u, {11.3284, 42.7280, 6.82e7}},
-        {0x75b3u, {11.3284, 42.7280, 6.82e7}},
-    };
-
-    /* Per-device cache.   */
-    static std::optional<std::optional<PerfModelParams>> device_params_cache[64];
-
     /* Returns the perf-model parameters for the given HIP device, or nullopt if
      * the device is not in the table (in which case emulation should not run). */
-    static std::optional<PerfModelParams> get_perf_model_params(int device)
+    static std::optional<PerfModelDeviceParams> get_perf_model_params(int device)
     {
+        static const std::unordered_map<uint32_t, PerfModelDeviceParams> hw_params_by_pci_id = {
+            {0x74a0u, {2.63868, 168.411, 3.93e7}},
+            {0x74a1u, {2.63868, 168.411, 3.93e7}},
+            {0x74a9u, {2.63868, 168.411, 3.93e7}},
+
+            {0x75a0u, {11.2237, 46.4678, 6.08e7}},
+            {0x75b0u, {11.2237, 46.4678, 6.08e7}},
+
+            {0x75a3u, {11.3284, 42.7280, 6.82e7}},
+            {0x75b3u, {11.3284, 42.7280, 6.82e7}},
+        };
+        static std::optional<std::optional<PerfModelDeviceParams>> device_params_cache[64];
+
         if(device < 0 || device >= 64)
             return std::nullopt;
         auto& entry = device_params_cache[device];
@@ -154,8 +162,9 @@ namespace FP64Emulation
                 = hipDeviceGetAttribute(&chip_id, hipDeviceAttributePciChipId, device);
             const uint32_t pci_device_id = static_cast<uint32_t>(chip_id) & 0xFFFFu;
             auto           it            = hw_params_by_pci_id.find(pci_device_id);
-            entry = (it != hw_params_by_pci_id.end()) ? std::optional<PerfModelParams>{it->second}
-                                                      : std::optional<PerfModelParams>{};
+            entry = (it != hw_params_by_pci_id.end())
+                        ? std::optional<PerfModelDeviceParams>{it->second}
+                        : std::optional<PerfModelDeviceParams>{};
         }
         return *entry;
     }
@@ -176,7 +185,6 @@ namespace FP64Emulation
         double t_int8_gemms_ms; /* all INT8 GEMMs                      */
         double t_accum_ms; /* CRT accumulation / finalize kernels */
         double t_host_ms; /* per-call host overhead              */
-        double t_launch_ms; /* kernel-launch overhead              */
         double t_fused_ms; /* fused TN kernel (replaces scale+GEMM+accum when better) */
         double t_total_ms; /* total predicted emulation time      */
         double t_native_ms; /* predicted native FP64 DGEMM time    */
@@ -191,21 +199,13 @@ namespace FP64Emulation
                                            int      device,
                                            bool     dynamic_mode)
     {
+        using K = PerfModelKernelEffs;
         const auto hw_opt = get_perf_model_params(device);
         assert(hw_opt.has_value()
                && "perf_model_times called for a device not in hw_params_by_pci_id");
-        const PerfModelParams& hw = *hw_opt;
+        const PerfModelDeviceParams& hw = *hw_opt;
 
-        static constexpr double LATENCY_KERNEL = 5.0e-6;
-        static constexpr double LATENCY_MATMUL = 10.0e-6;
-        static constexpr double LATENCY_MEMSET = 2.0e-6;
-        /* CPU-GPU roundtrip for hipStreamSynchronize: the host parks until the GPU
-         * drains and signals, then re-queues the remaining kernels.  This is a
-         * true OS/driver latency, distinct from the GPU-side LATENCY_KERNEL or
-         * LATENCY_MATMUL scheduling overheads.                                  */
-        static constexpr double LATENCY_SYNC = 50.0e-6;
-
-        const double c0  = hw.latency / LATENCY_MATMUL;
+        const double c0  = hw.latency / K::latency_matmul_s;
         const double c1  = c0 * hw.ai;
         const double c2  = c1 * hw.ratio;
         const double s   = static_cast<double>(num_moduli);
@@ -218,37 +218,31 @@ namespace FP64Emulation
         const double n_chunks       = std::ceil(s / chunk_sz);
         const double n_scale_chunks = n_chunks; /* scale and GEMM share the same chunk */
 
-        const double            EFF_PRELIM_KERN = tA ? (tB ? 0.628 : 0.797) : (tB ? 0.550 : 0.622);
-        const double            EFF_SCALE_KERN  = tA ? (tB ? 0.401 : 0.461) : (tB ? 0.354 : 0.405);
-        static constexpr double EFF_REFINE_KERN = 0.511;
-        static constexpr double EFF_ACCUM_KERN  = 0.775;
-        static constexpr double OZ2_HOST_OVERHEAD_MS = 0.100;
-
         const double t_int8_bw = (mk + kn + 4.0 * mn) / c0;
         const double t_prelim_kern
-            = ((mk + kn) * 17.0 / c0 + 2.0 * LATENCY_KERNEL) / EFF_PRELIM_KERN;
-        const double t_prelim_gemm = std::max(2.0 * mnk / c2, t_int8_bw) + LATENCY_MATMUL;
+            = ((mk + kn) * 17.0 / c0 + 2.0 * K::latency_kernel_s) / K::eff_prelim[tA][tB];
+        const double t_prelim_gemm = std::max(2.0 * mnk / c2, t_int8_bw) + K::latency_matmul_s;
         const double t_refine_kern
-            = (mn * 8.0 / c0 + 3.0 * LATENCY_KERNEL + LATENCY_MEMSET) / EFF_REFINE_KERN;
+            = (mn * 8.0 / c0 + 3.0 * K::latency_kernel_s + K::latency_memset_s) / K::eff_refine;
         const double t_scale_kern
-            = ((mk + kn) * (8.0 * n_scale_chunks + s) / c0 + 2.0 * n_scale_chunks * LATENCY_KERNEL)
-              / EFF_SCALE_KERN;
+            = ((mk + kn) * (8.0 * n_scale_chunks + s) / c0
+               + 2.0 * n_scale_chunks * K::latency_kernel_s)
+              / K::eff_scale[tA][tB];
         const double t_int8_gemms
-            = s * std::max(2.0 * mnk / c2, t_int8_bw) + n_chunks * LATENCY_MATMUL;
+            = s * std::max(2.0 * mnk / c2, t_int8_bw) + n_chunks * K::latency_matmul_s;
         const double t_accum_kern
-            = (mn * (4.0 * s + 32.0 * n_chunks - 16.0) / c0 + n_chunks * LATENCY_KERNEL)
-              / EFF_ACCUM_KERN;
-        const double t_host   = OZ2_HOST_OVERHEAD_MS * 1e-3;
-        const double t_launch = 0.0; /* all launch overhead distributed into components above */
+            = (mn * (4.0 * s + 32.0 * n_chunks - 16.0) / c0 + n_chunks * K::latency_kernel_s)
+              / K::eff_accum;
+        const double t_host   = K::host_overhead_s;
 
         /* Fused TN kernel: reads pre-computed INT8 A8i/B8i from workspace, performs
          * MFMA + CRT accumulation, writes FP64 D directly.  Scale runs separately.  */
-        static constexpr double EFF_FUSED  = 0.333;
-        const double            t_fused_bw = (s * (mk + kn) + 16.0 * mn) / c0; /* INT8 + FP64 C/D */
-        const double            t_fused_int8 = s * 2.0 * mnk / c2; /* MFMA              */
-        const double            t_fused_fp64 = s * 8.0 * mn / c1; /* CRT accum only    */
-        const double            t_fused_cmp  = t_fused_int8 + t_fused_fp64;
-        const double t_fused = std::max(t_fused_bw, t_fused_cmp) / EFF_FUSED + LATENCY_KERNEL;
+        const double t_fused_bw   = (s * (mk + kn) + 16.0 * mn) / c0; /* INT8 + FP64 C/D */
+        const double t_fused_int8 = s * 2.0 * mnk / c2;               /* MFMA              */
+        const double t_fused_fp64 = s * 8.0 * mn / c1;                /* CRT accum only    */
+        const double t_fused_cmp  = t_fused_int8 + t_fused_fp64;
+        const double t_fused
+            = std::max(t_fused_bw, t_fused_cmp) / K::eff_fused + K::latency_kernel_s;
 
         /* Scale always runs.  Fused kernel replaces only GEMM + CRT accum.
          * Only consider the fused time when the fused kernel is not disabled:
@@ -259,20 +253,20 @@ namespace FP64Emulation
                                         : t_int8_gemms + t_accum_kern;
         /* ADP (dynamic-mode) overhead: two tiny reduction kernels followed by a
          * hipStreamSynchronize that blocks the CPU until the GPU drains.
-         *   oz2_adp_reduce_A reads row_max[m]  (~m × 4 bytes, negligible)
-         *   oz2_adp_reduce_B reads col_max[n]  (~n × 4 bytes, negligible)
+         *   adp_reduce_A_kernel reads row_max[m]  (~m × 4 bytes, negligible)
+         *   adp_reduce_B_kernel reads col_max[n]  (~n × 4 bytes, negligible)
          *     — col_max[] was precomputed by col_max_kernel (charged to t_refine);
-         *       adp_reduce_B no longer reads the full m×n C32i matrix.
+         *       adp_reduce_B_kernel no longer reads the full m×n C32i matrix.
          * Bottleneck is entirely the CPU-GPU hipStreamSynchronize roundtrip.       */
         const double t_adp
             = dynamic_mode
-                  ? 2.0 * LATENCY_KERNEL /* oz2_adp_reduce_A + oz2_adp_reduce_B (both tiny) */
-                        + LATENCY_SYNC /* hipStreamSynchronize — dominant cost             */
+                  ? 2.0 * K::latency_kernel_s /* adp_reduce_A_kernel + adp_reduce_B_kernel */
+                        + K::latency_sync_s    /* hipStreamSynchronize — dominant cost */
                   : 0.0;
         const double t_total = t_prelim_kern + t_prelim_gemm + t_refine_kern + t_scale_kern
                                + t_gemm_accum + t_host + t_adp;
         const double t_native
-            = std::max(2.0 * mnk / c1, 8.0 * (mk + kn + mn) / c0) + LATENCY_MATMUL;
+            = std::max(2.0 * mnk / c1, 8.0 * (mk + kn + mn) / c0) + K::latency_matmul_s;
 
         constexpr double s2ms = 1000.0;
         return {t_prelim_kern * s2ms,
@@ -283,7 +277,6 @@ namespace FP64Emulation
                 t_int8_gemms * s2ms,
                 t_accum_kern * s2ms,
                 t_host * s2ms,
-                t_launch * s2ms,
                 t_fused * s2ms,
                 t_total * s2ms,
                 t_native * s2ms};
@@ -367,7 +360,6 @@ namespace FP64Emulation
                 half.t_int8_gemms_ms *= 2.0;
                 half.t_accum_ms *= 2.0;
                 half.t_host_ms *= 2.0;
-                half.t_launch_ms *= 2.0;
                 half.t_fused_ms *= 2.0;
                 half.t_total_ms *= 2.0;
                 /* Native DGEMM does not split: keep the top-level prediction. */
@@ -971,21 +963,21 @@ namespace FP64Emulation
 #pragma unroll
         for(unsigned t_local = 0; t_local < T_COUNT; ++t_local)
         {
-            const unsigned tidx     = t_start + t_local;
-            const double   neg_mod  = neg_mod(tidx);
-            const double   inv_mod  = inv_mod(tidx);
-            const float    inv_modf = inv_mod_f(tidx);
-            const double   r0       = fma(neg_mod, rint(ival0 * inv_mod), ival0);
-            const float    rf0      = static_cast<float>(r0);
-            const auto     b0       = static_cast<int8_t>(static_cast<int32_t>(
-                fmaf(rintf(rf0 * inv_modf), static_cast<float>(neg_mod), rf0)));
+            const unsigned tidx = t_start + t_local;
+            const double   nm   = neg_mod(tidx);
+            const double   im   = inv_mod(tidx);
+            const float    imf  = inv_mod_f(tidx);
+            const double   r0   = fma(nm, rint(ival0 * im), ival0);
+            const float    rf0  = static_cast<float>(r0);
+            const auto     b0   = static_cast<int8_t>(static_cast<int32_t>(
+                fmaf(rintf(rf0 * imf), static_cast<float>(nm), rf0)));
             if(valid1)
             {
                 /* Pack INT8[j0] and INT8[j0+1] into one 16-bit NT store. */
-                const double   r1     = fma(neg_mod, rint(ival1 * inv_mod), ival1);
+                const double   r1     = fma(nm, rint(ival1 * im), ival1);
                 const float    rf1    = static_cast<float>(r1);
                 const auto     b1     = static_cast<int8_t>(static_cast<int32_t>(
-                    fmaf(rintf(rf1 * inv_modf), static_cast<float>(neg_mod), rf1)));
+                    fmaf(rintf(rf1 * imf), static_cast<float>(nm), rf1)));
                 const uint16_t packed = static_cast<uint8_t>(b0)
                                         | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
                 __builtin_nontemporal_store(
@@ -1093,20 +1085,20 @@ namespace FP64Emulation
 #pragma unroll
         for(unsigned t_local = 0; t_local < T_COUNT; ++t_local)
         {
-            const unsigned tidx     = t_start + t_local;
-            const double   neg_mod  = neg_mod(tidx);
-            const double   inv_mod  = inv_mod(tidx);
-            const float    inv_modf = inv_mod_f(tidx);
-            const double   r0       = fma(neg_mod, rint(ival0 * inv_mod), ival0);
-            const float    rf0      = static_cast<float>(r0);
-            const auto     b0       = static_cast<int8_t>(static_cast<int32_t>(
-                fmaf(rintf(rf0 * inv_modf), static_cast<float>(neg_mod), rf0)));
+            const unsigned tidx = t_start + t_local;
+            const double   nm   = neg_mod(tidx);
+            const double   im   = inv_mod(tidx);
+            const float    imf  = inv_mod_f(tidx);
+            const double   r0   = fma(nm, rint(ival0 * im), ival0);
+            const float    rf0  = static_cast<float>(r0);
+            const auto     b0   = static_cast<int8_t>(static_cast<int32_t>(
+                fmaf(rintf(rf0 * imf), static_cast<float>(nm), rf0)));
             if(valid1)
             {
-                const double   r1     = fma(neg_mod, rint(ival1 * inv_mod), ival1);
+                const double   r1     = fma(nm, rint(ival1 * im), ival1);
                 const float    rf1    = static_cast<float>(r1);
                 const auto     b1     = static_cast<int8_t>(static_cast<int32_t>(
-                    fmaf(rintf(rf1 * inv_modf), static_cast<float>(neg_mod), rf1)));
+                    fmaf(rintf(rf1 * imf), static_cast<float>(nm), rf1)));
                 const uint16_t packed = static_cast<uint8_t>(b0)
                                         | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
                 __builtin_nontemporal_store(
@@ -3063,13 +3055,13 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                     "t_finalize_ms,t_total_ms,"
                     "pred_prelim_ms,pred_prelim_gemm_ms,pred_refine_ms,pred_adp_ms,"
                     "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
-                    "pred_host_ms,pred_launch_ms,pred_fused_ms,pred_total_ms,pred_native_dgemm_"
+                    "pred_host_ms,pred_fused_ms,pred_total_ms,pred_native_dgemm_"
                     "ms\n");
             std::fprintf(_f,
                          "%lld,%lld,%lld,%c,%c,%u,%u,%u,%u,"
                          "%llu,%u,"
                          "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                         "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                         "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                          (long long)m,
                          (long long)n,
                          (long long)k,
@@ -3100,7 +3092,6 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                          pm.t_int8_gemms_ms,
                          pm.t_accum_ms,
                          pm.t_host_ms,
-                         pm.t_launch_ms,
                          pm.t_fused_ms,
                          pm.t_total_ms,
                          pm.t_native_ms);
