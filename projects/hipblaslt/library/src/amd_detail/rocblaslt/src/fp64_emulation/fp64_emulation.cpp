@@ -909,17 +909,19 @@ namespace FP64Emulation
      * SHMEM kernels: TILE_M=16 → 4× fewer blocks/syncs; 8.7 KB LDS per block.
      * ========================================================================= */
     static constexpr int OZ2_SCALE_TILE_K = 64;
-    /* Coalesced kernels (A_T, B_N) process 2 k-positions per thread (K_UNROLL=2):
-     * effective k-tile per block = OZ2_SCALE_TILE_K * 2 = 128.                  */
+    /* Coalesced kernels (A_T, B_N) process 4 k-positions per thread (K_UNROLL=4):
+     * effective k-tile per block = OZ2_SCALE_TILE_K * 4 = 256.
+     * 32 threads × 4 bytes = 128 bytes = one full HBM cache line per warp.      */
     static constexpr int OZ2_SCALE_COALESC_TILE_M = 8; /* blockDim=512, no SHMEM */
     static constexpr int OZ2_SCALE_SHMEM_TILE_M   = 16; /* blockDim=1024, uses SHMEM */
 
-    /* ── A_T: TRANS_A=true, k-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=2 ──
-     * Each thread processes TWO adjacent k-positions: j0 and j0+1.
-     * j0 = blockIdx.x * 2*TILE_K + (t%TILE_K)*2  →  always even  →  16-byte aligned.
-     * Loads:  one double2 (128-bit) per thread (j0 & j0+1 together).
-     * Stores: one uint16_t NT store per modulus per thread (packs INT8[j0] & INT8[j1]).
-     * This halves both load and store instruction counts vs. two separate scalar ops. */
+    /* ── A_T: TRANS_A=true, k-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=4 ──
+     * Each thread processes FOUR adjacent k-positions: j0..j0+3.
+     * j0 = blockIdx.x * 4*TILE_K + (t%TILE_K)*4  →  always 4-aligned.
+     * Loads:  two double2 reads (j0..j0+1 and j0+2..j0+3), each 128-bit, each aligned.
+     * Stores: one uint32_t NT store per modulus (packs INT8[j0..j0+3]) = 128 bytes/warp.
+     * Moduli loop is OUTER so nm/im/imf are loaded once per modulus, and only
+     * TILE_M=8 NT write-combine buffers are needed simultaneously.               */
     template <unsigned T_COUNT>
     __global__ static void scale_A_T_kernel(const double* __restrict__ A,
                                             int64_t m,
@@ -935,58 +937,64 @@ namespace FP64Emulation
         static constexpr int TILE_M = OZ2_SCALE_COALESC_TILE_M; /* 8 */
         const int            t      = static_cast<int>(threadIdx.x);
         const int64_t        m_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
-        /* j0 is always even → the double2 load is 16-byte aligned when lda is even. */
-        const int64_t j0 = static_cast<int64_t>(blockIdx.x) * (TILE_K * 2)
-                           + static_cast<int64_t>(t % TILE_K) * 2;
-        const int64_t j1 = j0 + 1; /* adjacent element */
-        const int64_t i  = m_base + (t / TILE_K);
+        /* j0 is always 4-aligned → both double2 loads and the uint32_t store are aligned. */
+        const int64_t j0 = static_cast<int64_t>(blockIdx.x) * (TILE_K * 4)
+                           + static_cast<int64_t>(t % TILE_K) * 4;
+        const int64_t i = m_base + (t / TILE_K);
         if(i >= m || j0 >= k)
             return;
-        const int  sft    = static_cast<int>(sftA[i]);
-        const bool valid1 = (j1 < k);
-        double     ival0, ival1;
-        if(valid1)
+        const int sft = static_cast<int>(sftA[i]);
+        /* Load j0/j0+1 as double2 (j0 is 4-aligned → even → 16-byte aligned). */
+        double ival[4];
         {
-            /* 128-bit load: reads j0 and j0+1 in one instruction (j0 is even → aligned). */
             const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0);
-            ival0            = trunc(ldexp(vv.x, sft));
-            ival1            = trunc(ldexp(vv.y, sft));
+            ival[0] = trunc(ldexp(vv.x, sft));
+            ival[1] = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+        }
+        /* Load j0+2/j0+3 as double2 (j0+2 is even → aligned) only when valid. */
+        if(j0 + 2 < k)
+        {
+            const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0 + 2);
+            ival[2] = trunc(ldexp(vv.x, sft));
+            ival[3] = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
         }
         else
         {
-            ival0 = trunc(ldexp(A[i * lda + j0], sft));
-            ival1 = 0.0;
+            ival[2] = 0.0;
+            ival[3] = 0.0;
         }
         const size_t stride   = lda8i * cola8i;
         const size_t off_base = static_cast<size_t>(i) * lda8i;
-        const size_t off0 = static_cast<size_t>(j0) + off_base; /* always even → uint16_t aligned */
-#pragma unroll
+        const size_t off0     = static_cast<size_t>(j0) + off_base; /* 4-aligned → uint32_t aligned */
+        /* Outer loop over moduli — sequential (no unroll) so nm/im/imf loaded once per modulus,
+         * keeping register pressure low and WCB usage at TILE_M=8 entries simultaneously.   */
         for(unsigned t_local = 0; t_local < T_COUNT; ++t_local)
         {
             const unsigned tidx = t_start + t_local;
             const double   nm   = neg_mod(tidx);
             const double   im   = inv_mod(tidx);
             const float    imf  = inv_mod_f(tidx);
-            const double   r0   = fma(nm, rint(ival0 * im), ival0);
-            const float    rf0  = static_cast<float>(r0);
-            const auto     b0   = static_cast<int8_t>(static_cast<int32_t>(
-                fmaf(rintf(rf0 * imf), static_cast<float>(nm), rf0)));
-            if(valid1)
+            /* Compute INT8 residues for all four k-positions. */
+            int8_t b[4];
+#pragma unroll
+            for(int p = 0; p < 4; ++p)
             {
-                /* Pack INT8[j0] and INT8[j0+1] into one 16-bit NT store. */
-                const double   r1     = fma(nm, rint(ival1 * im), ival1);
-                const float    rf1    = static_cast<float>(r1);
-                const auto     b1     = static_cast<int8_t>(static_cast<int32_t>(
-                    fmaf(rintf(rf1 * imf), static_cast<float>(nm), rf1)));
-                const uint16_t packed = static_cast<uint8_t>(b0)
-                                        | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
-                __builtin_nontemporal_store(
-                    packed, reinterpret_cast<uint16_t*>(A8i + t_local * stride + off0));
+                const double rp  = fma(nm, rint(ival[p] * im), ival[p]);
+                const float  rfp = static_cast<float>(rp);
+                b[p] = static_cast<int8_t>(static_cast<int32_t>(
+                    fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
             }
-            else
-            {
-                __builtin_nontemporal_store(b0, A8i + t_local * stride + off0);
-            }
+            /* Pack and store: always write 4 bytes as uint32_t.
+             * Out-of-bounds b[p] are zero (ival[p] was pre-zeroed for p >= valid count),
+             * so the extra bytes land harmlessly in the [k, lda8i) padding region.
+             * j0 is always 4-aligned, so dst is always uint32_t-aligned.
+             * This eliminates branch divergence in tail k-tiles.              */
+            int8_t* const  dst    = A8i + t_local * stride + off0;
+            const uint32_t packed = static_cast<uint8_t>(b[0])
+                                    | (static_cast<uint32_t>(static_cast<uint8_t>(b[1])) << 8)
+                                    | (static_cast<uint32_t>(static_cast<uint8_t>(b[2])) << 16)
+                                    | (static_cast<uint32_t>(static_cast<uint8_t>(b[3])) << 24);
+            __builtin_nontemporal_store(packed, reinterpret_cast<uint32_t*>(dst));
         }
     }
 
@@ -1043,8 +1051,8 @@ namespace FP64Emulation
         }
     }
 
-    /* ── B_N: TRANS_B=false, j-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=2 ──
-     * Mirrors scale_A_T_kernel: double2 load + uint16_t packed store. */
+    /* ── B_N: TRANS_B=false, j-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=4 ──
+     * Mirrors scale_A_T_kernel: two double2 loads (j0..j0+1 and j0+2..j0+3) + uint32_t packed store. */
     template <unsigned T_COUNT>
     __global__ static void scale_B_N_kernel(const double* __restrict__ B,
                                             int64_t n,
@@ -1059,55 +1067,58 @@ namespace FP64Emulation
         static constexpr int TILE_M = OZ2_SCALE_COALESC_TILE_M; /* 8 */
         const int            t      = static_cast<int>(threadIdx.x);
         const int64_t        n_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
-        const int64_t        j0     = static_cast<int64_t>(blockIdx.x) * (TILE_K * 2)
-                           + static_cast<int64_t>(t % TILE_K) * 2;
-        const int64_t j1  = j0 + 1; /* adjacent element */
+        const int64_t        j0     = static_cast<int64_t>(blockIdx.x) * (TILE_K * 4)
+                           + static_cast<int64_t>(t % TILE_K) * 4;
         const int64_t col = n_base + (t / TILE_K);
         if(col >= n || j0 >= k)
             return;
-        const int  sft    = static_cast<int>(sftB[col]);
-        const bool valid1 = (j1 < k);
-        double     ival0, ival1;
-        if(valid1)
+        const int sft = static_cast<int>(sftB[col]);
+        double ival[4];
         {
             const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0);
-            ival0            = trunc(ldexp(vv.x, sft));
-            ival1            = trunc(ldexp(vv.y, sft));
+            ival[0] = trunc(ldexp(vv.x, sft));
+            ival[1] = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+        }
+        if(j0 + 2 < k)
+        {
+            const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0 + 2);
+            ival[2] = trunc(ldexp(vv.x, sft));
+            ival[3] = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
         }
         else
         {
-            ival0 = trunc(ldexp(B[col * ldb + j0], sft));
-            ival1 = 0.0;
+            ival[2] = 0.0;
+            ival[3] = 0.0;
         }
         const size_t stride   = ldb8i * static_cast<size_t>(n);
         const size_t off_base = static_cast<size_t>(col) * ldb8i;
-        const size_t off0 = static_cast<size_t>(j0) + off_base; /* always even → uint16_t aligned */
-#pragma unroll
+        const size_t off0     = static_cast<size_t>(j0) + off_base; /* 4-aligned → uint32_t aligned */
         for(unsigned t_local = 0; t_local < T_COUNT; ++t_local)
         {
             const unsigned tidx = t_start + t_local;
             const double   nm   = neg_mod(tidx);
             const double   im   = inv_mod(tidx);
             const float    imf  = inv_mod_f(tidx);
-            const double   r0   = fma(nm, rint(ival0 * im), ival0);
-            const float    rf0  = static_cast<float>(r0);
-            const auto     b0   = static_cast<int8_t>(static_cast<int32_t>(
-                fmaf(rintf(rf0 * imf), static_cast<float>(nm), rf0)));
-            if(valid1)
+            int8_t b[4];
+#pragma unroll
+            for(int p = 0; p < 4; ++p)
             {
-                const double   r1     = fma(nm, rint(ival1 * im), ival1);
-                const float    rf1    = static_cast<float>(r1);
-                const auto     b1     = static_cast<int8_t>(static_cast<int32_t>(
-                    fmaf(rintf(rf1 * imf), static_cast<float>(nm), rf1)));
-                const uint16_t packed = static_cast<uint8_t>(b0)
-                                        | (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8);
-                __builtin_nontemporal_store(
-                    packed, reinterpret_cast<uint16_t*>(B8i + t_local * stride + off0));
+                const double rp  = fma(nm, rint(ival[p] * im), ival[p]);
+                const float  rfp = static_cast<float>(rp);
+                b[p] = static_cast<int8_t>(static_cast<int32_t>(
+                    fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
             }
-            else
-            {
-                __builtin_nontemporal_store(b0, B8i + t_local * stride + off0);
-            }
+            /* Pack and store: always write 4 bytes as uint32_t.
+             * Out-of-bounds b[p] are zero (ival[p] was pre-zeroed for p >= valid count),
+             * so the extra bytes land harmlessly in the [k, ldb8i) padding region.
+             * j0 is always 4-aligned, so dst is always uint32_t-aligned.
+             * This eliminates branch divergence in tail k-tiles.              */
+            int8_t* const  dst    = B8i + t_local * stride + off0;
+            const uint32_t packed = static_cast<uint8_t>(b[0])
+                                    | (static_cast<uint32_t>(static_cast<uint8_t>(b[1])) << 8)
+                                    | (static_cast<uint32_t>(static_cast<uint8_t>(b[2])) << 16)
+                                    | (static_cast<uint32_t>(static_cast<uint8_t>(b[3])) << 24);
+            __builtin_nontemporal_store(packed, reinterpret_cast<uint32_t*>(dst));
         }
     }
 
@@ -1551,7 +1562,7 @@ namespace FP64Emulation
                                hipStream_t   stream)
     {
         const unsigned k_c
-            = static_cast<unsigned>((k + 2u * OZ2_SCALE_TILE_K - 1u) / (2u * OZ2_SCALE_TILE_K));
+            = static_cast<unsigned>((k + 4u * OZ2_SCALE_TILE_K - 1u) / (4u * OZ2_SCALE_TILE_K));
         const unsigned k_x = static_cast<unsigned>((k + OZ2_SCALE_TILE_K - 1) / OZ2_SCALE_TILE_K);
         if(tA)
             hipLaunchKernelGGL((scale_A_T_kernel<TC>),
@@ -1602,7 +1613,7 @@ namespace FP64Emulation
                                hipStream_t   stream)
     {
         const unsigned k_c
-            = static_cast<unsigned>((k + 2u * OZ2_SCALE_TILE_K - 1u) / (2u * OZ2_SCALE_TILE_K));
+            = static_cast<unsigned>((k + 4u * OZ2_SCALE_TILE_K - 1u) / (4u * OZ2_SCALE_TILE_K));
         const unsigned k_x = static_cast<unsigned>((k + OZ2_SCALE_TILE_K - 1) / OZ2_SCALE_TILE_K);
         if(!tB)
             hipLaunchKernelGGL((scale_B_N_kernel<TC>),
