@@ -114,20 +114,21 @@ namespace FP64Emulation
     /* Kernel efficiency factors and latency constants calibrated on MI355X. */
     struct PerfModelKernelEffs
     {
-        static constexpr double eff_prelim[2][2] = {
-            {0.697, 0.561},   /* [N][N], [N][T] */
-            {0.902, 0.682}};  /* [T][N], [T][T] */
-        static constexpr double eff_scale[2][2]  = {
-            {0.595,  0.520},   /* [N][N], [N][T] */
-            {0.683,  0.583}};  /* [T][N], [T][T] */
-        static constexpr double eff_refine        = 0.586;
-        static constexpr double eff_accum         = 0.938;
-        static constexpr double eff_fused         = 0.333;
-        static constexpr double host_overhead_s  = 1.0e-4;   /* host overhead (s) = 0.1 ms           */
-        static constexpr double latency_kernel_s = 5.0e-6;   /* GPU kernel scheduling overhead (s)   */
-        static constexpr double latency_matmul_s = 10.0e-6;  /* hipBLASLt matmul launch overhead (s) */
-        static constexpr double latency_memset_s = 2.0e-6;   /* hipMemsetAsync overhead (s)          */
-        static constexpr double latency_sync_s   = 50.0e-6;  /* hipStreamSynchronize cost (s)        */
+        static constexpr double eff_prelim[2][2] = {{0.697, 0.561}, /* [N][N], [N][T] */
+                                                    {0.902, 0.682}}; /* [T][N], [T][T] */
+        static constexpr double eff_scale[2][2]  = {{0.595, 0.520}, /* [N][N], [N][T] */
+                                                    {0.683, 0.583}}; /* [T][N], [T][T] */
+        static constexpr double eff_refine       = 0.586;
+        static constexpr double eff_accum        = 0.938;
+        static constexpr double eff_fused        = 0.333;
+        static constexpr double host_overhead_s = 1.0e-4; /* host overhead (s) = 0.1 ms           */
+        static constexpr double latency_kernel_s
+            = 5.0e-6; /* GPU kernel scheduling overhead (s)   */
+        static constexpr double latency_matmul_s
+            = 10.0e-6; /* hipBLASLt matmul launch overhead (s) */
+        static constexpr double latency_memset_s
+            = 2.0e-6; /* hipMemsetAsync overhead (s)          */
+        static constexpr double latency_sync_s = 50.0e-6; /* hipStreamSynchronize cost (s)        */
     };
 
     struct PerfModelDeviceParams
@@ -164,9 +165,9 @@ namespace FP64Emulation
                 = hipDeviceGetAttribute(&chip_id, hipDeviceAttributePciChipId, device);
             const uint32_t pci_device_id = static_cast<uint32_t>(chip_id) & 0xFFFFu;
             auto           it            = hw_params_by_pci_id.find(pci_device_id);
-            entry = (it != hw_params_by_pci_id.end())
-                        ? std::optional<PerfModelDeviceParams>{it->second}
-                        : std::optional<PerfModelDeviceParams>{};
+            entry                        = (it != hw_params_by_pci_id.end())
+                                               ? std::optional<PerfModelDeviceParams>{it->second}
+                                               : std::optional<PerfModelDeviceParams>{};
         }
         return *entry;
     }
@@ -201,7 +202,7 @@ namespace FP64Emulation
                                            int      device,
                                            bool     dynamic_mode)
     {
-        using K = PerfModelKernelEffs;
+        using K           = PerfModelKernelEffs;
         const auto hw_opt = get_perf_model_params(device);
         assert(hw_opt.has_value()
                && "perf_model_times called for a device not in hw_params_by_pci_id");
@@ -226,22 +227,21 @@ namespace FP64Emulation
         const double t_prelim_gemm = std::max(2.0 * mnk / c2, t_int8_bw) + K::latency_matmul_s;
         const double t_refine_kern
             = (mn * 8.0 / c0 + 3.0 * K::latency_kernel_s + K::latency_memset_s) / K::eff_refine;
-        const double t_scale_kern
-            = ((mk + kn) * (8.0 * n_scale_chunks + s) / c0
-               + 2.0 * n_scale_chunks * K::latency_kernel_s)
-              / K::eff_scale[tA][tB];
+        const double t_scale_kern = ((mk + kn) * (8.0 * n_scale_chunks + s) / c0
+                                     + 2.0 * n_scale_chunks * K::latency_kernel_s)
+                                    / K::eff_scale[tA][tB];
         const double t_int8_gemms
             = s * std::max(2.0 * mnk / c2, t_int8_bw) + n_chunks * K::latency_matmul_s;
         const double t_accum_kern
             = (mn * (4.0 * s + 32.0 * n_chunks - 16.0) / c0 + n_chunks * K::latency_kernel_s)
               / K::eff_accum;
-        const double t_host   = K::host_overhead_s;
+        const double t_host = K::host_overhead_s;
 
         /* Fused TN kernel: reads pre-computed INT8 A8i/B8i from workspace, performs
          * MFMA + CRT accumulation, writes FP64 D directly.  Scale runs separately.  */
         const double t_fused_bw   = (s * (mk + kn) + 16.0 * mn) / c0; /* INT8 + FP64 C/D */
-        const double t_fused_int8 = s * 2.0 * mnk / c2;               /* MFMA              */
-        const double t_fused_fp64 = s * 8.0 * mn / c1;                /* CRT accum only    */
+        const double t_fused_int8 = s * 2.0 * mnk / c2; /* MFMA              */
+        const double t_fused_fp64 = s * 8.0 * mn / c1; /* CRT accum only    */
         const double t_fused_cmp  = t_fused_int8 + t_fused_fp64;
         const double t_fused
             = std::max(t_fused_bw, t_fused_cmp) / K::eff_fused + K::latency_kernel_s;
@@ -263,7 +263,7 @@ namespace FP64Emulation
         const double t_adp
             = dynamic_mode
                   ? 2.0 * K::latency_kernel_s /* adp_reduce_A_kernel + adp_reduce_B_kernel */
-                        + K::latency_sync_s    /* hipStreamSynchronize — dominant cost */
+                        + K::latency_sync_s /* hipStreamSynchronize — dominant cost */
                   : 0.0;
         const double t_total = t_prelim_kern + t_prelim_gemm + t_refine_kern + t_scale_kern
                                + t_gemm_accum + t_host + t_adp;
@@ -492,8 +492,8 @@ namespace FP64Emulation
         __shared__ double  s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
         __shared__ int16_t s_sft[1];
 
-        const int64_t row    = static_cast<int64_t>(blockIdx.x);
-        const int64_t k_even = k & ~int64_t{1}; /* floor(k/2)*2 — double2 main range */
+        const int64_t       row      = static_cast<int64_t>(blockIdx.x);
+        const int64_t       k_even   = k & ~int64_t{1}; /* floor(k/2)*2 — double2 main range */
         const double* const row_base = A + static_cast<size_t>(row) * static_cast<size_t>(lda);
 
         /* Pass 1: reduce per-row max using double2 loads (2 elements per memory txn). */
@@ -503,21 +503,27 @@ namespace FP64Emulation
             const double2 vv = *reinterpret_cast<const double2*>(row_base + j); /* COALESCED */
             if constexpr(CHECK_NAN)
             {
-                if(!isfinite(vv.x)) (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
-                if(!isfinite(vv.y)) (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+                if(!isfinite(vv.x))
+                    (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
+                if(!isfinite(vv.y))
+                    (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
             }
             const double av0 = fabs(vv.x), av1 = fabs(vv.y);
-            if(av0 > local_max) local_max = av0;
-            if(av1 > local_max) local_max = av1;
+            if(av0 > local_max)
+                local_max = av0;
+            if(av1 > local_max)
+                local_max = av1;
         }
         /* Scalar tail: last element when k is odd (thread 0 only). */
         if((k & 1) && threadIdx.x == 0)
         {
             const double val = row_base[k - 1];
             if constexpr(CHECK_NAN)
-                if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+                if(!isfinite(val))
+                    (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
             const double av = fabs(val);
-            if(av > local_max) local_max = av;
+            if(av > local_max)
+                local_max = av;
         }
 
         local_max = warp_reduce_max_abs_d(local_max);
@@ -537,17 +543,17 @@ namespace FP64Emulation
         for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
         {
             const double2 vv = *reinterpret_cast<const double2*>(row_base + j); /* COALESCED */
-            A8i_high[row_out + static_cast<size_t>(j)    ] =
-                static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
-            A8i_high[row_out + static_cast<size_t>(j) + 1] =
-                static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
+            A8i_high[row_out + static_cast<size_t>(j)]
+                = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
+            A8i_high[row_out + static_cast<size_t>(j) + 1]
+                = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
         }
         /* Scalar tail. */
         if((k & 1) && threadIdx.x == 0)
         {
             const double scaled = ceil(ldexp(fabs(row_base[k - 1]), sft));
-            A8i_high[row_out + static_cast<size_t>(k - 1)] =
-                static_cast<int8_t>(static_cast<int32_t>(scaled));
+            A8i_high[row_out + static_cast<size_t>(k - 1)]
+                = static_cast<int8_t>(static_cast<int32_t>(scaled));
         }
     }
 
@@ -643,8 +649,8 @@ namespace FP64Emulation
         __shared__ double  s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
         __shared__ int16_t s_sft[1];
 
-        const int64_t col    = static_cast<int64_t>(blockIdx.x);
-        const int64_t k_even = k & ~int64_t{1};
+        const int64_t       col      = static_cast<int64_t>(blockIdx.x);
+        const int64_t       k_even   = k & ~int64_t{1};
         const double* const col_base = B + static_cast<size_t>(col) * static_cast<size_t>(ldb);
 
         /* Pass 1: reduce per-col max using double2 loads. */
@@ -654,21 +660,27 @@ namespace FP64Emulation
             const double2 vv = *reinterpret_cast<const double2*>(col_base + j); /* COALESCED */
             if constexpr(CHECK_NAN)
             {
-                if(!isfinite(vv.x)) (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
-                if(!isfinite(vv.y)) (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+                if(!isfinite(vv.x))
+                    (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
+                if(!isfinite(vv.y))
+                    (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
             }
             const double av0 = fabs(vv.x), av1 = fabs(vv.y);
-            if(av0 > local_max) local_max = av0;
-            if(av1 > local_max) local_max = av1;
+            if(av0 > local_max)
+                local_max = av0;
+            if(av1 > local_max)
+                local_max = av1;
         }
         /* Scalar tail when k is odd (thread 0 only). */
         if((k & 1) && threadIdx.x == 0)
         {
             const double val = col_base[k - 1];
             if constexpr(CHECK_NAN)
-                if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+                if(!isfinite(val))
+                    (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
             const double av = fabs(val);
-            if(av > local_max) local_max = av;
+            if(av > local_max)
+                local_max = av;
         }
 
         local_max = warp_reduce_max_abs_d(local_max);
@@ -688,17 +700,17 @@ namespace FP64Emulation
         for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
         {
             const double2 vv = *reinterpret_cast<const double2*>(col_base + j); /* COALESCED */
-            B8i_high[col_out + static_cast<size_t>(j)    ] =
-                static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
-            B8i_high[col_out + static_cast<size_t>(j) + 1] =
-                static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
+            B8i_high[col_out + static_cast<size_t>(j)]
+                = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
+            B8i_high[col_out + static_cast<size_t>(j) + 1]
+                = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
         }
         /* Scalar tail. */
         if((k & 1) && threadIdx.x == 0)
         {
             const double scaled = ceil(ldexp(fabs(col_base[k - 1]), sft));
-            B8i_high[col_out + static_cast<size_t>(k - 1)] =
-                static_cast<int8_t>(static_cast<int32_t>(scaled));
+            B8i_high[col_out + static_cast<size_t>(k - 1)]
+                = static_cast<int8_t>(static_cast<int32_t>(scaled));
         }
     }
 
@@ -976,13 +988,14 @@ namespace FP64Emulation
     /* Coalesced kernels (A_T, B_N) process 4 k-positions per thread (K_UNROLL=4):
      * effective k-tile per block = OZ2_SCALE_TILE_K * 4 = 256.
      * 32 threads × 4 bytes = 128 bytes = one full HBM cache line per warp.      */
-    static constexpr int OZ2_SCALE_COALESC_TILE_M  = 8; /* blockDim=512, no SHMEM */
-    static constexpr int OZ2_SCALE_SHMEM_TILE_M    = 16; /* TILE_M for SHMEM kernels */
+    static constexpr int OZ2_SCALE_COALESC_TILE_M = 8; /* blockDim=512, no SHMEM */
+    static constexpr int OZ2_SCALE_SHMEM_TILE_M   = 16; /* TILE_M for SHMEM kernels */
     /* SHMEM kernels (A_N, B_T) also use K_UNROLL=4: each thread loads/stores 4
      * consecutive k-positions, packs 4 int8 bytes as uint32_t per store.
      * blockDim = (TILE_K / 4) * TILE_M = 16 * 16 = 256 threads.
      * LDS bank conflicts drop from 4-way (old 1024-thread scheme) to 2-way.    */
-    static constexpr int OZ2_SCALE_SHMEM_BLOCK_DIM = (OZ2_SCALE_TILE_K / 4) * OZ2_SCALE_SHMEM_TILE_M; /* 256 */
+    static constexpr int OZ2_SCALE_SHMEM_BLOCK_DIM
+        = (OZ2_SCALE_TILE_K / 4) * OZ2_SCALE_SHMEM_TILE_M; /* 256 */
 
     /* ── A_T: TRANS_A=true, k-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=4 ──
      * Each thread processes FOUR adjacent k-positions: j0..j0+3.
@@ -1017,15 +1030,15 @@ namespace FP64Emulation
         double ival[4];
         {
             const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0);
-            ival[0] = trunc(ldexp(vv.x, sft));
-            ival[1] = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            ival[0]          = trunc(ldexp(vv.x, sft));
+            ival[1]          = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
         }
         /* Load j0+2/j0+3 as double2 (j0+2 is even → aligned) only when valid. */
         if(j0 + 2 < k)
         {
             const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0 + 2);
-            ival[2] = trunc(ldexp(vv.x, sft));
-            ival[3] = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            ival[2]          = trunc(ldexp(vv.x, sft));
+            ival[3]          = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
         }
         else
         {
@@ -1034,7 +1047,7 @@ namespace FP64Emulation
         }
         const size_t stride   = lda8i * cola8i;
         const size_t off_base = static_cast<size_t>(i) * lda8i;
-        const size_t off0     = static_cast<size_t>(j0) + off_base; /* 4-aligned → uint32_t aligned */
+        const size_t off0 = static_cast<size_t>(j0) + off_base; /* 4-aligned → uint32_t aligned */
         /* Outer loop over moduli — sequential (no unroll) so nm/im/imf loaded once per modulus,
          * keeping register pressure low and WCB usage at TILE_M=8 entries simultaneously.   */
         for(unsigned t_local = 0; t_local < T_COUNT; ++t_local)
@@ -1050,8 +1063,8 @@ namespace FP64Emulation
             {
                 const double rp  = fma(nm, rint(ival[p] * im), ival[p]);
                 const float  rfp = static_cast<float>(rp);
-                b[p] = static_cast<int8_t>(static_cast<int32_t>(
-                    fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
+                b[p]             = static_cast<int8_t>(
+                    static_cast<int32_t>(fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
             }
             /* Pack and store: always write 4 bytes as uint32_t.
              * Out-of-bounds b[p] are zero (ival[p] was pre-zeroed for p >= valid count),
@@ -1091,8 +1104,8 @@ namespace FP64Emulation
                                             int64_t  k,
                                             unsigned t_start)
     {
-        static constexpr int TILE_K   = OZ2_SCALE_TILE_K;                    /* 64 */
-        static constexpr int TILE_M   = OZ2_SCALE_SHMEM_TILE_M;              /* 16 */
+        static constexpr int TILE_K   = OZ2_SCALE_TILE_K; /* 64 */
+        static constexpr int TILE_M   = OZ2_SCALE_SHMEM_TILE_M; /* 16 */
         static constexpr int K_UNROLL = 4;
         /* blockDim = OZ2_SCALE_SHMEM_BLOCK_DIM = (TILE_K/K_UNROLL)*TILE_M = 256 */
         __shared__ double  shmem[TILE_K][TILE_M + 1];
@@ -1100,8 +1113,8 @@ namespace FP64Emulation
 
         const int     t      = static_cast<int>(threadIdx.x);
         const int64_t m_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
-        const int     k_grp  = t / TILE_M;   /* 0..TILE_K/K_UNROLL-1 = 0..15 */
-        const int     m_loc  = t % TILE_M;   /* 0..TILE_M-1 = 0..15           */
+        const int     k_grp  = t / TILE_M; /* 0..TILE_K/K_UNROLL-1 = 0..15 */
+        const int     m_loc  = t % TILE_M; /* 0..TILE_M-1 = 0..15           */
         const int64_t i      = m_base + m_loc;
 
         /* Load phase: each thread fills K_UNROLL consecutive SHMEM entries.
@@ -1121,7 +1134,7 @@ namespace FP64Emulation
          * lda8i = pad(k) is 128-aligned → offset is 4-aligned → uint32_t aligned.
          * Out-of-bounds positions have shmem=0.0 → ival=0.0 → b[p]=0.            */
         const int     k_wb  = (t % (TILE_K / K_UNROLL)) * K_UNROLL; /* 0,4,8,...,60 */
-        const int     m_wr  = t / (TILE_K / K_UNROLL);              /* 0..15         */
+        const int     m_wr  = t / (TILE_K / K_UNROLL); /* 0..15         */
         const int64_t j_out = static_cast<int64_t>(blockIdx.x) * TILE_K + k_wb;
         const int64_t i_out = m_base + m_wr;
         if(i_out < m && j_out < k)
@@ -1144,14 +1157,14 @@ namespace FP64Emulation
                 const double   nm   = neg_mod(tidx);
                 const double   im   = inv_mod(tidx);
                 const float    imf  = inv_mod_f(tidx);
-                int8_t b[K_UNROLL];
+                int8_t         b[K_UNROLL];
 #pragma unroll
                 for(int p = 0; p < K_UNROLL; p++)
                 {
                     const double rp  = fma(nm, rint(ival[p] * im), ival[p]);
                     const float  rfp = static_cast<float>(rp);
-                    b[p]             = static_cast<int8_t>(static_cast<int32_t>(
-                        fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
+                    b[p]             = static_cast<int8_t>(
+                        static_cast<int32_t>(fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
                 }
                 /* Pack and store: always write 4 bytes as uint32_t.
                  * Out-of-bounds b[p] are zero (ival[p]=0.0 from pre-zeroed shmem),
@@ -1160,9 +1173,8 @@ namespace FP64Emulation
                                         | (static_cast<uint32_t>(static_cast<uint8_t>(b[1])) << 8)
                                         | (static_cast<uint32_t>(static_cast<uint8_t>(b[2])) << 16)
                                         | (static_cast<uint32_t>(static_cast<uint8_t>(b[3])) << 24);
-                __builtin_nontemporal_store(packed,
-                                            reinterpret_cast<uint32_t*>(A8i + t_local * stride
-                                                                         + offset));
+                __builtin_nontemporal_store(
+                    packed, reinterpret_cast<uint32_t*>(A8i + t_local * stride + offset));
             }
         }
     }
@@ -1189,17 +1201,17 @@ namespace FP64Emulation
         if(col >= n || j0 >= k)
             return;
         const int sft = static_cast<int>(sftB[col]);
-        double ival[4];
+        double    ival[4];
         {
             const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0);
-            ival[0] = trunc(ldexp(vv.x, sft));
-            ival[1] = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            ival[0]          = trunc(ldexp(vv.x, sft));
+            ival[1]          = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
         }
         if(j0 + 2 < k)
         {
             const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0 + 2);
-            ival[2] = trunc(ldexp(vv.x, sft));
-            ival[3] = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            ival[2]          = trunc(ldexp(vv.x, sft));
+            ival[3]          = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
         }
         else
         {
@@ -1208,21 +1220,21 @@ namespace FP64Emulation
         }
         const size_t stride   = ldb8i * static_cast<size_t>(n);
         const size_t off_base = static_cast<size_t>(col) * ldb8i;
-        const size_t off0     = static_cast<size_t>(j0) + off_base; /* 4-aligned → uint32_t aligned */
+        const size_t off0 = static_cast<size_t>(j0) + off_base; /* 4-aligned → uint32_t aligned */
         for(unsigned t_local = 0; t_local < T_COUNT; ++t_local)
         {
             const unsigned tidx = t_start + t_local;
             const double   nm   = neg_mod(tidx);
             const double   im   = inv_mod(tidx);
             const float    imf  = inv_mod_f(tidx);
-            int8_t b[4];
+            int8_t         b[4];
 #pragma unroll
             for(int p = 0; p < 4; ++p)
             {
                 const double rp  = fma(nm, rint(ival[p] * im), ival[p]);
                 const float  rfp = static_cast<float>(rp);
-                b[p] = static_cast<int8_t>(static_cast<int32_t>(
-                    fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
+                b[p]             = static_cast<int8_t>(
+                    static_cast<int32_t>(fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
             }
             /* Pack and store: always write 4 bytes as uint32_t.
              * Out-of-bounds b[p] are zero (ival[p] was pre-zeroed for p >= valid count),
@@ -1261,8 +1273,8 @@ namespace FP64Emulation
                                             int64_t  k,
                                             unsigned t_start)
     {
-        static constexpr int TILE_K   = OZ2_SCALE_TILE_K;                    /* 64 */
-        static constexpr int TILE_M   = OZ2_SCALE_SHMEM_TILE_M;              /* 16 */
+        static constexpr int TILE_K   = OZ2_SCALE_TILE_K; /* 64 */
+        static constexpr int TILE_M   = OZ2_SCALE_SHMEM_TILE_M; /* 16 */
         static constexpr int K_UNROLL = 4;
         /* blockDim = OZ2_SCALE_SHMEM_BLOCK_DIM = (TILE_K/K_UNROLL)*TILE_M = 256 */
         __shared__ double  shmem[TILE_K][TILE_M + 1];
@@ -1270,8 +1282,8 @@ namespace FP64Emulation
 
         const int     t      = static_cast<int>(threadIdx.x);
         const int64_t n_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
-        const int     k_grp  = t / TILE_M;   /* 0..TILE_K/K_UNROLL-1 = 0..15 */
-        const int     l_loc  = t % TILE_M;   /* 0..TILE_M-1 = 0..15           */
+        const int     k_grp  = t / TILE_M; /* 0..TILE_K/K_UNROLL-1 = 0..15 */
+        const int     l_loc  = t % TILE_M; /* 0..TILE_M-1 = 0..15           */
         const int64_t col    = n_base + l_loc;
 
         /* Load phase: each thread fills K_UNROLL consecutive SHMEM entries.
@@ -1291,7 +1303,7 @@ namespace FP64Emulation
          * ldb8i = pad(k) is 128-aligned → offset is 4-aligned → uint32_t aligned.
          * Out-of-bounds positions have shmem=0.0 → ival=0.0 → b[p]=0.            */
         const int     k_wb  = (t % (TILE_K / K_UNROLL)) * K_UNROLL; /* 0,4,8,...,60 */
-        const int     l_wr  = t / (TILE_K / K_UNROLL);              /* 0..15         */
+        const int     l_wr  = t / (TILE_K / K_UNROLL); /* 0..15         */
         const int64_t j_out = static_cast<int64_t>(blockIdx.x) * TILE_K + k_wb;
         const int64_t c_out = n_base + l_wr;
         if(c_out < n && j_out < k)
@@ -1314,14 +1326,14 @@ namespace FP64Emulation
                 const double   nm   = neg_mod(tidx);
                 const double   im   = inv_mod(tidx);
                 const float    imf  = inv_mod_f(tidx);
-                int8_t b[K_UNROLL];
+                int8_t         b[K_UNROLL];
 #pragma unroll
                 for(int p = 0; p < K_UNROLL; p++)
                 {
                     const double rp  = fma(nm, rint(ival[p] * im), ival[p]);
                     const float  rfp = static_cast<float>(rp);
-                    b[p]             = static_cast<int8_t>(static_cast<int32_t>(
-                        fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
+                    b[p]             = static_cast<int8_t>(
+                        static_cast<int32_t>(fmaf(rintf(rfp * imf), static_cast<float>(nm), rfp)));
                 }
                 /* Pack and store: always write 4 bytes as uint32_t.
                  * Out-of-bounds b[p] are zero (ival[p]=0.0 from pre-zeroed shmem),
@@ -1330,9 +1342,8 @@ namespace FP64Emulation
                                         | (static_cast<uint32_t>(static_cast<uint8_t>(b[1])) << 8)
                                         | (static_cast<uint32_t>(static_cast<uint8_t>(b[2])) << 16)
                                         | (static_cast<uint32_t>(static_cast<uint8_t>(b[3])) << 24);
-                __builtin_nontemporal_store(packed,
-                                            reinterpret_cast<uint32_t*>(B8i + t_local * stride
-                                                                         + offset));
+                __builtin_nontemporal_store(
+                    packed, reinterpret_cast<uint32_t*>(B8i + t_local * stride + offset));
             }
         }
     }
@@ -2175,8 +2186,8 @@ namespace FP64Emulation
 
         const bool    _prof = (prof != nullptr);
         Ozaki2Context context;
-        float         _t_prelim = 0, _t_prelim_gemm = 0, _t_refine = 0, _t_adp = 0,
-              _t_fused = 0, _t_scale = 0, _t_int8 = 0, _t_accum = 0;
+        float         _t_prelim = 0, _t_prelim_gemm = 0, _t_refine = 0, _t_adp = 0, _t_fused = 0,
+              _t_scale = 0, _t_int8 = 0, _t_accum = 0;
         if(_prof)
         {
             (void)hipEventCreate(&context.ev0);

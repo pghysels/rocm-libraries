@@ -20,7 +20,7 @@
  * This file MUST be compiled as HIP (LANGUAGE HIP in CMakeLists.txt).
  */
 
-#include "fp64_emulation.hpp"  /* rocblaslt_status, OZ2_S_MAX */
+#include "fp64_emulation.hpp" /* rocblaslt_status, OZ2_S_MAX */
 #include <hip/hip_runtime.h>
 
 /* =========================================================================
@@ -32,7 +32,12 @@
  *   "off" / "never"      → never  use fused (forces non-fused path)
  *   "auto"/ "performant" → performance model decides
  *   unset (default)      → OFF — fused kernel disabled until production-ready */
-enum class Oz2FusedMode { AUTO, ON, OFF };
+enum class Oz2FusedMode
+{
+    AUTO,
+    ON,
+    OFF
+};
 Oz2FusedMode oz2_fused_mode();
 
 /* Maximum KBLK_LOAD across all kernel variants AND all supported architectures —
@@ -46,16 +51,22 @@ inline constexpr unsigned OZ2_FUSED_KBLK_LOAD_MAX = 256u;
 /* =========================================================================
  * Fused TN kernel launcher (implemented in fp64_emulation_fused.cpp)
  * ========================================================================= */
-rocblaslt_status oz2_launch_fused_TN(
-    const int8_t*  A8i,    /* workspace INT8 A (all S moduli stacked) */
-    const int8_t*  B8i,    /* workspace INT8 B (all S moduli stacked) */
-    size_t         lda8i,  /* padded k, leading dim of A8i per modulus */
-    size_t         cola8i, /* padded m                                 */
-    size_t         ldb8i,  /* padded k, leading dim of B8i per modulus */
-    const double*  C,
-    double*        D,
-    int64_t m, int64_t n, int64_t k,
-    int64_t ldc, int64_t ldd,
-    double alpha, double beta,
-    const int16_t* sftA, const int16_t* sftB,
-    unsigned num_moduli, hipStream_t stream);
+rocblaslt_status
+    oz2_launch_fused_TN(const int8_t*  A8i, /* workspace INT8 A (all S moduli stacked) */
+                        const int8_t*  B8i, /* workspace INT8 B (all S moduli stacked) */
+                        size_t         lda8i, /* padded k, leading dim of A8i per modulus */
+                        size_t         cola8i, /* padded m                                 */
+                        size_t         ldb8i, /* padded k, leading dim of B8i per modulus */
+                        const double*  C,
+                        double*        D,
+                        int64_t        m,
+                        int64_t        n,
+                        int64_t        k,
+                        int64_t        ldc,
+                        int64_t        ldd,
+                        double         alpha,
+                        double         beta,
+                        const int16_t* sftA,
+                        const int16_t* sftB,
+                        unsigned       num_moduli,
+                        hipStream_t    stream);
