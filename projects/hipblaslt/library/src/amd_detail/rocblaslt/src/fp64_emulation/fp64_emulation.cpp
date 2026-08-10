@@ -114,12 +114,14 @@ namespace FP64Emulation
     /* Kernel efficiency factors and latency constants calibrated on MI355X. */
     struct PerfModelKernelEffs
     {
-        static constexpr double eff_prelim[2][2] = {{0.588, 0.504},   /* [N][N], [N][T] */
-                                                   {0.733, 0.432}};  /* [T][N], [T][T] */
-        static constexpr double eff_scale[2][2]  = {{0.610, 0.573},   /* [N][N], [N][T] */
-                                                   {0.624, 0.618}};  /* [T][N], [T][T] */
-        static constexpr double eff_refine        = 0.503;
-        static constexpr double eff_accum         = 0.949;
+        static constexpr double eff_prelim[2][2] = {
+            {0.697, 0.561},   /* [N][N], [N][T] */
+            {0.902, 0.682}};  /* [T][N], [T][T] */
+        static constexpr double eff_scale[2][2]  = {
+            {0.595,  0.520},   /* [N][N], [N][T] */
+            {0.683,  0.583}};  /* [T][N], [T][T] */
+        static constexpr double eff_refine        = 0.586;
+        static constexpr double eff_accum         = 0.938;
         static constexpr double eff_fused         = 0.333;
         static constexpr double host_overhead_s  = 1.0e-4;   /* host overhead (s) = 0.1 ms           */
         static constexpr double latency_kernel_s = 5.0e-6;   /* GPU kernel scheduling overhead (s)   */
@@ -471,7 +473,12 @@ namespace FP64Emulation
         return static_cast<int>((bits >> 52) & 0x7FFull) - 1023;
     }
 
-    /* ── A_T: TRANS_A=true, k-fast coalesced, blockDim=256, one block per row ── */
+    /* ── A_T: TRANS_A=true, k-fast double2 coalesced, blockDim=256, one block per row ──
+     * Both passes use double2 loads (128-bit) to process two k-positions per iteration,
+     * halving the number of memory transactions versus scalar 64-bit loads.
+     * Alignment: j = 2*threadIdx.x is always even; the base A+row*lda is assumed even
+     * in double-units (lda is even for any aligned allocation), so double2 is safe.
+     * Odd-k tail (at most one element) is handled by thread 0 with a scalar load.  */
     template <bool CHECK_NAN>
     __global__ static void accu_prelim_A_T_kernel(const double* __restrict__ A,
                                                   int64_t m,
@@ -485,18 +492,34 @@ namespace FP64Emulation
         __shared__ double  s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
         __shared__ int16_t s_sft[1];
 
-        const int64_t row       = static_cast<int64_t>(blockIdx.x);
-        double        local_max = 0.0;
-        for(int64_t j = threadIdx.x; j < k; j += blockDim.x)
+        const int64_t row    = static_cast<int64_t>(blockIdx.x);
+        const int64_t k_even = k & ~int64_t{1}; /* floor(k/2)*2 — double2 main range */
+        const double* const row_base = A + static_cast<size_t>(row) * static_cast<size_t>(lda);
+
+        /* Pass 1: reduce per-row max using double2 loads (2 elements per memory txn). */
+        double local_max = 0.0;
+        for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
         {
-            double val = A[row * lda + j]; /* COALESCED */
+            const double2 vv = *reinterpret_cast<const double2*>(row_base + j); /* COALESCED */
             if constexpr(CHECK_NAN)
-                if(!isfinite(val))
-                    (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
-            double av = fabs(val);
-            if(av > local_max)
-                local_max = av;
+            {
+                if(!isfinite(vv.x)) (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
+                if(!isfinite(vv.y)) (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+            }
+            const double av0 = fabs(vv.x), av1 = fabs(vv.y);
+            if(av0 > local_max) local_max = av0;
+            if(av1 > local_max) local_max = av1;
         }
+        /* Scalar tail: last element when k is odd (thread 0 only). */
+        if((k & 1) && threadIdx.x == 0)
+        {
+            const double val = row_base[k - 1];
+            if constexpr(CHECK_NAN)
+                if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+            const double av = fabs(val);
+            if(av > local_max) local_max = av;
+        }
+
         local_max = warp_reduce_max_abs_d(local_max);
         local_max = block_reduce_max_d(local_max, s_wmax);
         if(threadIdx.x == 0)
@@ -508,12 +531,23 @@ namespace FP64Emulation
         }
         __syncthreads();
         const int sft = static_cast<int>(s_sft[0]);
-        for(int64_t j = threadIdx.x; j < k; j += blockDim.x)
+
+        /* Pass 2: scale and extract INT8 using double2 loads. */
+        const size_t row_out = static_cast<size_t>(row) * lda8i;
+        for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
         {
-            double val    = A[row * lda + j]; /* COALESCED */
-            double scaled = ceil(ldexp(fabs(val), sft));
-            A8i_high[static_cast<size_t>(j) + static_cast<size_t>(row) * lda8i]
-                = static_cast<int8_t>(static_cast<int32_t>(scaled)); /* COALESCED */
+            const double2 vv = *reinterpret_cast<const double2*>(row_base + j); /* COALESCED */
+            A8i_high[row_out + static_cast<size_t>(j)    ] =
+                static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
+            A8i_high[row_out + static_cast<size_t>(j) + 1] =
+                static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
+        }
+        /* Scalar tail. */
+        if((k & 1) && threadIdx.x == 0)
+        {
+            const double scaled = ceil(ldexp(fabs(row_base[k - 1]), sft));
+            A8i_high[row_out + static_cast<size_t>(k - 1)] =
+                static_cast<int8_t>(static_cast<int32_t>(scaled));
         }
     }
 
@@ -592,7 +626,10 @@ namespace FP64Emulation
         }
     }
 
-    /* ── B_N: TRANS_B=false, j-fast coalesced, blockDim=256, one block per col ── */
+    /* ── B_N: TRANS_B=false, j-fast double2 coalesced, blockDim=256, one block per col ──
+     * Mirrors accu_prelim_A_T_kernel: double2 loads halve memory transactions in both
+     * passes.  Alignment: j = 2*threadIdx.x is always even; the base B+col*ldb is
+     * assumed even in double-units (ldb even for aligned allocations).              */
     template <bool CHECK_NAN>
     __global__ static void accu_prelim_B_N_kernel(const double* __restrict__ B,
                                                   int64_t n,
@@ -606,18 +643,34 @@ namespace FP64Emulation
         __shared__ double  s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
         __shared__ int16_t s_sft[1];
 
-        const int64_t col       = static_cast<int64_t>(blockIdx.x);
-        double        local_max = 0.0;
-        for(int64_t j = threadIdx.x; j < k; j += blockDim.x)
+        const int64_t col    = static_cast<int64_t>(blockIdx.x);
+        const int64_t k_even = k & ~int64_t{1};
+        const double* const col_base = B + static_cast<size_t>(col) * static_cast<size_t>(ldb);
+
+        /* Pass 1: reduce per-col max using double2 loads. */
+        double local_max = 0.0;
+        for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
         {
-            double val = B[j + col * ldb]; /* COALESCED */
+            const double2 vv = *reinterpret_cast<const double2*>(col_base + j); /* COALESCED */
             if constexpr(CHECK_NAN)
-                if(!isfinite(val))
-                    (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
-            double av = fabs(val);
-            if(av > local_max)
-                local_max = av;
+            {
+                if(!isfinite(vv.x)) (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
+                if(!isfinite(vv.y)) (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+            }
+            const double av0 = fabs(vv.x), av1 = fabs(vv.y);
+            if(av0 > local_max) local_max = av0;
+            if(av1 > local_max) local_max = av1;
         }
+        /* Scalar tail when k is odd (thread 0 only). */
+        if((k & 1) && threadIdx.x == 0)
+        {
+            const double val = col_base[k - 1];
+            if constexpr(CHECK_NAN)
+                if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+            const double av = fabs(val);
+            if(av > local_max) local_max = av;
+        }
+
         local_max = warp_reduce_max_abs_d(local_max);
         local_max = block_reduce_max_d(local_max, s_wmax);
         if(threadIdx.x == 0)
@@ -629,12 +682,23 @@ namespace FP64Emulation
         }
         __syncthreads();
         const int sft = static_cast<int>(s_sft[0]);
-        for(int64_t j = threadIdx.x; j < k; j += blockDim.x)
+
+        /* Pass 2: scale and extract INT8 using double2 loads. */
+        const size_t col_out = static_cast<size_t>(col) * ldb8i;
+        for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
         {
-            double val    = B[j + col * ldb]; /* COALESCED */
-            double scaled = ceil(ldexp(fabs(val), sft));
-            B8i_high[static_cast<size_t>(j) + static_cast<size_t>(col) * ldb8i]
-                = static_cast<int8_t>(static_cast<int32_t>(scaled)); /* COALESCED */
+            const double2 vv = *reinterpret_cast<const double2*>(col_base + j); /* COALESCED */
+            B8i_high[col_out + static_cast<size_t>(j)    ] =
+                static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
+            B8i_high[col_out + static_cast<size_t>(j) + 1] =
+                static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
+        }
+        /* Scalar tail. */
+        if((k & 1) && threadIdx.x == 0)
+        {
+            const double scaled = ceil(ldexp(fabs(col_base[k - 1]), sft));
+            B8i_high[col_out + static_cast<size_t>(k - 1)] =
+                static_cast<int8_t>(static_cast<int32_t>(scaled));
         }
     }
 
