@@ -47,9 +47,9 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from matplotlib.colors import BoundaryNorm
 
-# =============================================================================
-# 1.  Constants  (verbatim from fp64_emulation.cpp)
-# =============================================================================
+#===============================================================================
+# 1. Constants (verbatim from fp64_emulation.cpp)
+#===============================================================================
 
 LATENCY_KERNEL  = 5.0e-6    # s  – GPU kernel scheduling overhead
 LATENCY_MATMUL  = 10.0e-6   # s  – hipBLASLt matmul launch overhead
@@ -63,64 +63,58 @@ OZ2_HOST_OVERHEAD_S    = 0.100e-3    # 0.1 ms → s
 # Kernel efficiency factors (tA, tB) → {prelim, scale}
 # Calibrated on MI355X; reused for MI455 (monolithic path).
 _EFF = {
-    (True,  True ): {"prelim": 0.628, "scale": 0.401},
-    (True,  False): {"prelim": 0.797, "scale": 0.461},
-    (False, True ): {"prelim": 0.550, "scale": 0.354},
-    (False, False): {"prelim": 0.622, "scale": 0.405},
+    (True,  True ): {"prelim": 0.432, "scale": 0.618},   # eff_prelim[1][1], eff_scale[1][1]
+    (True,  False): {"prelim": 0.733, "scale": 0.624},   # eff_prelim[1][0], eff_scale[1][0]
+    (False, True ): {"prelim": 0.504, "scale": 0.573},   # eff_prelim[0][1], eff_scale[0][1]
+    (False, False): {"prelim": 0.588, "scale": 0.610},   # eff_prelim[0][0], eff_scale[0][0]
 }
-EFF_REFINE = 0.511
-EFF_ACCUM  = 0.775
-EFF_FUSED  = 0.66    # fused kernel INT8 MFMA efficiency (applied to compute only, not BW)
+EFF_REFINE = 0.503
+EFF_ACCUM  = 0.949
+EFF_FUSED  = 0.66   # global efficiency divisor for the fused MFMA+CRT kernel
 
-# =============================================================================
-# 2.  Hardware parameter sets
-# =============================================================================
+#===============================================================================
+# 2. Hardware parameter sets
+#===============================================================================
 
-# ── From the C++ Oz2PerfModelParams table ────────────────────────────────────
-# latency units: observed_bandwidth_bytes_per_sec × LATENCY_MATMUL
-# So  c0 = latency / LATENCY_MATMUL  is observed HBM bandwidth in bytes/s.
-#     c1 = c0 × ai                   is observed FP64 GEMM throughput  (ops/s)
-#     c2 = c1 × ratio                is observed INT8 GEMM throughput  (ops/s)
+# ── From the C++ Oz2PerfModelParams table ─────────────────────────────────────
+# latency units : observed_bandwidth_bytes_per_sec × LATENCY_MATMUL
+# So c0 = latency / LATENCY_MATMUL is observed HBM bandwidth in bytes/s.
+# c1 = c0 × ai is observed FP64 GEMM throughput (ops/s)
+# c2 = c1 × ratio is observed INT8 GEMM throughput (ops/s)
 
 HW_PARAMS = {
     "MI300X": {
-        # pci_id 0x74a0 / 0x74a1 / 0x74a9  (from C++ table)
+        # pci_id 0x74a0 / 0x74a1 / 0x74a9 (from C++ table)
         "latency": 3.93e7,   # → c0 ≈ 3.93 TB/s
         "ai":       2.63868, # → c1 ≈  10.4 TFLOP/s FP64
         "ratio":  168.411,   # → c2 ≈ 1750 TOPS INT8
     },
     "MI350X": {
-        # pci_id 0x75a0 / 0x75b0  (from C++ table)
+        # pci_id 0x75a0 / 0x75b0 (from C++ table)
         "latency": 6.08e7,   # → c0 ≈ 6.08 TB/s
         "ai":      11.2237,  # → c1 ≈  68.2 TFLOP/s FP64
         "ratio":   46.4678,  # → c2 ≈ 3169 TOPS INT8
     },
     "MI355X": {
-        # pci_id 0x75a3 / 0x75b3  (from C++ table)
+        # pci_id 0x75a3 / 0x75b3 (from C++ table)
         "latency": 6.82e7,   # → c0 ≈ 6.82 TB/s
         "ai":      11.3284,  # → c1 ≈  77.2 TFLOP/s FP64
         "ratio":   42.7280,  # → c2 ≈ 3298 TOPS INT8
     },
-    # ── MI455 (old estimate, superseded) ─────────────────────────────────────
-    # "MI455": {
-    #     "latency": 1.705e8,      # → c0 ≈ 17.05 TB/s  (2.5× MI355X BW)
-    #     "ai":      10.0 / 17.05, # → c1 ≈ 10 TFLOP/s FP64 (SIMD only, no MFMA)
-    #     "ratio":   211.3,         # → c2 ≈ 2113 TOPS INT8  (same fraction as MI355X)
-    # },
-    # ── MI455  —  ESTIMATED parameters ───────────────────────────────────────
+    # ── MI455  — ESTIMATED parameters ───────────────────────────────────────
     # Estimation rationale:
-    #   HBM bandwidth  : 23.3 TB/s
-    #     latency = 23.3e12 × LATENCY_MATMUL = 23.3e12 × 10e-6 = 2.33e8
-    #   FP64 throughput: MI455 has no FP64 matrix (MFMA) instructions.
-    #     Native DGEMM falls back to SIMD-only FP64 → ~5 TFLOP/s.
-    #     ai = 5e12 / 23.3e12 ≈ 0.2146
-    #   INT8 throughput: peak is 5000 TOPS (5 POPS), but the model uses the
-    #     *effective* observed fraction.
-    #     MI355X effective / peak = 3301 / 5000 ≈ 0.660.
-    #     MI455 effective INT8 = 0.660 × 5000 ≈ 3300 TOPS.
-    #     ratio = 3300e12 / 5e12 = 660.0
-    #   All kernel efficiency factors and LATENCY_* constants are INHERITED
-    #   from MI355X calibration (monolithic path, no fused kernel).
+    # HBM bandwidth : 23.3 TB/s
+    # latency = 23.3e12 × LATENCY_MATMUL = 23.3e12 × 10e-6 = 2.33e8
+    # FP64 throughput : MI455 has no FP64 matrix (MFMA) instructions.
+    # Native DGEMM falls back to SIMD-only FP64 → ~5 TFLOP/s.
+    # ai = 5e12 / 23.3e12 ≈ 0.2146
+    # INT8 throughput : peak is 5000 TOPS (5 POPS), but the model uses the
+    # *effective* observed fraction.
+    # MI355X effective / peak = 3301 / 5000 ≈ 0.660.
+    # MI455 effective INT8 = 0.660 × 5000 ≈ 3300 TOPS.
+    # ratio = 3300e12 / 5e12 = 660.0
+    # All kernel efficiency factors and LATENCY_* constants are INHERITED
+    # from MI355X calibration (monolithic path, no fused kernel).
     "MI455": {
         "latency": 2.33e8,       # → c0 ≈ 23.3 TB/s
         "ai":      5.0 / 23.3,   # → c1 ≈ 5 TFLOP/s FP64 (SIMD only, no MFMA)
@@ -128,9 +122,9 @@ HW_PARAMS = {
     },
 }
 
-# =============================================================================
-# 3.  Model helpers  (oz2_pad, oz2_compute_chunk_size)
-# =============================================================================
+#===============================================================================
+# 3. Model helpers (oz2_pad, oz2_compute_chunk_size)
+#===============================================================================
 
 def oz2_pad(n: int) -> int:
     """Pad n to the next multiple of OZ2_ALIGN (128 bytes)."""
@@ -221,9 +215,9 @@ def oz2_effective_time(
 
     return t_mono
 
-# =============================================================================
-# 4.  Core performance model  (fp64EmulationPerfModelTimes, monolithic path)
-# =============================================================================
+#===============================================================================
+# 4. Core performance model (fp64EmulationPerfModelTimes, monolithic path)
+#===============================================================================
 
 def perf_model_times(
     tA: bool,
@@ -265,9 +259,9 @@ def perf_model_times(
     All times are in seconds.
     """
     # ── Derived hardware capacities ──────────────────────────────────────────
-    # c0: memory bandwidth  (bytes/s)
-    # c1: FP64 GEMM throughput  (ops/s, where 1 op = 1 multiply-accumulate)
-    # c2: INT8 GEMM throughput  (ops/s)
+    # c0 : memory bandwidth (bytes/s)
+    # c1 : FP64 GEMM throughput (ops/s, where 1 op = 1 multiply-accumulate)
+    # c2 : INT8 GEMM throughput (ops/s)
     c0 = hw["latency"] / LATENCY_MATMUL
     c1 = c0 * hw["ai"]
     c2 = c1 * hw["ratio"]
@@ -289,14 +283,14 @@ def perf_model_times(
     eff_prelim = _EFF[(tA, tB)]["prelim"]
     eff_scale  = _EFF[(tA, tB)]["scale"]
 
-    # ── Component-time formulas (transcribed verbatim from C++) ──────────────
+    # ── Component-time formulas (transcribed verbatim from C++) ───────────────
 
     # Memory-bandwidth reference: read INT8 A (mk bytes), B (kn bytes),
     # write FP64 C/D (4·mn bytes = 32-bit output × 4 bytes).
     t_int8_bw = (mk + kn + 4.0 * mn) / c0
 
     # Preliminary shift + extraction kernel (reads fp64 A and B, writes INT8).
-    # 17 bytes/elem of (mk+kn) combines: 8 fp64 read + 1 int8 write + overhead.
+    # 17 bytes/elem of (mk + kn) combines: 8 fp64 read + 1 int8 write + overhead.
     t_prelim_kern = (
         (mk + kn) * 17.0 / c0 + 2.0 * LATENCY_KERNEL
     ) / eff_prelim
@@ -304,14 +298,14 @@ def perf_model_times(
     # Preliminary INT8 GEMM: C32i_prelim = A8i_high^T × B8i_high.
     t_prelim_gemm = max(2.0 * mnk / c2, t_int8_bw) + LATENCY_MATMUL
 
-    # Shift-refinement kernels (reads m×n INT32 C32i, writes sftA / sftB).
+    # Shift-refinement kernels (reads m×n INT32 C32i, writes sftA/sftB).
     # 8 bytes/elem accounts for the INT32 read + partial sft write.
     t_refine_kern = (
         mn * 8.0 / c0 + 3.0 * LATENCY_KERNEL + LATENCY_MEMSET
     ) / EFF_REFINE
 
     # Multi-modulus scale kernels (reads fp64 A/B, writes s×INT8 slices).
-    # Per pass: (8·n_scale_chunks + s) bytes per (m,k) or (k,n) element.
+    # Per pass: (8·n_scale_chunks + s) bytes per (m, k) or (k, n) element.
     t_scale_kern = (
         (mk + kn) * (8.0 * n_scale_chunks + s) / c0
         + 2.0 * n_scale_chunks * LATENCY_KERNEL
@@ -334,10 +328,10 @@ def perf_model_times(
 
     # ADP (dynamic precision selection) overhead — two tiny reduction kernels
     # followed by a hipStreamSynchronize roundtrip.
-    #   oz2_adp_reduce_A reads row_max[m]  (~m × 4 bytes, negligible)
-    #   oz2_adp_reduce_B reads col_max[n]  (~n × 4 bytes, negligible)
+    # oz2_adp_reduce_A reads row_max[m] (~m × 4 bytes, negligible)
+    # oz2_adp_reduce_B reads col_max[n] (~n × 4 bytes, negligible)
     #     — col_max[] is precomputed by oz2_col_max_kernel (charged to t_refine);
-    #       adp_reduce_B no longer reads the full m×n C32i matrix.
+    # adp_reduce_B no longer reads the full m×n C32i matrix.
     # Bottleneck is entirely the CPU-GPU hipStreamSynchronize roundtrip.
     if dynamic_mode:
         t_adp = (
@@ -347,29 +341,25 @@ def perf_model_times(
     else:
         t_adp = 0.0
 
-    # ── Fused kernel: replaces INT8 GEMMs + accum when faster ────────────────
-    # Reads:  s × INT8 A8i + s × INT8 B8i  (s*(mk+kn) bytes)
-    #         FP64 C input (8*mn bytes, when beta≠0) + FP64 D output (8*mn bytes)
-    # Compute: MFMA  s×2×mnk ops at INT8 throughput c2
-    #          CRT   s×8×mn  FP64 ops at FP64 throughput c1
-    # Fused kernel bandwidth: reads s×INT8 A8i/B8i, writes FP64 D (+ optional C read).
+    # ── Fused kernel: replaces INT8 GEMMs + accum when faster ─────────────────
+    # Reads: s × INT8 A8i + s × INT8 B8i (s*(mk + kn) bytes)
+    # FP64 C input (8*mn bytes, when beta≠0) + FP64 D output (8*mn bytes)
+    # Compute: MFMA s×2×mnk ops at INT8 throughput c2
+    # CRT s×8×mn FP64 ops at FP64 throughput c1
+    # Fused kernel bandwidth: reads s×INT8 A8i/B8i, writes FP64 D (+optional C read).
     t_fused_bw   = (s * (mk + kn) + 16.0 * mn) / c0
-    # Fused kernel MFMA compute: s×2×mnk INT8 ops at effective throughput c2×EFF_FUSED.
-    t_fused_int8 = s * 2.0 * mnk / (c2 * EFF_FUSED)
-    # CRT FP64 accumulation is done in registers; on CDNA VALU FP64 dual-issues
-    # alongside MFMA, so CRT compute is hidden.  The non-fused t_accum_kern model
-    # also treats the CRT as BW-bound (ignoring its FP64 compute cost), so for
-    # consistency we do the same here: t_fused_fp64 is excluded from t_fused_kern.
-    t_fused_fp64 = s * 8.0 * mn / c1  # informational only — not added to t_fused_kern
-    t_fused_kern = max(t_fused_bw, t_fused_int8) + LATENCY_KERNEL
+    t_fused_int8 = s * 2.0 * mnk / c2
+    t_fused_fp64 = s * 8.0 * mn / c1
+    t_fused_cmp  = t_fused_int8 + t_fused_fp64
+    t_fused_kern = max(t_fused_bw, t_fused_cmp) / EFF_FUSED + LATENCY_KERNEL
 
-    # Select GEMM+accum time: use fused when requested and faster
+    # Select GEMM + accum time: use fused when requested and faster
     if use_fused:
         t_gemm_accum = min(t_int8_gemms + t_accum_kern, t_fused_kern)
     else:
         t_gemm_accum = t_int8_gemms + t_accum_kern
 
-    # ── Total emulation time ──────────────────────────────────────────────────
+    # ── Total emulation time ───────────────────────────────────────────────────
     t_total = (
         t_prelim_kern
         + t_prelim_gemm
@@ -380,9 +370,9 @@ def perf_model_times(
         + t_adp
     )
 
-    # ── Native DGEMM time (roofline model) ───────────────────────────────────
+    # ── Native DGEMM time (roofline model) ────────────────────────────────────
     # FP64 GEMM: max of compute-bound (2·m·n·k / c1) and
-    #            bandwidth-bound (8 bytes × (mk + kn + mn) / c0).
+    # bandwidth-bound (8 bytes × (mk + kn + mn) / c0).
     t_native = (
         max(2.0 * mnk / c1, 8.0 * (mk + kn + mn) / c0)
         + LATENCY_MATMUL
@@ -402,9 +392,9 @@ def perf_model_times(
         "t_native":      t_native,
     }
 
-# =============================================================================
-# 5.  Heatmap computation
-# =============================================================================
+#===============================================================================
+# 5. Heatmap computation
+#===============================================================================
 
 def compute_time_ratio_grid(
     hw: dict,
@@ -468,9 +458,9 @@ def compute_speedup_grid(
             speedup[i, j] = max(1.0, t["t_native"] / t_emul)
     return speedup
 
-# =============================================================================
-# 6.  Figure helpers
-# =============================================================================
+#===============================================================================
+# 6. Figure helpers
+#===============================================================================
 
 _LOG_CANDIDATES = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0,
                    8.0, 9.0, 10.0, 11.0, 12.0, 15.0, 20.0,
@@ -518,7 +508,6 @@ def _draw_heatmap(ax, speedup: np.ndarray, mn_vals: np.ndarray,
     im = ax.pcolormesh(k_vals, mn_vals, speedup_T, cmap=cmap, norm=norm,
                        shading="nearest")
 
-
     ax.set_xscale("log")
     ax.set_yscale("log")
 
@@ -538,10 +527,9 @@ def _draw_heatmap(ax, speedup: np.ndarray, mn_vals: np.ndarray,
 
     return im
 
-
-# =============================================================================
-# 7.  Main
-# =============================================================================
+#===============================================================================
+# 7. Main
+#===============================================================================
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -570,8 +558,8 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # ── Grid definition ───────────────────────────────────────────────────────
-    # m=n: log-spaced 512 → mn_max
+    # ── Grid definition ────────────────────────────────────────────────────────
+    # m = n: log-spaced 512 → mn_max
     mn_vals = np.unique(np.round(
         np.logspace(np.log10(512), np.log10(args.mn_max), args.n_pts)
     ).astype(int))
@@ -580,7 +568,7 @@ def main() -> None:
         np.logspace(np.log10(512), np.log10(65536), args.n_pts)
     ).astype(int))
 
-    # ── Determine which HW configs to run ────────────────────────────────────
+    # ── Determine which HW configs to run ─────────────────────────────────────
     if args.hw == "all":
         hw_configs = HW_PARAMS
     elif args.hw in HW_PARAMS:
@@ -596,7 +584,7 @@ def main() -> None:
     for hw_name, hw in hw_configs.items():
         hw_slug = hw_name.lower()   # e.g. "mi455", "mi300x"
 
-        # ── Compute both grids ───────────────────────────────────────────────
+        # ── Compute both grids ────────────────────────────────────────────────
         print(f"\n[{hw_name}] Computing {len(mn_vals)}×{len(k_vals)} monolithic "
               f"speedup grid, s={s} …")
         speedup_mono = compute_speedup_grid(hw, mn_vals, k_vals, num_moduli=s,
@@ -623,7 +611,7 @@ def main() -> None:
         n_split_cells = int(np.sum(speedup_split > speedup_mono + 1e-9))
         print(f"  cells improved by splitting: {n_split_cells} / {speedup_mono.size}")
 
-        # ── Optional fused-kernel grid ───────────────────────────────────────
+        # ── Optional fused-kernel grid ─────────────────────────────────────────
         speedup_fused = None
         if args.fused:
             print(f"[{hw_name}] Computing {len(mn_vals)}×{len(k_vals)} fused-"
@@ -640,7 +628,7 @@ def main() -> None:
             n_fused_better = int(np.sum(speedup_fused > speedup_split + 1e-9))
             print(f"  cells improved by fused kernel: {n_fused_better} / {speedup_mono.size}")
 
-        # ── Shared colormap / levels ─────────────────────────────────────────
+        # ── Shared colormap / levels ───────────────────────────────────────────
         all_grids = [speedup_mono, speedup_split]
         if speedup_fused is not None:
             all_grids.append(speedup_fused)
@@ -672,13 +660,13 @@ def main() -> None:
                 print(f"Saved  {out}")
             plt.close(fig)
 
-        # ── Individual figures ───────────────────────────────────────────────
+        # ── Individual figures ─────────────────────────────────────────────────
         _save_individual(speedup_mono,  "",                    "")
         _save_individual(speedup_split, "recursive splitting", "_split")
         if speedup_fused is not None:
             _save_individual(speedup_fused, "fused kernel", "_fused")
 
-        # ── Combined comparison figure ────────────────────────────────────────
+        # ── Combined comparison figure ─────────────────────────────────────────
         if speedup_fused is not None:
             # Ratio: raw emulation-time ratio t_split / t_fused (unclamped).
             # Uses actual emulation times so the ratio varies everywhere —
@@ -692,8 +680,8 @@ def main() -> None:
             ratio_cmap   = plt.get_cmap("YlOrRd")
             ratio_norm   = BoundaryNorm(ratio_levels, ncolors=ratio_cmap.N, clip=True)
 
-            # 2×2 layout: (a) mono  | (b) split
-            #              (c) fused | (d) fused/non-fused ratio
+            # 2×2 layout: (a) mono | (b) split
+            #             (c) fused | (d) fused/non-fused ratio
             fig2, axes2 = plt.subplots(2, 2, figsize=(10, 8), constrained_layout=True)
             ax_a, ax_b = axes2[0]
             ax_c, ax_d = axes2[1]
