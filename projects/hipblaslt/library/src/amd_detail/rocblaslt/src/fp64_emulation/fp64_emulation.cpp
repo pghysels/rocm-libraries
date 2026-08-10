@@ -114,12 +114,12 @@ namespace FP64Emulation
     /* Kernel efficiency factors and latency constants calibrated on MI355X. */
     struct PerfModelKernelEffs
     {
-        static constexpr double eff_prelim[2][2] = {{0.622, 0.550},   /* [N][N], [N][T] */
-                                                   {0.797, 0.628}};  /* [T][N], [T][T] */
-        static constexpr double eff_scale[2][2]  = {{0.405, 0.354},
-                                                   {0.461, 0.401}};
-        static constexpr double eff_refine        = 0.511;
-        static constexpr double eff_accum         = 0.775;
+        static constexpr double eff_prelim[2][2] = {{0.588, 0.504},   /* [N][N], [N][T] */
+                                                   {0.733, 0.432}};  /* [T][N], [T][T] */
+        static constexpr double eff_scale[2][2]  = {{0.610, 0.573},   /* [N][N], [N][T] */
+                                                   {0.624, 0.618}};  /* [T][N], [T][T] */
+        static constexpr double eff_refine        = 0.503;
+        static constexpr double eff_accum         = 0.949;
         static constexpr double eff_fused         = 0.333;
         static constexpr double host_overhead_s  = 1.0e-4;   /* host overhead (s) = 0.1 ms           */
         static constexpr double latency_kernel_s = 5.0e-6;   /* GPU kernel scheduling overhead (s)   */
@@ -1528,14 +1528,12 @@ namespace FP64Emulation
     {
         float    t_prelim      = 0.f;
         float    t_prelim_gemm = 0.f;
-        float    t_extract     = 0.f;
         float    t_refine      = 0.f;
         float    t_adp   = 0.f; /* ADP reduce kernels + hipStreamSynchronize (dynamic mode only) */
         float    t_fused = 0.f; /* fused TN kernel (non-zero when fused path taken) */
         float    t_scale = 0.f;
         float    t_int8  = 0.f;
         float    t_accum = 0.f;
-        float    t_finalize       = 0.f;
         unsigned effective_s_used = 0u; /* ADP: actual s chosen (= num_moduli in fixed mode) */
         unsigned n_sub_gemms      = 0u;
     };
@@ -2113,8 +2111,8 @@ namespace FP64Emulation
 
         const bool    _prof = (prof != nullptr);
         Ozaki2Context context;
-        float         _t_prelim = 0, _t_prelim_gemm = 0, _t_extract = 0, _t_refine = 0, _t_adp = 0,
-              _t_fused = 0, _t_scale = 0, _t_int8 = 0, _t_accum = 0, _t_finalize = 0;
+        float         _t_prelim = 0, _t_prelim_gemm = 0, _t_refine = 0, _t_adp = 0,
+              _t_fused = 0, _t_scale = 0, _t_int8 = 0, _t_accum = 0;
         if(_prof)
         {
             (void)hipEventCreate(&context.ev0);
@@ -2264,7 +2262,6 @@ namespace FP64Emulation
                                         sftB,
                                         stream);
         _pstop(_t_prelim);
-        /* _t_extract remains 0: extraction is now fused into _t_prelim */
 
         if(svmask != 0u)
         {
@@ -2696,14 +2693,12 @@ namespace FP64Emulation
             /* Accumulate component times into the caller's accumulator. */
             prof->t_prelim += _t_prelim;
             prof->t_prelim_gemm += _t_prelim_gemm;
-            prof->t_extract += _t_extract;
             prof->t_refine += _t_refine;
             prof->t_adp += _t_adp;
             prof->t_fused += _t_fused;
             prof->t_scale += _t_scale;
             prof->t_int8 += _t_int8;
             prof->t_accum += _t_accum;
-            prof->t_finalize += _t_finalize;
             prof->effective_s_used = std::max(prof->effective_s_used, effective_s);
             prof->n_sub_gemms += 1u;
         }
@@ -3160,9 +3155,9 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                     _f,
                     "m,n,k,transA,transB,num_moduli,effective_s,scale_chunk_size,gemm_chunk_size,"
                     "workspace_bytes,num_sub_gemms,"
-                    "t_prelim_ms,t_prelim_gemm_ms,t_extract_ms,t_refine_ms,"
+                    "t_prelim_ms,t_prelim_gemm_ms,t_refine_ms,"
                     "t_fused_ms,t_adp_ms,t_scale_ms,t_int8_gemm_ms,t_accum_ms,"
-                    "t_finalize_ms,t_total_ms,"
+                    "t_total_ms,"
                     "pred_prelim_ms,pred_prelim_gemm_ms,pred_refine_ms,pred_adp_ms,"
                     "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
                     "pred_host_ms,pred_fused_ms,pred_total_ms,pred_native_dgemm_"
@@ -3170,7 +3165,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
             std::fprintf(_f,
                          "%lld,%lld,%lld,%c,%c,%u,%u,%u,%u,"
                          "%llu,%u,"
-                         "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                         "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                          "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                          (long long)m,
                          (long long)n,
@@ -3185,14 +3180,12 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                          accum.n_sub_gemms,
                          accum.t_prelim,
                          accum.t_prelim_gemm,
-                         accum.t_extract,
                          accum.t_refine,
                          accum.t_fused,
                          accum.t_adp,
                          accum.t_scale,
                          accum.t_int8,
                          accum.t_accum,
-                         accum.t_finalize,
                          t_total,
                          pm.t_prelim_ms,
                          pm.t_prelim_gemm_ms,
