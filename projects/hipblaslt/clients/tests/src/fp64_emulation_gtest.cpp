@@ -71,24 +71,7 @@ namespace
     {
         const unsigned s = fp64EmulationNumModuli();
         EXPECT_GE(s, 2u);
-        EXPECT_LE(s, 18u); // OZ2_S_MAX
-    }
-
-    // Workspace must be non-empty and not shrink as the moduli count grows.
-    TEST_F(Fp64EmulationHostTest, WorkspaceSizePositiveAndMonotonic)
-    {
-        const int64_t m = 1024, n = 1024, k = 1024;
-        const size_t  ws8  = fp64EmulationWorkspaceSize(m, n, k, 8);
-        const size_t  ws16 = fp64EmulationWorkspaceSize(m, n, k, 16);
-        EXPECT_GT(ws8, 0u);
-        EXPECT_GE(ws16, ws8);
-    }
-
-    TEST_F(Fp64EmulationHostTest, PublicWorkspaceSizeRejectsNegativeDimensions)
-    {
-        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(-1, 64, 64, 16), 0u);
-        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(64, -1, 64, 16), 0u);
-        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(64, 64, -1, 16), 0u);
+        EXPECT_LE(s, 18u); // S_MAX
     }
 
     TEST_F(Fp64EmulationHostTest, ParseEnabledEnv)
@@ -113,8 +96,7 @@ namespace
 
         auto performant = fp64EmulationParseStrategyEnv("performant");
         EXPECT_EQ(performant.state, FP64_EMULATION_ENV_VALID);
-        EXPECT_EQ(performant.value,
-                  static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT));
+        EXPECT_EQ(performant.value, static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT));
 
         auto eager = fp64EmulationParseStrategyEnv("eager");
         EXPECT_EQ(eager.state, FP64_EMULATION_ENV_VALID);
@@ -154,12 +136,9 @@ namespace
         EXPECT_EQ(bits140.state, FP64_EMULATION_ENV_VALID);
         EXPECT_EQ(bits140.value, 140u);
 
-        EXPECT_EQ(fp64EmulationParseMantissaBitCountEnv("141").state,
-                  FP64_EMULATION_ENV_INVALID);
-        EXPECT_EQ(fp64EmulationParseMantissaBitCountEnv("-1").state,
-                  FP64_EMULATION_ENV_INVALID);
-        EXPECT_EQ(fp64EmulationParseMantissaBitCountEnv("55.0").state,
-                  FP64_EMULATION_ENV_INVALID);
+        EXPECT_EQ(fp64EmulationParseMantissaBitCountEnv("141").state, FP64_EMULATION_ENV_INVALID);
+        EXPECT_EQ(fp64EmulationParseMantissaBitCountEnv("-1").state, FP64_EMULATION_ENV_INVALID);
+        EXPECT_EQ(fp64EmulationParseMantissaBitCountEnv("55.0").state, FP64_EMULATION_ENV_INVALID);
     }
 
     TEST_F(Fp64EmulationHostTest, MantissaBitCountRange)
@@ -203,8 +182,8 @@ namespace
 
         bool would_apply(hipDataType t, int64_t m, int64_t n, int64_t k, int batch)
         {
-            const Fp64EmulationDecision decision =
-                fp64EmulationDecision(m_roc, t, m, n, k, batch);
+            const Fp64EmulationDecision decision
+                = fp64EmulationDecision(m_roc, t, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, batch);
             EXPECT_EQ(decision.status, rocblaslt_status_success);
             return decision.apply;
         }
@@ -216,22 +195,30 @@ namespace
     // Workspace must be non-empty and not shrink as the moduli count grows.
     TEST_F(Fp64EmulationTest, WorkspaceSizePositiveAndMonotonic)
     {
-        const int64_t m = 1024, n = 1024, k = 1024;
+        const int64_t         m = 1024, n = 1024, k = 1024;
         Fp64EmulationDecision d{};
         d.dynamic_mode = false;
-        d.num_moduli = 8;
-        const size_t  ws8  = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+        d.num_moduli   = 8;
+        const size_t ws8
+            = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
         d.num_moduli = 16;
-        const size_t  ws16 = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+        const size_t ws16
+            = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
         EXPECT_GT(ws8, 0u);
         EXPECT_GE(ws16, ws8);
     }
 
     TEST_F(Fp64EmulationTest, PublicWorkspaceSizeRejectsNegativeDimensions)
     {
-        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, -1, 64, 64), 0u);
-        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, -1, 64), 0u);
-        EXPECT_EQ(hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, -1), 0u);
+        EXPECT_EQ(
+            hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, -1, 64, 64),
+            0u);
+        EXPECT_EQ(
+            hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, -1, 64),
+            0u);
+        EXPECT_EQ(
+            hipblasLtFp64EmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, -1),
+            0u);
     }
 
     // Explicit "off" must win regardless of the environment variable.
@@ -324,8 +311,8 @@ namespace
                       m_handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
                   HIPBLAS_STATUS_SUCCESS);
 
-        const Fp64EmulationDecision decision =
-            fp64EmulationDecision(m_roc, HIP_R_64F, 4096, 4096, 4096, 1);
+        const Fp64EmulationDecision decision = fp64EmulationDecision(
+            m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 4096, 4096, 4096, 1);
         ASSERT_EQ(decision.status, rocblaslt_status_success);
         ASSERT_TRUE(decision.apply);
         EXPECT_TRUE(decision.dynamic_mode);
@@ -366,7 +353,7 @@ namespace
         settings.workspace_bytes = 0;
 
         const rocblaslt_status st = fp64EmulatedGemm(m_handle,
-                                      HIPBLAS_OP_N,
+                                                     HIPBLAS_OP_N,
                                                      HIPBLAS_OP_N,
                                                      N,
                                                      N,
@@ -438,26 +425,32 @@ namespace
 
     struct EmulAccuracyParam
     {
-        unsigned           s;         /* num_moduli (2..18)                   */
-        int64_t            m, n, k;   /* matrix dimensions                    */
+        unsigned           s; /* num_moduli (2..18)                   */
+        int64_t            m, n, k; /* matrix dimensions                    */
         double             threshold; /* max relative error vs native DGEMM   */
-        FillStyle          fill;      /* input distribution                   */
-        hipblasOperation_t opA;       /* HIPBLAS_OP_N or HIPBLAS_OP_T for A   */
-        hipblasOperation_t opB;       /* HIPBLAS_OP_N or HIPBLAS_OP_T for B   */
-        double             alpha;     /* scaling factor for A*B               */
-        double             beta;      /* scaling factor for C                 */
+        FillStyle          fill; /* input distribution                   */
+        hipblasOperation_t opA; /* HIPBLAS_OP_N or HIPBLAS_OP_T for A   */
+        hipblasOperation_t opB; /* HIPBLAS_OP_N or HIPBLAS_OP_T for B   */
+        double             alpha; /* scaling factor for A*B               */
+        double             beta; /* scaling factor for C                 */
     };
 
-    static std::string EmulAccuracyParamName(
-        const ::testing::TestParamInfo<EmulAccuracyParam>& info)
+    static std::string
+        EmulAccuracyParamName(const ::testing::TestParamInfo<EmulAccuracyParam>& info)
     {
-        const EmulAccuracyParam& p = info.param;
-        const char* suf = "";
+        const EmulAccuracyParam& p   = info.param;
+        const char*              suf = "";
         switch(p.fill)
         {
-        case FILL_UNIFORM_01:   suf = "_uni";   break;
-        case FILL_ALLPOS_NEAR1: suf = "_near1"; break;
-        case FILL_GEOMROWS:     suf = "_geom";  break;
+        case FILL_UNIFORM_01:
+            suf = "_uni";
+            break;
+        case FILL_ALLPOS_NEAR1:
+            suf = "_near1";
+            break;
+        case FILL_GEOMROWS:
+            suf = "_geom";
+            break;
         }
         const char opA_c = (p.opA == HIPBLAS_OP_N) ? 'N' : 'T';
         const char opB_c = (p.opB == HIPBLAS_OP_N) ? 'N' : 'T';
@@ -466,11 +459,9 @@ namespace
             const int vi = static_cast<int>(v);
             return (static_cast<double>(vi) == v) ? std::to_string(vi) : "x";
         };
-        return "s" + std::to_string(p.s) + suf
-               + "_" + std::to_string(p.m) + "x" + std::to_string(p.n) + "x" + std::to_string(p.k)
-               + "_" + opA_c + opB_c
-               + "_a" + fmt_s(p.alpha)
-               + "_b" + fmt_s(p.beta);
+        return "s" + std::to_string(p.s) + suf + "_" + std::to_string(p.m) + "x"
+               + std::to_string(p.n) + "x" + std::to_string(p.k) + "_" + opA_c + opB_c + "_a"
+               + fmt_s(p.alpha) + "_b" + fmt_s(p.beta);
     }
 
     class Fp64EmulationAccuracyTest : public ::testing::TestWithParam<EmulAccuracyParam>
@@ -486,7 +477,10 @@ namespace
     /* Deterministic xorshift64 PRNG; fills v with U(0,1) doubles. */
     static uint64_t xsr64(uint64_t s)
     {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        return s;
     }
     static double xsr64_uniform(uint64_t b)
     {
@@ -495,8 +489,13 @@ namespace
     static void fill_uniform_host(std::vector<double>& v, uint64_t seed)
     {
         uint64_t s = seed ^ 1442695040888963407ULL;
-        s = xsr64(s); s = xsr64(s);
-        for(double& x : v) { s = xsr64(s); x = xsr64_uniform(s); }
+        s          = xsr64(s);
+        s          = xsr64(s);
+        for(double& x : v)
+        {
+            s = xsr64(s);
+            x = xsr64_uniform(s);
+        }
     }
 
     /* All-positive near-1: U(0.9, 1.0).  Inner products are ≈3.7× larger
@@ -504,8 +503,13 @@ namespace
     static void fill_allpos_near1_host(std::vector<double>& v, uint64_t seed)
     {
         uint64_t s = seed ^ 0x9e3779b97f4a7c15ULL;
-        s = xsr64(s); s = xsr64(s);
-        for(double& x : v) { s = xsr64(s); x = 0.9 + 0.1 * xsr64_uniform(s); }
+        s          = xsr64(s);
+        s          = xsr64(s);
+        for(double& x : v)
+        {
+            s = xsr64(s);
+            x = 0.9 + 0.1 * xsr64_uniform(s);
+        }
     }
 
     /* Geometric row-scale: element (i, j) in column-major storage (lda=rows) is
@@ -513,19 +517,19 @@ namespace
      * Creates rows spanning 16 doublings (2^{-8}..2^{8}) → diverse sftA[i] values.
      * Used for op(A)=N matrices (A is m×k, column-major with lda=m), and also for
      * the opA=T case via fill_geomcols_host to scale op(A)'s rows correctly. */
-    static void fill_geomrows_host(std::vector<double>& v,
-                                   int64_t rows, int64_t cols, uint64_t seed)
+    static void
+        fill_geomrows_host(std::vector<double>& v, int64_t rows, int64_t cols, uint64_t seed)
     {
         uint64_t s = seed ^ 0xdeadbeef12345678ULL;
-        s = xsr64(s); s = xsr64(s);
+        s          = xsr64(s);
+        s          = xsr64(s);
         for(int64_t i = 0; i < rows; ++i)
         {
             const double row_scale = std::ldexp(1.0, static_cast<int>(i * 16 / rows) - 8);
             for(int64_t j = 0; j < cols; ++j)
             {
-                s = xsr64(s);
-                v[static_cast<size_t>(i + j * rows)] =
-                    row_scale * (xsr64_uniform(s) * 2.0 - 1.0);
+                s                                    = xsr64(s);
+                v[static_cast<size_t>(i + j * rows)] = row_scale * (xsr64_uniform(s) * 2.0 - 1.0);
             }
         }
     }
@@ -533,19 +537,19 @@ namespace
     /* Geometric col-scale: element (i, j) in column-major storage (ldb=rows) is
      * col_scale(j) × U(-1,1), where col_scale(j) = 2^{(j·16/cols)−8}.
      * Creates columns spanning 16 doublings → diverse sftB[j] values. */
-    static void fill_geomcols_host(std::vector<double>& v,
-                                   int64_t rows, int64_t cols, uint64_t seed)
+    static void
+        fill_geomcols_host(std::vector<double>& v, int64_t rows, int64_t cols, uint64_t seed)
     {
         uint64_t s = seed ^ 0xbadcafe0deadbeefULL;
-        s = xsr64(s); s = xsr64(s);
+        s          = xsr64(s);
+        s          = xsr64(s);
         for(int64_t j = 0; j < cols; ++j)
         {
             const double col_scale = std::ldexp(1.0, static_cast<int>(j * 16 / cols) - 8);
             for(int64_t i = 0; i < rows; ++i)
             {
-                s = xsr64(s);
-                v[static_cast<size_t>(i + j * rows)] =
-                    col_scale * (xsr64_uniform(s) * 2.0 - 1.0);
+                s                                    = xsr64(s);
+                v[static_cast<size_t>(i + j * rows)] = col_scale * (xsr64_uniform(s) * 2.0 - 1.0);
             }
         }
     }
@@ -554,8 +558,8 @@ namespace
     {
         const EmulAccuracyParam& p = GetParam();
 
-        const bool    tA  = (p.opA == HIPBLAS_OP_T);
-        const bool    tB  = (p.opB == HIPBLAS_OP_T);
+        const bool tA = (p.opA == HIPBLAS_OP_T);
+        const bool tB = (p.opB == HIPBLAS_OP_T);
         /* Physical leading dimensions of the stored A and B matrices.
          * op(A)=N: A is m×k col-major (lda=m).  op(A)=T: A is k×m col-major (lda=k).
          * op(B)=N: B is k×n col-major (ldb=k).  op(B)=T: B is n×k col-major (ldb=n). */
@@ -573,26 +577,36 @@ namespace
         /* Device buffers.  Guard against zero-size malloc when k=0. */
         const size_t alloc_A = (nA > 0) ? nA * sizeof(double) : sizeof(double);
         const size_t alloc_B = (nB > 0) ? nB * sizeof(double) : sizeof(double);
-        double *dA = nullptr, *dB = nullptr, *dC = nullptr;
-        double *dD_nat = nullptr, *dD_emu = nullptr;
-        ASSERT_EQ(hipMalloc(&dA,     alloc_A),           hipSuccess);
-        ASSERT_EQ(hipMalloc(&dB,     alloc_B),           hipSuccess);
-        ASSERT_EQ(hipMalloc(&dC,     nD * sizeof(double)), hipSuccess);
+        double *     dA = nullptr, *dB = nullptr, *dC = nullptr;
+        double *     dD_nat = nullptr, *dD_emu = nullptr;
+        ASSERT_EQ(hipMalloc(&dA, alloc_A), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, alloc_B), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, nD * sizeof(double)), hipSuccess);
         ASSERT_EQ(hipMalloc(&dD_nat, nD * sizeof(double)), hipSuccess);
         ASSERT_EQ(hipMalloc(&dD_emu, nD * sizeof(double)), hipSuccess);
 
         /* Cleanup helper called on every exit path */
-        auto cleanup = [&](hipblasLtHandle_t hem, hipblasLtHandle_t hnat,
-                           hipblasLtMatmulDesc_t desc,
-                           hipblasLtMatrixLayout_t la, hipblasLtMatrixLayout_t lb,
-                           hipblasLtMatrixLayout_t ld, hipblasLtMatmulPreference_t pref) {
-            if(pref) hipblasLtMatmulPreferenceDestroy(pref);
-            if(ld)   hipblasLtMatrixLayoutDestroy(ld);
-            if(lb)   hipblasLtMatrixLayoutDestroy(lb);
-            if(la)   hipblasLtMatrixLayoutDestroy(la);
-            if(desc) hipblasLtMatmulDescDestroy(desc);
-            if(hnat) hipblasLtDestroy(hnat);
-            if(hem)  hipblasLtDestroy(hem);
+        auto cleanup = [&](hipblasLtHandle_t           hem,
+                           hipblasLtHandle_t           hnat,
+                           hipblasLtMatmulDesc_t       desc,
+                           hipblasLtMatrixLayout_t     la,
+                           hipblasLtMatrixLayout_t     lb,
+                           hipblasLtMatrixLayout_t     ld,
+                           hipblasLtMatmulPreference_t pref) {
+            if(pref)
+                hipblasLtMatmulPreferenceDestroy(pref);
+            if(ld)
+                hipblasLtMatrixLayoutDestroy(ld);
+            if(lb)
+                hipblasLtMatrixLayoutDestroy(lb);
+            if(la)
+                hipblasLtMatrixLayoutDestroy(la);
+            if(desc)
+                hipblasLtMatmulDescDestroy(desc);
+            if(hnat)
+                hipblasLtDestroy(hnat);
+            if(hem)
+                hipblasLtDestroy(hem);
             (void)hipFree(dD_emu);
             (void)hipFree(dD_nat);
             (void)hipFree(dC);
@@ -603,15 +617,21 @@ namespace
         /* ── Emulation handle (s moduli, eager strategy) ─────────────────── */
         hipblasLtHandle_t hem = nullptr;
         ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true),  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
                   HIPBLAS_STATUS_SUCCESS);
 
         /* Skip if the device is not supported by the emulation. */
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
-                                      HIP_R_64F, p.opA, p.opB, p.m, p.n, p.k, 1);
+            const Fp64EmulationDecision gate
+                = fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
+                                        HIP_R_64F,
+                                        p.opA,
+                                        p.opB,
+                                        p.m,
+                                        p.n,
+                                        p.k,
+                                        1);
             if(!gate.apply)
             {
                 cleanup(hem, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -620,19 +640,17 @@ namespace
         }
 
         /* ── Native DGEMM reference handle + layouts ─────────────────────── */
-        hipblasLtHandle_t        hnat = nullptr;
-        hipblasLtMatmulDesc_t    desc = nullptr;
-        hipblasLtMatrixLayout_t  la   = nullptr, lb = nullptr, ld = nullptr;
-        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtHandle_t                hnat = nullptr;
+        hipblasLtMatmulDesc_t            desc = nullptr;
+        hipblasLtMatrixLayout_t          la = nullptr, lb = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t      pref = nullptr;
         hipblasLtMatmulHeuristicResult_t heur{};
 
         ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F),
                   HIPBLAS_STATUS_SUCCESS);
-        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA,
-                                        &p.opA, sizeof(p.opA));
-        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB,
-                                        &p.opB, sizeof(p.opB));
+        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &p.opA, sizeof(p.opA));
+        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &p.opB, sizeof(p.opB));
 
         /* Physical matrix dimensions for layout creation:
          * opA=N: A is (m × k), lda=m.  opA=T: A is (k × m), lda=k.
@@ -646,9 +664,8 @@ namespace
                   HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lb, HIP_R_64F, lb_rows, lb_cols, ldb),
                   HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&ld, HIP_R_64F,
-                                              static_cast<uint64_t>(p.m),
-                                              static_cast<uint64_t>(p.n), p.m),
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(
+                      &ld, HIP_R_64F, static_cast<uint64_t>(p.m), static_cast<uint64_t>(p.n), p.m),
                   HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&pref), HIPBLAS_STATUS_SUCCESS);
         /* No workspace restriction: let the library pick any algorithm.  Without
@@ -665,7 +682,7 @@ namespace
         /* ── Emulation settings (use settings.num_moduli directly) ──────── */
         Fp64EmulationSettings emu_settings{};
         emu_settings.num_moduli      = p.s;
-        emu_settings.sv_mask         = 0u;   /* skip Inf/NaN detection */
+        emu_settings.sv_mask         = 0u; /* skip Inf/NaN detection */
         emu_settings.workspace       = nullptr; /* library allocates internally */
         emu_settings.workspace_bytes = 0u;
 
@@ -673,12 +690,11 @@ namespace
          * read by either GEMM, but we still fill it to exercise the beta=0
          * bypass path with a non-trivial buffer.                            */
         fill_uniform_host(hC, 0xc0ffee0000000000ULL);
-        ASSERT_EQ(hipMemcpy(dC, hC.data(), nD * sizeof(double), hipMemcpyHostToDevice),
-                  hipSuccess);
+        ASSERT_EQ(hipMemcpy(dC, hC.data(), nD * sizeof(double), hipMemcpyHostToDevice), hipSuccess);
 
         /* Sweep three deterministic seeds; accumulate the worst relative error. */
-        constexpr uint64_t SEEDS[3] = {12345ULL, 98765ULL, 54321ULL};
-        double max_rel_err = 0.0;
+        constexpr uint64_t SEEDS[3]    = {12345ULL, 98765ULL, 54321ULL};
+        double             max_rel_err = 0.0;
 
         for(uint64_t seed : SEEDS)
         {
@@ -700,40 +716,67 @@ namespace
                  * For op(B)=N (B is k×n, ldb=k): scale by col index (n_idx).
                  * For op(B)=T (B is n×k, ldb=n): B's row n_idx = op(B)'s col n_idx
                  *   → fill_geomrows_host scales by row i = n_idx ✓             */
-                if(tA) fill_geomcols_host(hA, p.k, p.m, seed);
-                else   fill_geomrows_host(hA, p.m, p.k, seed);
-                if(tB) fill_geomrows_host(hB, p.n, p.k, seed ^ 0xdeadbeefcafeULL);
-                else   fill_geomcols_host(hB, p.k, p.n, seed ^ 0xdeadbeefcafeULL);
+                if(tA)
+                    fill_geomcols_host(hA, p.k, p.m, seed);
+                else
+                    fill_geomrows_host(hA, p.m, p.k, seed);
+                if(tB)
+                    fill_geomrows_host(hB, p.n, p.k, seed ^ 0xdeadbeefcafeULL);
+                else
+                    fill_geomcols_host(hB, p.k, p.n, seed ^ 0xdeadbeefcafeULL);
                 break;
             }
 
             if(nA > 0)
-                ASSERT_EQ(hipMemcpy(dA, hA.data(), nA*sizeof(double), hipMemcpyHostToDevice),
+                ASSERT_EQ(hipMemcpy(dA, hA.data(), nA * sizeof(double), hipMemcpyHostToDevice),
                           hipSuccess);
             if(nB > 0)
-                ASSERT_EQ(hipMemcpy(dB, hB.data(), nB*sizeof(double), hipMemcpyHostToDevice),
+                ASSERT_EQ(hipMemcpy(dB, hB.data(), nB * sizeof(double), hipMemcpyHostToDevice),
                           hipSuccess);
 
             /* Native FP64 DGEMM reference (C→D_nat). */
-            const hipblasStatus_t nat_st =
-                hipblasLtMatmul(hnat, desc,
-                                &p.alpha, dA, la, dB, lb,
-                                &p.beta,  dC, ld, dD_nat, ld,
-                                &heur.algo, nullptr, 0, /*stream=*/nullptr);
+            const hipblasStatus_t nat_st = hipblasLtMatmul(hnat,
+                                                           desc,
+                                                           &p.alpha,
+                                                           dA,
+                                                           la,
+                                                           dB,
+                                                           lb,
+                                                           &p.beta,
+                                                           dC,
+                                                           ld,
+                                                           dD_nat,
+                                                           ld,
+                                                           &heur.algo,
+                                                           nullptr,
+                                                           0,
+                                                           /*stream=*/nullptr);
             if(nat_st != HIPBLAS_STATUS_SUCCESS)
             {
                 cleanup(hem, hnat, desc, la, lb, ld, pref);
-                GTEST_SKIP() << "Native hipblasLtMatmul failed (status="
-                             << static_cast<int>(nat_st) << ")";
+                GTEST_SKIP() << "Native hipblasLtMatmul failed (status=" << static_cast<int>(nat_st)
+                             << ")";
             }
 
             /* Emulated DGEMM (C→D_emu). */
-            const rocblaslt_status emu_st =
-                fp64EmulatedGemm(hem,
-                                              p.opA, p.opB, p.m, p.n, p.k,
-                                 &p.alpha, dA, lda, dB, ldb,
-                                 &p.beta,  dC, p.m, dD_emu, p.m,
-                                 /*stream=*/nullptr, emu_settings);
+            const rocblaslt_status emu_st = fp64EmulatedGemm(hem,
+                                                             p.opA,
+                                                             p.opB,
+                                                             p.m,
+                                                             p.n,
+                                                             p.k,
+                                                             &p.alpha,
+                                                             dA,
+                                                             lda,
+                                                             dB,
+                                                             ldb,
+                                                             &p.beta,
+                                                             dC,
+                                                             p.m,
+                                                             dD_emu,
+                                                             p.m,
+                                                             /*stream=*/nullptr,
+                                                             emu_settings);
             if(emu_st != rocblaslt_status_success)
             {
                 cleanup(hem, hnat, desc, la, lb, ld, pref);
@@ -741,20 +784,20 @@ namespace
                              << " (INT8 device library may be unavailable on this arch)";
             }
 
-            ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, nD*sizeof(double), hipMemcpyDeviceToHost),
+            ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, nD * sizeof(double), hipMemcpyDeviceToHost),
                       hipSuccess);
-            ASSERT_EQ(hipMemcpy(hD_emu.data(), dD_emu, nD*sizeof(double), hipMemcpyDeviceToHost),
+            ASSERT_EQ(hipMemcpy(hD_emu.data(), dD_emu, nD * sizeof(double), hipMemcpyDeviceToHost),
                       hipSuccess);
 
             /* Relative error normalised by the maximum element magnitude.
              * Floor at 1.0 prevents division-by-zero for near-zero outputs.  */
             double dmax = 0.0;
-            for(double v : hD_nat) dmax = std::max(dmax, std::abs(v));
+            for(double v : hD_nat)
+                dmax = std::max(dmax, std::abs(v));
             const double norm = std::max(dmax, 1.0);
 
             for(size_t idx = 0; idx < nD; ++idx)
-                max_rel_err = std::max(max_rel_err,
-                                       std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
+                max_rel_err = std::max(max_rel_err, std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
         }
 
         cleanup(hem, hnat, desc, la, lb, ld, pref);
@@ -782,26 +825,41 @@ namespace
         AllModuliCounts,
         Fp64EmulationAccuracyTest,
         ::testing::Values(
-            EmulAccuracyParam{ 2,  64,  64,  128, 3e-1,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 3,  64,  64,  128, 3e-1,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 4,  64,  64,  128, 2e-1,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 5,  64,  64,  128, 1e-1,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 6,  64,  64,  128, 5e-2,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 7,  128, 128, 4096, 5e-4,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 8,  128, 128, 4096, 5e-4,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 9,  128, 128, 4096, 1e-6,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{10,  128, 128, 4096, 1e-7,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{11,  128, 128, 4096, 1e-8,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{12,  128, 128, 4096, 1e-9,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{13,  128, 128, 4096, 1e-10, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{14,  128, 128, 4096, 1e-10, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{15,  128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{16,  128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{17,  128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{18,  128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 }
-        ),
-        EmulAccuracyParamName
-    );
+            EmulAccuracyParam{
+                2, 64, 64, 128, 3e-1, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                3, 64, 64, 128, 3e-1, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                4, 64, 64, 128, 2e-1, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                5, 64, 64, 128, 1e-1, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                6, 64, 64, 128, 5e-2, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                8, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                9, 128, 128, 4096, 1e-6, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                10, 128, 128, 4096, 1e-7, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                11, 128, 128, 4096, 1e-8, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                12, 128, 128, 4096, 1e-9, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                13, 128, 128, 4096, 1e-10, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                14, 128, 128, 4096, 1e-10, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                15, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                17, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                18, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+        EmulAccuracyParamName);
 
     // ── NearSignFlip: adversarial distributions pushing X_true toward M_s/2 ──
     //
@@ -816,34 +874,56 @@ namespace
         Fp64EmulationAccuracyTest,
         ::testing::Values(
             // All-positive near-1
-            EmulAccuracyParam{ 7,  128, 128, 4096, 5e-4,  FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 8,  128, 128, 4096, 5e-4,  FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 9,  128, 128, 4096, 1e-6,  FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{10,  128, 128, 4096, 1e-7,  FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{11,  128, 128, 4096, 1e-8,  FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{12,  128, 128, 4096, 1e-9,  FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{13,  128, 128, 4096, 1e-10, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{14,  128, 128, 4096, 1e-10, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{15,  128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{16,  128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{17,  128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{18,  128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
+            EmulAccuracyParam{
+                7, 128, 128, 4096, 5e-4, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                8, 128, 128, 4096, 5e-4, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                9, 128, 128, 4096, 1e-6, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                10, 128, 128, 4096, 1e-7, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                11, 128, 128, 4096, 1e-8, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                12, 128, 128, 4096, 1e-9, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                13, 128, 128, 4096, 1e-10, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                14, 128, 128, 4096, 1e-10, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                15, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                17, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                18, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
             // Geometric row-/col-scaling (wide dynamic range)
-            EmulAccuracyParam{ 7,  128, 128, 4096, 5e-4,  FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 8,  128, 128, 4096, 5e-4,  FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 9,  128, 128, 4096, 1e-6,  FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{10,  128, 128, 4096, 1e-7,  FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{11,  128, 128, 4096, 1e-8,  FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{12,  128, 128, 4096, 1e-9,  FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{13,  128, 128, 4096, 1e-10, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{14,  128, 128, 4096, 1e-10, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{15,  128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{16,  128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{17,  128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{18,  128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 }
-        ),
-        EmulAccuracyParamName
-    );
+            EmulAccuracyParam{
+                7, 128, 128, 4096, 5e-4, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                8, 128, 128, 4096, 5e-4, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                9, 128, 128, 4096, 1e-6, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                10, 128, 128, 4096, 1e-7, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                11, 128, 128, 4096, 1e-8, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                12, 128, 128, 4096, 1e-9, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                13, 128, 128, 4096, 1e-10, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                14, 128, 128, 4096, 1e-10, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                15, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                17, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                18, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+        EmulAccuracyParamName);
 
     // ── TransposeCombinations: all 4 op(A)×op(B) transpose variants ──────────
     //
@@ -855,18 +935,24 @@ namespace
         Fp64EmulationAccuracyTest,
         ::testing::Values(
             // s=7 — CRT just above FP64 mantissa capacity
-            EmulAccuracyParam{ 7, 128, 128, 4096, 5e-4,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 7, 128, 128, 4096, 5e-4,  FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{ 7, 128, 128, 4096, 5e-4,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_T, 1.0, 0.0 },
-            EmulAccuracyParam{ 7, 128, 128, 4096, 5e-4,  FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_T, 1.0, 0.0 },
+            EmulAccuracyParam{
+                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_T, 1.0, 0.0},
+            EmulAccuracyParam{
+                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_T, 1.0, 0.0},
             // s=16 — default precision
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_T, 1.0, 0.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_T, 1.0, 0.0 }
-        ),
-        EmulAccuracyParamName
-    );
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_T, 1.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_T, 1.0, 0.0}),
+        EmulAccuracyParamName);
 
     // ── AlphaBeta: alpha × beta ∈ {0, 1, 2}² at s=16, NN ────────────────────
     //
@@ -878,18 +964,25 @@ namespace
         AlphaBeta,
         Fp64EmulationAccuracyTest,
         ::testing::Values(
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 0.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 1.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 2.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 1.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 2.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 0.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 1.0 },
-            EmulAccuracyParam{16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 2.0 }
-        ),
-        EmulAccuracyParamName
-    );
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 1.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 2.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 1.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 2.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 0.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 1.0},
+            EmulAccuracyParam{
+                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 2.0}),
+        EmulAccuracyParamName);
 
     // ── KEqualsZero: k=0 edge case ────────────────────────────────────────────
     //
@@ -900,12 +993,12 @@ namespace
         Fp64EmulationAccuracyTest,
         ::testing::Values(
             /* beta=0: D = 0 */
-            EmulAccuracyParam{16, 64, 64, 0, 0.0, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
+            EmulAccuracyParam{
+                16, 64, 64, 0, 0.0, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
             /* beta=1: D = C */
-            EmulAccuracyParam{16, 64, 64, 0, 0.0, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 1.0 }
-        ),
-        EmulAccuracyParamName
-    );
+            EmulAccuracyParam{
+                16, 64, 64, 0, 0.0, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 1.0}),
+        EmulAccuracyParamName);
 
     // ── SmallDimensions: m=1 or n=1 (single-row / single-column output) ──────
     //
@@ -936,11 +1029,9 @@ namespace
     INSTANTIATE_TEST_SUITE_P(
         LargeK,
         Fp64EmulationAccuracyTest,
-        ::testing::Values(
-            EmulAccuracyParam{16, 64, 64, 16384, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 }
-        ),
-        EmulAccuracyParamName
-    );
+        ::testing::Values(EmulAccuracyParam{
+            16, 64, 64, 16384, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+        EmulAccuracyParamName);
 
     // ── RectangularShapes: non-square m×n×k to exercise different tile paths ──
     //
@@ -952,14 +1043,15 @@ namespace
         Fp64EmulationAccuracyTest,
         ::testing::Values(
             /* Tall-and-thin output (m >> n) */
-            EmulAccuracyParam{16, 512, 16, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
+            EmulAccuracyParam{
+                16, 512, 16, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
             /* Wide-and-short output (n >> m) */
-            EmulAccuracyParam{16, 16, 512, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
+            EmulAccuracyParam{
+                16, 16, 512, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
             /* Intermediate rectangular */
-            EmulAccuracyParam{16, 256, 64, 1024, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 }
-        ),
-        EmulAccuracyParamName
-    );
+            EmulAccuracyParam{
+                16, 256, 64, 1024, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+        EmulAccuracyParamName);
 
     // ── Demmel matrix helper ──────────────────────────────────────────────────
     //
@@ -968,7 +1060,8 @@ namespace
     // and fills column-major A and B:
     //   A[col*n+row] = x[(row+col)%n] × d[(row+col)%n]
     //   B[col*n+row] = x[(row+col)%n] / d[(row+col)%n]
-    static void build_demmel_ab(int n, int b,
+    static void build_demmel_ab(int                  n,
+                                int                  b,
                                 std::vector<double>& h_x,
                                 std::vector<double>& h_d,
                                 std::vector<double>& h_A,
@@ -982,18 +1075,21 @@ namespace
 
         for(int i = 0; i < n; ++i)
         {
-            uint64_t s = static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL
-                         + 1442695040888963407ULL;
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-            h_x[static_cast<size_t>(i)] =
-                1.0 + static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0);
+            uint64_t s = static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL + 1442695040888963407ULL;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            h_x[static_cast<size_t>(i)]
+                = 1.0 + static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0);
         }
 
         const double delta = (n > 1) ? (2.0 * b) / static_cast<double>(n - 1) : 0.0;
         for(int m = 0; m < n; ++m)
         {
-            double jm = -b + std::round(static_cast<double>(m) * delta);
+            double jm                   = -b + std::round(static_cast<double>(m) * delta);
             h_d[static_cast<size_t>(m)] = std::ldexp(1.0, static_cast<int>(jm));
         }
 
@@ -1002,8 +1098,8 @@ namespace
             {
                 const size_t m   = static_cast<size_t>((row + col) % n);
                 const size_t idx = static_cast<size_t>(col * n + row);
-                h_A[idx] = h_x[m] * h_d[m];
-                h_B[idx] = h_x[m] / h_d[m];
+                h_A[idx]         = h_x[m] * h_d[m];
+                h_B[idx]         = h_x[m] / h_d[m];
             }
     }
 
@@ -1024,9 +1120,8 @@ namespace
 
         // Skip unsupported devices
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(m_roc, HIP_R_64F,
-                                      HIPBLAS_OP_N, HIPBLAS_OP_N, 128, 128, 128, 1);
+            const Fp64EmulationDecision gate = fp64EmulationDecision(
+                m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 128, 128, 128, 1);
             if(!gate.apply)
                 GTEST_SKIP() << "Device not supported by emulation";
         }
@@ -1048,22 +1143,36 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
         Fp64EmulationSettings emu_settings{};
-        emu_settings.num_moduli      = 16u;    /* ADP upper bound */
-        emu_settings.sv_mask         = 0u;     /* skip Inf/NaN detection */
-        emu_settings.dynamic_mode    = true;   /* enable ADP */
+        emu_settings.num_moduli      = 16u; /* ADP upper bound */
+        emu_settings.sv_mask         = 0u; /* skip Inf/NaN detection */
+        emu_settings.dynamic_mode    = true; /* enable ADP */
         emu_settings.workspace       = nullptr;
         emu_settings.workspace_bytes = 0u;
 
-        const double alpha = 1.0, beta = 0.0;
-        const rocblaslt_status st =
-            fp64EmulatedGemm(m_handle,
-                                          HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n,
-                             &alpha, dA, n, dB, n,
-                             &beta,  dC, n, dD, n,
-                             /*stream=*/nullptr, emu_settings);
+        const double           alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st = fp64EmulatedGemm(m_handle,
+                                                     HIPBLAS_OP_N,
+                                                     HIPBLAS_OP_N,
+                                                     n,
+                                                     n,
+                                                     n,
+                                                     &alpha,
+                                                     dA,
+                                                     n,
+                                                     dB,
+                                                     n,
+                                                     &beta,
+                                                     dC,
+                                                     n,
+                                                     dD,
+                                                     n,
+                                                     /*stream=*/nullptr,
+                                                     emu_settings);
 
-        (void)hipFree(dD); (void)hipFree(dC);
-        (void)hipFree(dB); (void)hipFree(dA);
+        (void)hipFree(dD);
+        (void)hipFree(dC);
+        (void)hipFree(dB);
+        (void)hipFree(dA);
 
         // ADP must have detected the b=32 overflow and returned invalid_value.
         // (The caller — rocblaslt_mat.cpp — would then fall back to native DGEMM.)
@@ -1093,19 +1202,16 @@ namespace
 
     struct EmulDemmelParam
     {
-        unsigned s;         /* num_moduli (2..18)           */
-        int      n;         /* square matrix side (≤ 128)   */
-        int      b;         /* exponent half-range (≤ 15)   */
+        unsigned s; /* num_moduli (2..18)           */
+        int      n; /* square matrix side (≤ 128)   */
+        int      b; /* exponent half-range (≤ 15)   */
         double   threshold; /* max rel error over all n² el */
     };
 
-    static std::string EmulDemmelParamName(
-        const ::testing::TestParamInfo<EmulDemmelParam>& info)
+    static std::string EmulDemmelParamName(const ::testing::TestParamInfo<EmulDemmelParam>& info)
     {
         const EmulDemmelParam& p = info.param;
-        return "s" + std::to_string(p.s)
-               + "_n" + std::to_string(p.n)
-               + "_b" + std::to_string(p.b);
+        return "s" + std::to_string(p.s) + "_n" + std::to_string(p.n) + "_b" + std::to_string(p.b);
     }
 
     class Fp64EmulationDemmelTest : public ::testing::TestWithParam<EmulDemmelParam>
@@ -1120,8 +1226,8 @@ namespace
 
     TEST_P(Fp64EmulationDemmelTest, VsLongDoubleReference)
     {
-        const EmulDemmelParam& p = GetParam();
-        const int64_t          N = static_cast<int64_t>(p.n);
+        const EmulDemmelParam& p  = GetParam();
+        const int64_t          N  = static_cast<int64_t>(p.n);
         const size_t           N2 = static_cast<size_t>(N) * static_cast<size_t>(N);
 
         // ── Host: build Demmel A, B matrices using shared helper ──────────────
@@ -1138,16 +1244,14 @@ namespace
             {
                 const size_t ml  = static_cast<size_t>(m);
                 const size_t mpl = static_cast<size_t>((m + lag) % N);
-                h_lag[static_cast<size_t>(lag)] +=
-                    static_cast<long double>(h_x[ml])
-                    * static_cast<long double>(h_x[mpl])
-                    * static_cast<long double>(h_d[ml])
-                    / static_cast<long double>(h_d[mpl]);
+                h_lag[static_cast<size_t>(lag)]
+                    += static_cast<long double>(h_x[ml]) * static_cast<long double>(h_x[mpl])
+                       * static_cast<long double>(h_d[ml]) / static_cast<long double>(h_d[mpl]);
             }
 
         // ── Device: upload and run emulation ──────────────────────────────────
         const size_t bytes = N2 * sizeof(double);
-        double *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr;
+        double *     dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr;
         ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
         ASSERT_EQ(hipMalloc(&dB, bytes), hipSuccess);
         ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
@@ -1157,21 +1261,29 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
         auto cleanup = [&]() {
-            (void)hipFree(dD); (void)hipFree(dC);
-            (void)hipFree(dB); (void)hipFree(dA);
+            (void)hipFree(dD);
+            (void)hipFree(dC);
+            (void)hipFree(dB);
+            (void)hipFree(dA);
         };
 
         hipblasLtHandle_t hem = nullptr;
         ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true),  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
                   HIPBLAS_STATUS_SUCCESS);
 
         // Skip unsupported devices
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
-                                      HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+            const Fp64EmulationDecision gate
+                = fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
+                                        HIP_R_64F,
+                                        HIPBLAS_OP_N,
+                                        HIPBLAS_OP_N,
+                                        N,
+                                        N,
+                                        N,
+                                        1);
             if(!gate.apply)
             {
                 (void)hipblasLtDestroy(hem);
@@ -1186,13 +1298,25 @@ namespace
         emu_settings.workspace       = nullptr;
         emu_settings.workspace_bytes = 0u;
 
-        const double          alpha = 1.0, beta = 0.0;
-        const rocblaslt_status st =
-            fp64EmulatedGemm(hem,
-                                          HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
-                             &alpha, dA, N, dB, N,
-                             &beta,  dC, N, dD, N,
-                             /*stream=*/nullptr, emu_settings);
+        const double           alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st = fp64EmulatedGemm(hem,
+                                                     HIPBLAS_OP_N,
+                                                     HIPBLAS_OP_N,
+                                                     N,
+                                                     N,
+                                                     N,
+                                                     &alpha,
+                                                     dA,
+                                                     N,
+                                                     dB,
+                                                     N,
+                                                     &beta,
+                                                     dC,
+                                                     N,
+                                                     dD,
+                                                     N,
+                                                     /*stream=*/nullptr,
+                                                     emu_settings);
         (void)hipblasLtDestroy(hem);
 
         if(st != rocblaslt_status_success)
@@ -1208,23 +1332,22 @@ namespace
         cleanup();
 
         double max_rel_err = 0.0;
-        for(int64_t col = 0; col < N; ++col)     /* i = col */
+        for(int64_t col = 0; col < N; ++col) /* i = col */
             for(int64_t row = 0; row < N; ++row) /* k = row */
             {
                 const size_t      lag  = static_cast<size_t>(((col - row) % N + N) % N);
                 const long double ref  = h_lag[lag];
                 const double      emul = h_D[static_cast<size_t>(col * N + row)];
                 /* ref > 0 always (sum of positive terms) */
-                const double rel = std::abs(emul - static_cast<double>(ref))
-                                 / static_cast<double>(ref);
-                if(rel > max_rel_err) max_rel_err = rel;
+                const double rel
+                    = std::abs(emul - static_cast<double>(ref)) / static_cast<double>(ref);
+                if(rel > max_rel_err)
+                    max_rel_err = rel;
             }
 
         EXPECT_LE(max_rel_err, p.threshold)
-            << "Demmel BLAS Test 2 (s=" << p.s
-            << ", n=" << p.n << ", b=" << p.b
-            << "): max_rel_err=" << max_rel_err
-            << " > threshold=" << p.threshold
+            << "Demmel BLAS Test 2 (s=" << p.s << ", n=" << p.n << ", b=" << p.b
+            << "): max_rel_err=" << max_rel_err << " > threshold=" << p.threshold
             << ".  A value near 1–2 indicates a CRT sign-flip regression.";
     }
 
@@ -1254,9 +1377,9 @@ namespace
         ::testing::Values(
             // s=7..14, b=0: d[m]=1 for all m → A=B elementwise, trivially safe.
             // Thresholds match CRT capacity per s (same pattern as AllModuliCounts).
-            EmulDemmelParam{ 7, 512, 0, 5e-4},
-            EmulDemmelParam{ 8, 512, 0, 5e-4},
-            EmulDemmelParam{ 9, 512, 0, 1e-6},
+            EmulDemmelParam{7, 512, 0, 5e-4},
+            EmulDemmelParam{8, 512, 0, 5e-4},
+            EmulDemmelParam{9, 512, 0, 1e-6},
             EmulDemmelParam{10, 512, 0, 1e-7},
             EmulDemmelParam{11, 512, 0, 1e-8},
             EmulDemmelParam{12, 512, 0, 1e-9},
@@ -1280,10 +1403,8 @@ namespace
             EmulDemmelParam{18, 512, 1, 1e-13},
             EmulDemmelParam{18, 512, 2, 1e-13},
             EmulDemmelParam{18, 512, 4, 1e-13},
-            EmulDemmelParam{18, 512, 8, 1e-13}
-        ),
-        EmulDemmelParamName
-    );
+            EmulDemmelParam{18, 512, 8, 1e-13}),
+        EmulDemmelParamName);
 
     // ── IllConditionedGramMatrix: disabled ─────────────────────────────────────
     //
@@ -1502,7 +1623,7 @@ namespace
         ),
         EmulIllCondParamName
     );
-#endif  // IllConditionedGramMatrix disabled
+#endif // IllConditionedGramMatrix disabled
 
     // ── StructuredGemmTest: stress matrices targeting the Ozaki extraction ────
     //
@@ -1519,26 +1640,36 @@ namespace
     // Reference: native FP64 DGEMM; threshold 1e-10.
     // CatastrophicCancel has an additional exact-zero check on row-pair sums.
 
-    enum StructuredMatType {
-        SMAT_CATASTROPHIC_CANCEL, SMAT_SCALED_DYNAMIC_RANGE, SMAT_ONES_AND_EPSILONS,
-        SMAT_HADAMARD, SMAT_TOEPLITZ, SMAT_RANK1_PERTURB, SMAT_ALTERNATING,
+    enum StructuredMatType
+    {
+        SMAT_CATASTROPHIC_CANCEL,
+        SMAT_SCALED_DYNAMIC_RANGE,
+        SMAT_ONES_AND_EPSILONS,
+        SMAT_HADAMARD,
+        SMAT_TOEPLITZ,
+        SMAT_RANK1_PERTURB,
+        SMAT_ALTERNATING,
     };
 
-    struct StructuredGemmParam {
+    struct StructuredGemmParam
+    {
         StructuredMatType mat_type;
         int               N;
         double            threshold;
     };
 
-    static std::string StructuredGemmParamName(
-        const ::testing::TestParamInfo<StructuredGemmParam>& info)
+    static std::string
+        StructuredGemmParamName(const ::testing::TestParamInfo<StructuredGemmParam>& info)
     {
-        const char* names[] = {
-            "CatastrophicCancel", "ScaledDynamicRange", "OnesAndEpsilons",
-            "Hadamard", "Toeplitz", "Rank1Perturb", "Alternating"
-        };
-        return std::string(names[static_cast<int>(info.param.mat_type)])
-               + "_N" + std::to_string(info.param.N);
+        const char* names[] = {"CatastrophicCancel",
+                               "ScaledDynamicRange",
+                               "OnesAndEpsilons",
+                               "Hadamard",
+                               "Toeplitz",
+                               "Rank1Perturb",
+                               "Alternating"};
+        return std::string(names[static_cast<int>(info.param.mat_type)]) + "_N"
+               + std::to_string(info.param.N);
     }
 
     class Fp64EmulationStructuredTest : public ::testing::TestWithParam<StructuredGemmParam>
@@ -1546,26 +1677,33 @@ namespace
     protected:
         void SetUp() override
         {
-            if(!has_device()) GTEST_SKIP() << "No HIP device available";
+            if(!has_device())
+                GTEST_SKIP() << "No HIP device available";
         }
     };
 
     /* Build N×N column-major A and B matrices for a given structured type.
      * A and B are independently filled where indicated (ExtremeScale, Alternating). */
-    static void build_structured_ab(
-        StructuredMatType type, int N,
-        std::vector<double>& hA, std::vector<double>& hB)
+    static void build_structured_ab(StructuredMatType    type,
+                                    int                  N,
+                                    std::vector<double>& hA,
+                                    std::vector<double>& hB)
     {
         const size_t N2 = static_cast<size_t>(N) * N;
-        hA.resize(N2); hB.resize(N2);
-        uint64_t sA = 0xabcd1234ef567890ULL;
-        uint64_t sB = 0x1032547698badcfeULL;
-        auto nextA = [&]() -> double {
-            sA ^= sA << 13; sA ^= sA >> 7; sA ^= sA << 17;
+        hA.resize(N2);
+        hB.resize(N2);
+        uint64_t sA    = 0xabcd1234ef567890ULL;
+        uint64_t sB    = 0x1032547698badcfeULL;
+        auto     nextA = [&]() -> double {
+            sA ^= sA << 13;
+            sA ^= sA >> 7;
+            sA ^= sA << 17;
             return static_cast<double>(sA >> 11) * (1.0 / 9007199254740992.0);
         };
         auto nextB = [&]() -> double {
-            sB ^= sB << 13; sB ^= sB >> 7; sB ^= sB << 17;
+            sB ^= sB << 13;
+            sB ^= sB >> 7;
+            sB ^= sB << 17;
             return static_cast<double>(sB >> 11) * (1.0 / 9007199254740992.0);
         };
 
@@ -1576,7 +1714,7 @@ namespace
         std::vector<double> v_cat(type == SMAT_CATASTROPHIC_CANCEL ? N : 0);
         if(type == SMAT_CATASTROPHIC_CANCEL)
             for(int jj = 0; jj < N; ++jj)
-                v_cat[jj] = 1.0 + nextA();   /* v[j] ~ U(1,2), shared across pair */
+                v_cat[jj] = 1.0 + nextA(); /* v[j] ~ U(1,2), shared across pair */
 
         for(int j = 0; j < N; ++j)
             for(int i = 0; i < N; ++i)
@@ -1597,10 +1735,10 @@ namespace
                     /* Row i scaled by 2^{i·16/(N-1)−8}: N distinct sftA values
                      * from 2^{−8} (row 0) to 2^{8} (row N-1).  Stresses the per-row
                      * shift refinement with every possible sftA in the range.          */
-                    const double exp = static_cast<double>(i) * 16.0 / std::max(N-1,1) - 8.0;
+                    const double exp   = static_cast<double>(i) * 16.0 / std::max(N - 1, 1) - 8.0;
                     const double scale = std::ldexp(1.0, static_cast<int>(std::round(exp)));
-                    hA[idx] = scale * (nextA() * 2.0 - 1.0);
-                    hB[idx] = nextB() * 2.0 - 1.0;
+                    hA[idx]            = scale * (nextA() * 2.0 - 1.0);
+                    hB[idx]            = nextB() * 2.0 - 1.0;
                     break;
                 }
                 case SMAT_ONES_AND_EPSILONS:
@@ -1611,8 +1749,8 @@ namespace
                      * residual in subsequent Ozaki passes.  Expected result:
                      *   (A×B)[i,k] = (N-1)×ε + 1.0  (all i,k).                       */
                     constexpr double eps_m = std::numeric_limits<double>::epsilon();
-                    hA[idx] = (j < N - 1) ? eps_m : 1.0;
-                    hB[idx] = 1.0;
+                    hA[idx]                = (j < N - 1) ? eps_m : 1.0;
+                    hB[idx]                = 1.0;
                     break;
                 }
                 case SMAT_HADAMARD:
@@ -1624,8 +1762,8 @@ namespace
                 {
                     /* A: checkerboard signs, B: all-positive → genuine cancellation */
                     const double sign = ((i + j) % 2 == 0) ? 1.0 : -1.0;
-                    hA[idx] = sign * nextA();
-                    hB[idx] = nextB();
+                    hA[idx]           = sign * nextA();
+                    hB[idx]           = nextB();
                     break;
                 }
                 }
@@ -1639,8 +1777,9 @@ namespace
              * For non-power-of-2 N, we build the smallest power-of-2 ≥ N and
              * use the top-left N×N sub-block (still ±1 entries).                */
             int logN = 0;
-            while((1 << logN) < N) ++logN;
-            const int HN = (1 << logN);
+            while((1 << logN) < N)
+                ++logN;
+            const int           HN = (1 << logN);
             std::vector<double> H(static_cast<size_t>(HN) * HN, 0.0);
             H[0] = 1.0;
             for(int step = 1; step < HN; step *= 2)
@@ -1648,8 +1787,8 @@ namespace
                     for(int c = 0; c < step; ++c)
                     {
                         const double v = H[static_cast<size_t>(r + c * HN)];
-                        H[static_cast<size_t>(r + step + c * HN)]         =  v;
-                        H[static_cast<size_t>(r       + (c + step) * HN)] =  v;
+                        H[static_cast<size_t>(r + step + c * HN)]          = v;
+                        H[static_cast<size_t>(r + (c + step) * HN)]        = v;
                         H[static_cast<size_t>(r + step + (c + step) * HN)] = -v;
                     }
             /* Copy top-left N×N block into hA, hB = identity-like (B=I so C=A). */
@@ -1657,8 +1796,8 @@ namespace
                 for(int ii = 0; ii < N; ++ii)
                 {
                     const size_t idx2 = static_cast<size_t>(ii + jj * N);
-                    hA[idx2] = H[static_cast<size_t>(ii + jj * HN)];
-                    hB[idx2] = (ii == jj) ? 1.0 : 0.0;
+                    hA[idx2]          = H[static_cast<size_t>(ii + jj * HN)];
+                    hB[idx2]          = (ii == jj) ? 1.0 : 0.0;
                 }
         }
         else if(type == SMAT_TOEPLITZ)
@@ -1681,48 +1820,61 @@ namespace
                 for(int ii = 0; ii < N; ++ii)
                 {
                     const size_t idx2 = static_cast<size_t>(ii + jj * N);
-                    const double u_i = std::sin(pi * (ii + 1) / (N + 1));
-                    const double v_j = std::cos(pi * (jj + 1) / (N + 1));
-                    hA[idx2] = ((ii == jj) ? 1.0 : 0.0) + u_i * v_j;
-                    hB[idx2] = (ii == jj) ? 1.0 : 0.0;
+                    const double u_i  = std::sin(pi * (ii + 1) / (N + 1));
+                    const double v_j  = std::cos(pi * (jj + 1) / (N + 1));
+                    hA[idx2]          = ((ii == jj) ? 1.0 : 0.0) + u_i * v_j;
+                    hB[idx2]          = (ii == jj) ? 1.0 : 0.0;
                 }
         }
     }
 
     TEST_P(Fp64EmulationStructuredTest, VsNativeDgemm)
     {
-        const StructuredGemmParam& p = GetParam();
-        const int64_t N     = static_cast<int64_t>(p.N);
-        const size_t  N2    = static_cast<size_t>(N) * N;
-        const size_t  bytes = N2 * sizeof(double);
+        const StructuredGemmParam& p     = GetParam();
+        const int64_t              N     = static_cast<int64_t>(p.N);
+        const size_t               N2    = static_cast<size_t>(N) * N;
+        const size_t               bytes = N2 * sizeof(double);
 
         std::vector<double> hA, hB, hD_nat(N2), hD_emu(N2);
         build_structured_ab(p.mat_type, p.N, hA, hB);
 
         double *dA = nullptr, *dB = nullptr, *dC = nullptr;
         double *dD_nat = nullptr, *dD_emu = nullptr;
-        ASSERT_EQ(hipMalloc(&dA,     bytes), hipSuccess);
-        ASSERT_EQ(hipMalloc(&dB,     bytes), hipSuccess);
-        ASSERT_EQ(hipMalloc(&dC,     bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
         ASSERT_EQ(hipMalloc(&dD_nat, bytes), hipSuccess);
         ASSERT_EQ(hipMalloc(&dD_emu, bytes), hipSuccess);
         ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
         ASSERT_EQ(hipMemcpy(dB, hB.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
-        auto cleanup = [&](hipblasLtHandle_t hem, hipblasLtHandle_t hnat,
-                           hipblasLtMatmulDesc_t desc,
-                           hipblasLtMatrixLayout_t la, hipblasLtMatrixLayout_t lb,
-                           hipblasLtMatrixLayout_t ld, hipblasLtMatmulPreference_t pref) {
-            if(pref) hipblasLtMatmulPreferenceDestroy(pref);
-            if(ld) hipblasLtMatrixLayoutDestroy(ld);
-            if(lb) hipblasLtMatrixLayoutDestroy(lb);
-            if(la) hipblasLtMatrixLayoutDestroy(la);
-            if(desc) hipblasLtMatmulDescDestroy(desc);
-            if(hnat) hipblasLtDestroy(hnat);
-            if(hem)  hipblasLtDestroy(hem);
-            (void)hipFree(dD_emu); (void)hipFree(dD_nat);
-            (void)hipFree(dC); (void)hipFree(dB); (void)hipFree(dA);
+        auto cleanup = [&](hipblasLtHandle_t           hem,
+                           hipblasLtHandle_t           hnat,
+                           hipblasLtMatmulDesc_t       desc,
+                           hipblasLtMatrixLayout_t     la,
+                           hipblasLtMatrixLayout_t     lb,
+                           hipblasLtMatrixLayout_t     ld,
+                           hipblasLtMatmulPreference_t pref) {
+            if(pref)
+                hipblasLtMatmulPreferenceDestroy(pref);
+            if(ld)
+                hipblasLtMatrixLayoutDestroy(ld);
+            if(lb)
+                hipblasLtMatrixLayoutDestroy(lb);
+            if(la)
+                hipblasLtMatrixLayoutDestroy(la);
+            if(desc)
+                hipblasLtMatmulDescDestroy(desc);
+            if(hnat)
+                hipblasLtDestroy(hnat);
+            if(hem)
+                hipblasLtDestroy(hem);
+            (void)hipFree(dD_emu);
+            (void)hipFree(dD_nat);
+            (void)hipFree(dC);
+            (void)hipFree(dB);
+            (void)hipFree(dA);
         };
 
         hipblasLtHandle_t hem = nullptr;
@@ -1735,19 +1887,26 @@ namespace
                       hem, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
                   HIPBLAS_STATUS_SUCCESS);
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
-                                      HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
-            if(!gate.apply) {
+            const Fp64EmulationDecision gate
+                = fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
+                                        HIP_R_64F,
+                                        HIPBLAS_OP_N,
+                                        HIPBLAS_OP_N,
+                                        N,
+                                        N,
+                                        N,
+                                        1);
+            if(!gate.apply)
+            {
                 cleanup(hem, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 GTEST_SKIP() << "Device not supported by emulation";
             }
         }
 
-        hipblasLtHandle_t hnat = nullptr;
-        hipblasLtMatmulDesc_t desc = nullptr;
-        hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, ld = nullptr;
-        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtHandle_t                hnat = nullptr;
+        hipblasLtMatmulDesc_t            desc = nullptr;
+        hipblasLtMatrixLayout_t          la = nullptr, lb = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t      pref = nullptr;
         hipblasLtMatmulHeuristicResult_t heur{};
         ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F),
@@ -1757,28 +1916,32 @@ namespace
             hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
             hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
         }
-        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&la, HIP_R_64F,
-            static_cast<uint64_t>(N), static_cast<uint64_t>(N), N), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lb, HIP_R_64F,
-            static_cast<uint64_t>(N), static_cast<uint64_t>(N), N), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&ld, HIP_R_64F,
-            static_cast<uint64_t>(N), static_cast<uint64_t>(N), N), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(
+                      &la, HIP_R_64F, static_cast<uint64_t>(N), static_cast<uint64_t>(N), N),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(
+                      &lb, HIP_R_64F, static_cast<uint64_t>(N), static_cast<uint64_t>(N), N),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(
+                      &ld, HIP_R_64F, static_cast<uint64_t>(N), static_cast<uint64_t>(N), N),
+                  HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&pref), HIPBLAS_STATUS_SUCCESS);
         {
             constexpr size_t ws_zero = 0u;
-            hipblasLtMatmulPreferenceSetAttribute(pref,
-                HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_zero, sizeof(ws_zero));
+            hipblasLtMatmulPreferenceSetAttribute(
+                pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_zero, sizeof(ws_zero));
         }
         int nat_cnt = 0;
         hipblasLtMatmulAlgoGetHeuristic(hnat, desc, la, lb, ld, ld, pref, 1, &heur, &nat_cnt);
-        if(nat_cnt == 0) {
+        if(nat_cnt == 0)
+        {
             cleanup(hem, hnat, desc, la, lb, ld, pref);
             GTEST_SKIP() << "No native FP64 DGEMM algorithm found on this device";
         }
 
         Fp64EmulationSettings emu_settings{};
-        emu_settings.num_moduli      = 18u;    /* ADP upper bound */
-        emu_settings.dynamic_mode    = true;   /* ADP: select s from data */
+        emu_settings.num_moduli      = 18u; /* ADP upper bound */
+        emu_settings.dynamic_mode    = true; /* ADP: select s from data */
         emu_settings.sv_mask         = 0u;
         emu_settings.workspace       = nullptr;
         emu_settings.workspace_bytes = 0u;
@@ -1786,27 +1949,52 @@ namespace
         const double alpha = 1.0, beta = 0.0;
 
         /* Native reference */
-        const hipblasStatus_t nat_st =
-            hipblasLtMatmul(hnat, desc, &alpha, dA, la, dB, lb,
-                            &beta, dC, ld, dD_nat, ld,
-                            &heur.algo, nullptr, 0, nullptr);
-        if(nat_st != HIPBLAS_STATUS_SUCCESS) {
+        const hipblasStatus_t nat_st = hipblasLtMatmul(hnat,
+                                                       desc,
+                                                       &alpha,
+                                                       dA,
+                                                       la,
+                                                       dB,
+                                                       lb,
+                                                       &beta,
+                                                       dC,
+                                                       ld,
+                                                       dD_nat,
+                                                       ld,
+                                                       &heur.algo,
+                                                       nullptr,
+                                                       0,
+                                                       nullptr);
+        if(nat_st != HIPBLAS_STATUS_SUCCESS)
+        {
             cleanup(hem, hnat, desc, la, lb, ld, pref);
             GTEST_SKIP() << "Native hipblasLtMatmul failed";
         }
 
         /* Emulated */
-        const rocblaslt_status emu_st =
-            fp64EmulatedGemm(hem,
-                                          HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
-                             &alpha, dA, N, dB, N,
-                             &beta,  dC, N, dD_emu, N,
-                             nullptr, emu_settings);
-        if(emu_st != rocblaslt_status_success) {
+        const rocblaslt_status emu_st = fp64EmulatedGemm(hem,
+                                                         HIPBLAS_OP_N,
+                                                         HIPBLAS_OP_N,
+                                                         N,
+                                                         N,
+                                                         N,
+                                                         &alpha,
+                                                         dA,
+                                                         N,
+                                                         dB,
+                                                         N,
+                                                         &beta,
+                                                         dC,
+                                                         N,
+                                                         dD_emu,
+                                                         N,
+                                                         nullptr,
+                                                         emu_settings);
+        if(emu_st != rocblaslt_status_success)
+        {
             cleanup(hem, hnat, desc, la, lb, ld, pref);
             GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(emu_st)
-                         << " (ADP may have triggered — scale too large for N="
-                         << p.N << ")";
+                         << " (ADP may have triggered — scale too large for N=" << p.N << ")";
         }
 
         /* Copy results back before freeing GPU buffers */
@@ -1815,21 +2003,23 @@ namespace
         cleanup(hem, hnat, desc, la, lb, ld, pref);
 
         double dmax = 0.0;
-        for(double v : hD_nat) dmax = std::max(dmax, std::abs(v));
-        const double norm = std::max(dmax, 1.0);
-        double max_rel_err = 0.0;
+        for(double v : hD_nat)
+            dmax = std::max(dmax, std::abs(v));
+        const double norm        = std::max(dmax, 1.0);
+        double       max_rel_err = 0.0;
         for(size_t idx = 0; idx < N2; ++idx)
-            max_rel_err = std::max(max_rel_err,
-                                   std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
+            max_rel_err = std::max(max_rel_err, std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
 
-        const char* mat_names[] = {
-            "CatastrophicCancel", "ScaledDynamicRange", "OnesAndEpsilons",
-            "Hadamard", "Toeplitz", "Rank1Perturb", "Alternating"
-        };
+        const char* mat_names[] = {"CatastrophicCancel",
+                                   "ScaledDynamicRange",
+                                   "OnesAndEpsilons",
+                                   "Hadamard",
+                                   "Toeplitz",
+                                   "Rank1Perturb",
+                                   "Alternating"};
         EXPECT_LE(max_rel_err, p.threshold)
-            << "Structured GEMM (" << mat_names[static_cast<int>(p.mat_type)]
-            << " N=" << p.N << " ADP): max_rel_err=" << max_rel_err
-            << " > threshold=" << p.threshold;
+            << "Structured GEMM (" << mat_names[static_cast<int>(p.mat_type)] << " N=" << p.N
+            << " ADP): max_rel_err=" << max_rel_err << " > threshold=" << p.threshold;
 
         /* Extra check for CatastrophicCancel: paired row sums must be ≈ 0.
          * The alternating-sign construction gives (A×B)[2k,:] = -(A×B)[2k+1,:],
@@ -1841,34 +2031,30 @@ namespace
             for(size_t col = 0; col < static_cast<size_t>(N); ++col)
                 for(int64_t row = 0; row + 1 < N; row += 2)
                 {
-                    const double sum =
-                        std::abs(hD_emu[static_cast<size_t>(row)   + col * static_cast<size_t>(N)] +
-                                 hD_emu[static_cast<size_t>(row+1) + col * static_cast<size_t>(N)]);
+                    const double sum = std::abs(
+                        hD_emu[static_cast<size_t>(row) + col * static_cast<size_t>(N)]
+                        + hD_emu[static_cast<size_t>(row + 1) + col * static_cast<size_t>(N)]);
                     max_pair_sum = std::max(max_pair_sum, sum);
                 }
             /* Normalise by the max output magnitude so the check is scale-independent. */
             const double pair_rel = (dmax > 0.0) ? max_pair_sum / dmax : max_pair_sum;
             EXPECT_LE(pair_rel, p.threshold)
-                << "CatastrophicCancel: row-pair sum " << max_pair_sum
-                << " / max=" << dmax << " = " << pair_rel
-                << " (a CRT sign-flip would give ≈ 1.0 here)";
+                << "CatastrophicCancel: row-pair sum " << max_pair_sum << " / max=" << dmax << " = "
+                << pair_rel << " (a CRT sign-flip would give ≈ 1.0 here)";
         }
     }
 
     INSTANTIATE_TEST_SUITE_P(
         Structured,
         Fp64EmulationStructuredTest,
-        ::testing::Values(
-            StructuredGemmParam{SMAT_CATASTROPHIC_CANCEL,  128, 1e-10},
-            StructuredGemmParam{SMAT_SCALED_DYNAMIC_RANGE, 128, 1e-10},
-            StructuredGemmParam{SMAT_ONES_AND_EPSILONS,    128, 1e-10},
-            StructuredGemmParam{SMAT_HADAMARD,             128, 1e-10},
-            StructuredGemmParam{SMAT_TOEPLITZ,             128, 1e-10},
-            StructuredGemmParam{SMAT_RANK1_PERTURB,        128, 1e-10},
-            StructuredGemmParam{SMAT_ALTERNATING,          128, 1e-10}
-        ),
-        StructuredGemmParamName
-    );
+        ::testing::Values(StructuredGemmParam{SMAT_CATASTROPHIC_CANCEL, 128, 1e-10},
+                          StructuredGemmParam{SMAT_SCALED_DYNAMIC_RANGE, 128, 1e-10},
+                          StructuredGemmParam{SMAT_ONES_AND_EPSILONS, 128, 1e-10},
+                          StructuredGemmParam{SMAT_HADAMARD, 128, 1e-10},
+                          StructuredGemmParam{SMAT_TOEPLITZ, 128, 1e-10},
+                          StructuredGemmParam{SMAT_RANK1_PERTURB, 128, 1e-10},
+                          StructuredGemmParam{SMAT_ALTERNATING, 128, 1e-10}),
+        StructuredGemmParamName);
 
     // ── AdpFallbackExtremeScale: ADP fallback path is transparent ─────────────
     //
@@ -1886,14 +2072,14 @@ namespace
                       m_handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC),
                   HIPBLAS_STATUS_SUCCESS);
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(m_roc, HIP_R_64F,
-                                      HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, 64, 1);
-            if(!gate.apply) GTEST_SKIP() << "Device not supported by emulation";
+            const Fp64EmulationDecision gate = fp64EmulationDecision(
+                m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, 64, 1);
+            if(!gate.apply)
+                GTEST_SKIP() << "Device not supported by emulation";
         }
 
-        constexpr int    N  = 64;
-        constexpr size_t N2 = static_cast<size_t>(N) * N;
+        constexpr int    N     = 64;
+        constexpr size_t N2    = static_cast<size_t>(N) * N;
         const size_t     bytes = N2 * sizeof(double);
 
         /* Build 1e16 / 1e-16 alternating-row matrix */
@@ -1906,44 +2092,69 @@ namespace
                 {
                     const size_t idx = static_cast<size_t>(i + j * N);
                     const double scl = (i % 2 == 0) ? 1e16 : 1e-16;
-                    sA ^= sA << 13; sA ^= sA >> 7; sA ^= sA << 17;
-                    sB ^= sB << 13; sB ^= sB >> 7; sB ^= sB << 17;
-                    hA[idx] = scl * (static_cast<double>(sA >> 11)*(1.0/9007199254740992.0)*2-1);
-                    hB[idx] = scl * (static_cast<double>(sB >> 11)*(1.0/9007199254740992.0)*2-1);
+                    sA ^= sA << 13;
+                    sA ^= sA >> 7;
+                    sA ^= sA << 17;
+                    sB ^= sB << 13;
+                    sB ^= sB >> 7;
+                    sB ^= sB << 17;
+                    hA[idx]
+                        = scl
+                          * (static_cast<double>(sA >> 11) * (1.0 / 9007199254740992.0) * 2 - 1);
+                    hB[idx]
+                        = scl
+                          * (static_cast<double>(sB >> 11) * (1.0 / 9007199254740992.0) * 2 - 1);
                 }
         }
 
         double *dA = nullptr, *dB = nullptr, *dC = nullptr;
         double *dD_emul = nullptr, *dD_nat = nullptr;
-        ASSERT_EQ(hipMalloc(&dA,     bytes), hipSuccess);
-        ASSERT_EQ(hipMalloc(&dB,     bytes), hipSuccess);
-        ASSERT_EQ(hipMalloc(&dC,     bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dB, bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
         ASSERT_EQ(hipMalloc(&dD_emul, bytes), hipSuccess);
-        ASSERT_EQ(hipMalloc(&dD_nat,  bytes), hipSuccess);
+        ASSERT_EQ(hipMalloc(&dD_nat, bytes), hipSuccess);
         ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
         ASSERT_EQ(hipMemcpy(dB, hB.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
         auto free_bufs = [&]() {
-            (void)hipFree(dD_nat); (void)hipFree(dD_emul);
-            (void)hipFree(dC); (void)hipFree(dB); (void)hipFree(dA);
+            (void)hipFree(dD_nat);
+            (void)hipFree(dD_emul);
+            (void)hipFree(dC);
+            (void)hipFree(dB);
+            (void)hipFree(dA);
         };
 
         /* ── Step 1: ADP triggers at the fp64EmulatedGemm level ────────────── */
         {
             Fp64EmulationSettings emu{};
-            emu.num_moduli = 16u;
-            emu.sv_mask = 0u;
-            emu.dynamic_mode = true;
-            emu.workspace = nullptr;
-            emu.workspace_bytes = 0u;
-            const double alpha = 1.0, beta = 0.0;
-            const rocblaslt_status st =
-                fp64EmulatedGemm(m_handle,
-                                              HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
-                                 &alpha, dA, N, dB, N,
-                                 &beta,  dC, N, dD_emul, N, nullptr, emu);
-            if(st == rocblaslt_status_success) {
+            emu.num_moduli               = 16u;
+            emu.sv_mask                  = 0u;
+            emu.dynamic_mode             = true;
+            emu.workspace                = nullptr;
+            emu.workspace_bytes          = 0u;
+            const double           alpha = 1.0, beta = 0.0;
+            const rocblaslt_status st = fp64EmulatedGemm(m_handle,
+                                                         HIPBLAS_OP_N,
+                                                         HIPBLAS_OP_N,
+                                                         N,
+                                                         N,
+                                                         N,
+                                                         &alpha,
+                                                         dA,
+                                                         N,
+                                                         dB,
+                                                         N,
+                                                         &beta,
+                                                         dC,
+                                                         N,
+                                                         dD_emul,
+                                                         N,
+                                                         nullptr,
+                                                         emu);
+            if(st == rocblaslt_status_success)
+            {
                 free_bufs();
                 GTEST_SKIP() << "ADP did not trigger for 1e16/1e-16 scale on this config";
             }
@@ -1952,10 +2163,10 @@ namespace
         }
 
         /* ── Step 2: hipblasLtMatmul falls back transparently ───────────────── */
-        hipblasLtHandle_t hnat = nullptr;
-        hipblasLtMatmulDesc_t desc = nullptr;
-        hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, ld = nullptr;
-        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtHandle_t                hnat = nullptr;
+        hipblasLtMatmulDesc_t            desc = nullptr;
+        hipblasLtMatrixLayout_t          la = nullptr, lb = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t      pref = nullptr;
         hipblasLtMatmulHeuristicResult_t heur{};
 
         ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
@@ -1972,8 +2183,8 @@ namespace
         ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&pref), HIPBLAS_STATUS_SUCCESS);
         {
             constexpr size_t ws_zero = 0u;
-            hipblasLtMatmulPreferenceSetAttribute(pref,
-                HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_zero, sizeof(ws_zero));
+            hipblasLtMatmulPreferenceSetAttribute(
+                pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_zero, sizeof(ws_zero));
         }
         int nat_cnt = 0;
         hipblasLtMatmulAlgoGetHeuristic(hnat, desc, la, lb, ld, ld, pref, 1, &heur, &nat_cnt);
@@ -1987,7 +2198,8 @@ namespace
             hipblasLtDestroy(hnat);
         };
 
-        if(nat_cnt == 0) {
+        if(nat_cnt == 0)
+        {
             destroy_handles();
             free_bufs();
             GTEST_SKIP() << "No native FP64 DGEMM algorithm found";
@@ -1996,41 +2208,66 @@ namespace
         const double alpha = 1.0, beta = 0.0;
 
         /* Pure native (emulation disabled via hnat) */
-        const hipblasStatus_t nat_st =
-            hipblasLtMatmul(hnat, desc, &alpha, dA, la, dB, lb,
-                            &beta, dC, ld, dD_nat, ld,
-                            &heur.algo, nullptr, 0, nullptr);
+        const hipblasStatus_t nat_st = hipblasLtMatmul(hnat,
+                                                       desc,
+                                                       &alpha,
+                                                       dA,
+                                                       la,
+                                                       dB,
+                                                       lb,
+                                                       &beta,
+                                                       dC,
+                                                       ld,
+                                                       dD_nat,
+                                                       ld,
+                                                       &heur.algo,
+                                                       nullptr,
+                                                       0,
+                                                       nullptr);
 
         /* m_handle has emulation+ADP enabled → falls back to native internally */
         ASSERT_EQ(hipMemset(dD_emul, 0, bytes), hipSuccess);
-        const hipblasStatus_t emul_st =
-            hipblasLtMatmul(m_handle, desc, &alpha, dA, la, dB, lb,
-                            &beta, dC, ld, dD_emul, ld,
-                            nullptr, nullptr, 0, nullptr);
+        const hipblasStatus_t emul_st = hipblasLtMatmul(m_handle,
+                                                        desc,
+                                                        &alpha,
+                                                        dA,
+                                                        la,
+                                                        dB,
+                                                        lb,
+                                                        &beta,
+                                                        dC,
+                                                        ld,
+                                                        dD_emul,
+                                                        ld,
+                                                        nullptr,
+                                                        nullptr,
+                                                        0,
+                                                        nullptr);
 
         destroy_handles();
 
-        if(nat_st != HIPBLAS_STATUS_SUCCESS || emul_st != HIPBLAS_STATUS_SUCCESS) {
+        if(nat_st != HIPBLAS_STATUS_SUCCESS || emul_st != HIPBLAS_STATUS_SUCCESS)
+        {
             free_bufs();
             GTEST_SKIP() << "hipblasLtMatmul failed (nat=" << static_cast<int>(nat_st)
                          << " emul=" << static_cast<int>(emul_st) << ")";
         }
 
         std::vector<double> hD_nat(N2), hD_emul_h(N2);
-        ASSERT_EQ(hipMemcpy(hD_nat.data(),    dD_nat,  bytes, hipMemcpyDeviceToHost), hipSuccess);
+        ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, bytes, hipMemcpyDeviceToHost), hipSuccess);
         ASSERT_EQ(hipMemcpy(hD_emul_h.data(), dD_emul, bytes, hipMemcpyDeviceToHost), hipSuccess);
         free_bufs();
 
         double dmax = 0.0;
-        for(double v : hD_nat) dmax = std::max(dmax, std::abs(v));
-        const double norm = std::max(dmax, 1.0);
-        double max_rel = 0.0;
+        for(double v : hD_nat)
+            dmax = std::max(dmax, std::abs(v));
+        const double norm    = std::max(dmax, 1.0);
+        double       max_rel = 0.0;
         for(size_t idx = 0; idx < N2; ++idx)
             max_rel = std::max(max_rel, std::abs(hD_emul_h[idx] - hD_nat[idx]) / norm);
 
-        EXPECT_LE(max_rel, 1e-10)
-            << "ADP fallback differs from pure native by max_rel=" << max_rel
-            << " (fallback should produce native-equivalent FP64 result)";
+        EXPECT_LE(max_rel, 1e-10) << "ADP fallback differs from pure native by max_rel=" << max_rel
+                                  << " (fallback should produce native-equivalent FP64 result)";
     }
 
     // ── BoundaryValues: FP64 boundary-value inputs handled gracefully ─────────
@@ -2093,25 +2330,26 @@ namespace
         set_enabled(true);
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
 
-        constexpr int64_t M  = 2;   /* output rows   */
-        constexpr int64_t N  = 6;   /* output cols   */
-        constexpr int64_t K  = 2;   /* contraction   */
-        constexpr size_t  MN = static_cast<size_t>(M * N);   /* 12 elements */
-        constexpr size_t  MK = static_cast<size_t>(M * K);   /* 4 elements  */
-        constexpr size_t  KN = static_cast<size_t>(K * N);   /* 12 elements */
-        const size_t bytes_A = MK * sizeof(double);
-        const size_t bytes_B = KN * sizeof(double);
-        const size_t bytes_D = MN * sizeof(double);
+        constexpr int64_t M       = 2; /* output rows   */
+        constexpr int64_t N       = 6; /* output cols   */
+        constexpr int64_t K       = 2; /* contraction   */
+        constexpr size_t  MN      = static_cast<size_t>(M * N); /* 12 elements */
+        constexpr size_t  MK      = static_cast<size_t>(M * K); /* 4 elements  */
+        constexpr size_t  KN      = static_cast<size_t>(K * N); /* 12 elements */
+        const size_t      bytes_A = MK * sizeof(double);
+        const size_t      bytes_B = KN * sizeof(double);
+        const size_t      bytes_D = MN * sizeof(double);
 
         /* Boundary-value constants (C++ names map to C DBL_xxx macros). */
         const double TINY = std::numeric_limits<double>::denorm_min(); /* 2^-1074 */
-        const double NMIN = std::numeric_limits<double>::min();        /* 2^-1022 */
-        const double EPS  = std::numeric_limits<double>::epsilon();    /* 2^-52   */
-        const double DMAX = std::numeric_limits<double>::max();        /* ~1.8e308 */
+        const double NMIN = std::numeric_limits<double>::min(); /* 2^-1022 */
+        const double EPS  = std::numeric_limits<double>::epsilon(); /* 2^-52   */
+        const double DMAX = std::numeric_limits<double>::max(); /* ~1.8e308 */
 
         /* A = 2×2 identity (column-major, lda=M). */
         std::vector<double> hA(MK, 0.0);
-        hA[0] = 1.0; hA[3] = 1.0;  /* A[0,0]=1, A[1,1]=1 */
+        hA[0] = 1.0;
+        hA[3] = 1.0; /* A[0,0]=1, A[1,1]=1 */
 
         /* B = 2×6 column-major matrix (ldb=K=2).
          * hB[col*2+row]:
@@ -2123,12 +2361,18 @@ namespace
          *   col 5: [EPS,  1.0 ]
          */
         const std::vector<double> hB = {
-            TINY, 1.0,    /* col 0 */
-            TINY, 0.0,    /* col 1 */
-            TINY, DMAX,   /* col 2 */
-            NMIN, 1.0,    /* col 3 */
-            NMIN, 0.0,    /* col 4 */
-            EPS,  1.0,    /* col 5 */
+            TINY,
+            1.0, /* col 0 */
+            TINY,
+            0.0, /* col 1 */
+            TINY,
+            DMAX, /* col 2 */
+            NMIN,
+            1.0, /* col 3 */
+            NMIN,
+            0.0, /* col 4 */
+            EPS,
+            1.0, /* col 5 */
         };
 
         double *dA = nullptr, *dB = nullptr, *dC = nullptr, *dD = nullptr;
@@ -2141,31 +2385,48 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, bytes_D), hipSuccess);
 
         auto cleanup = [&]() {
-            (void)hipFree(dD); (void)hipFree(dC);
-            (void)hipFree(dB); (void)hipFree(dA);
+            (void)hipFree(dD);
+            (void)hipFree(dC);
+            (void)hipFree(dB);
+            (void)hipFree(dA);
         };
 
         /* Skip on unsupported devices. */
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(m_roc, HIP_R_64F,
-                                      HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
-            if(!gate.apply) { cleanup(); GTEST_SKIP() << "Device not supported"; }
+            const Fp64EmulationDecision gate
+                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
+            if(!gate.apply)
+            {
+                cleanup();
+                GTEST_SKIP() << "Device not supported";
+            }
         }
 
         Fp64EmulationSettings settings{};
         settings.num_moduli      = 16u;
-        settings.sv_mask         = 0u;   /* inputs are finite — no Inf/NaN flag needed */
+        settings.sv_mask         = 0u; /* inputs are finite — no Inf/NaN flag needed */
         settings.workspace       = nullptr;
         settings.workspace_bytes = 0u;
 
-        const double alpha = 1.0, beta = 0.0;
-        const rocblaslt_status st =
-            fp64EmulatedGemm(m_handle,
-                             HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K,
-                             &alpha, dA, M, dB, K,
-                             &beta,  dC, M, dD, M,
-                             /*stream=*/nullptr, settings);
+        const double           alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st = fp64EmulatedGemm(m_handle,
+                                                     HIPBLAS_OP_N,
+                                                     HIPBLAS_OP_N,
+                                                     M,
+                                                     N,
+                                                     K,
+                                                     &alpha,
+                                                     dA,
+                                                     M,
+                                                     dB,
+                                                     K,
+                                                     &beta,
+                                                     dC,
+                                                     M,
+                                                     dD,
+                                                     M,
+                                                     /*stream=*/nullptr,
+                                                     settings);
         if(st != rocblaslt_status_success)
         {
             cleanup();
@@ -2197,16 +2458,15 @@ namespace
          * Actual CRT errors are ≪1e-9 for TINY/NMIN and ~1.6e-10 for EPS.      */
         EXPECT_NEAR(d(1, 0), TINY, TINY * 1e-9)
             << "Col 1 row 0: TINY sole non-zero (floor-guard path)";
-        EXPECT_NEAR(d(4, 0), NMIN, NMIN * 1e-9)
-            << "Col 4 row 0: NMIN as col max";
+        EXPECT_NEAR(d(4, 0), NMIN, NMIN * 1e-9) << "Col 4 row 0: NMIN as col max";
         EXPECT_NEAR(d(5, 0), EPS, EPS * 1e-9)
             << "Col 5 row 0: EPS survives INT8, ~1.6e-10 relative CRT error";
 
         /* Row=1: D = B (A=I), large values. */
         EXPECT_NEAR(d(2, 1), DMAX, DMAX * 1e-9) << "Col 2 row 1: DMAX";
-        EXPECT_NEAR(d(0, 1), 1.0,  1e-9)         << "Col 0 row 1: 1.0";
-        EXPECT_NEAR(d(3, 1), 1.0,  1e-9)         << "Col 3 row 1: 1.0";
-        EXPECT_NEAR(d(5, 1), 1.0,  1e-9)         << "Col 5 row 1: 1.0";
+        EXPECT_NEAR(d(0, 1), 1.0, 1e-9) << "Col 0 row 1: 1.0";
+        EXPECT_NEAR(d(3, 1), 1.0, 1e-9) << "Col 3 row 1: 1.0";
+        EXPECT_NEAR(d(5, 1), 1.0, 1e-9) << "Col 5 row 1: 1.0";
         EXPECT_EQ(d(1, 1), 0.0) << "Col 1 row 1: 0.0";
         EXPECT_EQ(d(4, 1), 0.0) << "Col 4 row 1: 0.0";
 
@@ -2227,52 +2487,71 @@ namespace
          *   ldexp(X_true, 958) = 2^1025−2^972 → +Inf (IEEE overflow).
          */
         {
-            constexpr int64_t N2  = 6;   /* 6 output columns */
-            constexpr size_t  MN2 = static_cast<size_t>(M * N2);   /* 12 elements */
-            constexpr size_t  KN2 = static_cast<size_t>(K * N2);   /* 12 elements */
-            const size_t bytes_B2 = KN2 * sizeof(double);
-            const size_t bytes_D2 = MN2 * sizeof(double);
+            constexpr int64_t N2       = 6; /* 6 output columns */
+            constexpr size_t  MN2      = static_cast<size_t>(M * N2); /* 12 elements */
+            constexpr size_t  KN2      = static_cast<size_t>(K * N2); /* 12 elements */
+            const size_t      bytes_B2 = KN2 * sizeof(double);
+            const size_t      bytes_D2 = MN2 * sizeof(double);
 
             /* A = 2×2 scaled identity: A[0,0]=2, A[1,1]=2 (column-major). */
             std::vector<double> hA2(MK, 0.0);
-            hA2[0] = 2.0; hA2[3] = 2.0;
+            hA2[0] = 2.0;
+            hA2[3] = 2.0;
 
             const std::vector<double> hB2 = {
-                TINY, 1.0,    /* col 0 */
-                TINY, 0.0,    /* col 1 */
-                NMIN, 1.0,    /* col 2 */
-                NMIN, 0.0,    /* col 3 */
-                EPS,  1.0,    /* col 4 */
-                TINY, DMAX,   /* col 5 — 2×DMAX overflows to +Inf */
+                TINY,
+                1.0, /* col 0 */
+                TINY,
+                0.0, /* col 1 */
+                NMIN,
+                1.0, /* col 2 */
+                NMIN,
+                0.0, /* col 3 */
+                EPS,
+                1.0, /* col 4 */
+                TINY,
+                DMAX, /* col 5 — 2×DMAX overflows to +Inf */
             };
 
             double *dA2 = nullptr, *dB2 = nullptr, *dC2 = nullptr, *dD2 = nullptr;
-            ASSERT_EQ(hipMalloc(&dA2, bytes_A),  hipSuccess);
+            ASSERT_EQ(hipMalloc(&dA2, bytes_A), hipSuccess);
             ASSERT_EQ(hipMalloc(&dB2, bytes_B2), hipSuccess);
             ASSERT_EQ(hipMalloc(&dC2, bytes_D2), hipSuccess);
             ASSERT_EQ(hipMalloc(&dD2, bytes_D2), hipSuccess);
-            ASSERT_EQ(hipMemcpy(dA2, hA2.data(), bytes_A,  hipMemcpyHostToDevice), hipSuccess);
+            ASSERT_EQ(hipMemcpy(dA2, hA2.data(), bytes_A, hipMemcpyHostToDevice), hipSuccess);
             ASSERT_EQ(hipMemcpy(dB2, hB2.data(), bytes_B2, hipMemcpyHostToDevice), hipSuccess);
             ASSERT_EQ(hipMemset(dC2, 0, bytes_D2), hipSuccess);
 
-            const rocblaslt_status st2 =
-                fp64EmulatedGemm(m_handle,
-                                 HIPBLAS_OP_N, HIPBLAS_OP_N, M, N2, K,
-                                 &alpha, dA2, M, dB2, K,
-                                 &beta,  dC2, M, dD2, M,
-                                 /*stream=*/nullptr, settings);
+            const rocblaslt_status st2 = fp64EmulatedGemm(m_handle,
+                                                          HIPBLAS_OP_N,
+                                                          HIPBLAS_OP_N,
+                                                          M,
+                                                          N2,
+                                                          K,
+                                                          &alpha,
+                                                          dA2,
+                                                          M,
+                                                          dB2,
+                                                          K,
+                                                          &beta,
+                                                          dC2,
+                                                          M,
+                                                          dD2,
+                                                          M,
+                                                          /*stream=*/nullptr,
+                                                          settings);
 
             std::vector<double> hD2(MN2);
             if(st2 == rocblaslt_status_success)
-                ASSERT_EQ(hipMemcpy(hD2.data(), dD2, bytes_D2, hipMemcpyDeviceToHost),
-                          hipSuccess);
-            (void)hipFree(dD2); (void)hipFree(dC2);
-            (void)hipFree(dB2); (void)hipFree(dA2);
+                ASSERT_EQ(hipMemcpy(hD2.data(), dD2, bytes_D2, hipMemcpyDeviceToHost), hipSuccess);
+            (void)hipFree(dD2);
+            (void)hipFree(dC2);
+            (void)hipFree(dB2);
+            (void)hipFree(dA2);
 
             if(st2 != rocblaslt_status_success)
             {
-                GTEST_SKIP() << "fp64EmulatedGemm (A=2*I) returned "
-                             << static_cast<int>(st2)
+                GTEST_SKIP() << "fp64EmulatedGemm (A=2*I) returned " << static_cast<int>(st2)
                              << " (INT8 device library may be unavailable)";
             }
 
@@ -2282,7 +2561,8 @@ namespace
             /* All outputs must be finite except col 5 row 1 (2×DMAX = +Inf). */
             for(size_t i = 0; i < MN2; ++i)
             {
-                if(i == 5 * 2 + 1) continue;   /* col 5 row 1 = +Inf is expected */
+                if(i == 5 * 2 + 1)
+                    continue; /* col 5 row 1 = +Inf is expected */
                 ASSERT_TRUE(std::isfinite(hD2[i]))
                     << "A=2*I sub-test: non-finite output at index " << i;
             }
@@ -2292,12 +2572,9 @@ namespace
             EXPECT_EQ(d2(2, 0), 0.0) << "A=2*I col 2 row 0: NMIN dominated → 0";
 
             /* Row=0 non-zero: D = 2 × B (sftA shifts inverse scale by 1 power of 2). */
-            EXPECT_NEAR(d2(1, 0), 2.0 * TINY, 2.0 * TINY * 1e-9)
-                << "A=2*I col 1 row 0: 2*TINY";
-            EXPECT_NEAR(d2(3, 0), 2.0 * NMIN, 2.0 * NMIN * 1e-9)
-                << "A=2*I col 3 row 0: 2*NMIN";
-            EXPECT_NEAR(d2(4, 0), 2.0 * EPS,  2.0 * EPS  * 1e-9)
-                << "A=2*I col 4 row 0: 2*EPS";
+            EXPECT_NEAR(d2(1, 0), 2.0 * TINY, 2.0 * TINY * 1e-9) << "A=2*I col 1 row 0: 2*TINY";
+            EXPECT_NEAR(d2(3, 0), 2.0 * NMIN, 2.0 * NMIN * 1e-9) << "A=2*I col 3 row 0: 2*NMIN";
+            EXPECT_NEAR(d2(4, 0), 2.0 * EPS, 2.0 * EPS * 1e-9) << "A=2*I col 4 row 0: 2*EPS";
 
             /* Row=1: D = 2 × B[row=1]. */
             EXPECT_NEAR(d2(0, 1), 2.0, 2e-9) << "A=2*I col 0 row 1: 2.0";
@@ -2309,8 +2586,7 @@ namespace
             /* Col 5 ([TINY, DMAX]): 2×DMAX overflows to +Inf.
              * Row=0: TINY dominated by DMAX → 0 (same mechanism as A=I col 2).
              * Row=1: 2×DMAX = ldexp(2^67-2^14, 958) = 2^1025-2^972 = +Inf.         */
-            EXPECT_EQ(d2(5, 0), 0.0)
-                << "A=2*I col 5 row 0: TINY dominated by DMAX → 0";
+            EXPECT_EQ(d2(5, 0), 0.0) << "A=2*I col 5 row 0: TINY dominated by DMAX → 0";
             EXPECT_TRUE(std::isinf(d2(5, 1)) && d2(5, 1) > 0.0)
                 << "A=2*I col 5 row 1: 2*DMAX overflows to +Inf, got " << d2(5, 1);
         }
@@ -2326,9 +2602,9 @@ namespace
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
 
         constexpr int64_t M = 128, N = 128, K = 128;
-        constexpr int64_t LDA = M + 7;   // 135
-        constexpr int64_t LDB = K + 13;  // 141
-        constexpr int64_t LDC = M + 11;  // 139
+        constexpr int64_t LDA = M + 7; // 135
+        constexpr int64_t LDB = K + 13; // 141
+        constexpr int64_t LDC = M + 11; // 139
         constexpr int64_t LDD = LDC;
 
         const size_t nA = static_cast<size_t>(LDA) * K;
@@ -2352,25 +2628,32 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, nC * sizeof(double)), hipSuccess);
 
         auto free_all = [&]() {
-            (void)hipFree(dD_nat); (void)hipFree(dD_emu);
-            (void)hipFree(dC); (void)hipFree(dB); (void)hipFree(dA);
+            (void)hipFree(dD_nat);
+            (void)hipFree(dD_emu);
+            (void)hipFree(dC);
+            (void)hipFree(dB);
+            (void)hipFree(dA);
         };
 
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(m_roc, HIP_R_64F,
-                                      HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
-            if(!gate.apply) { free_all(); GTEST_SKIP() << "Device not supported"; }
+            const Fp64EmulationDecision gate
+                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
+            if(!gate.apply)
+            {
+                free_all();
+                GTEST_SKIP() << "Device not supported";
+            }
         }
 
         /* Native reference via hipblasLtMatmul */
-        hipblasLtHandle_t hnat = nullptr;
-        hipblasLtMatmulDesc_t desc = nullptr;
-        hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr, ld = nullptr;
-        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtHandle_t                hnat = nullptr;
+        hipblasLtMatmulDesc_t            desc = nullptr;
+        hipblasLtMatrixLayout_t          la = nullptr, lb = nullptr, lc = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t      pref = nullptr;
         hipblasLtMatmulHeuristicResult_t heur{};
         ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F),
+                  HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatrixLayoutCreate(&la, HIP_R_64F, M, K, LDA), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lb, HIP_R_64F, K, N, LDB), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lc, HIP_R_64F, M, N, LDC), HIPBLAS_STATUS_SUCCESS);
@@ -2381,53 +2664,90 @@ namespace
 
         auto destroy_nat = [&]() {
             hipblasLtMatmulPreferenceDestroy(pref);
-            hipblasLtMatrixLayoutDestroy(ld); hipblasLtMatrixLayoutDestroy(lc);
-            hipblasLtMatrixLayoutDestroy(lb); hipblasLtMatrixLayoutDestroy(la);
-            hipblasLtMatmulDescDestroy(desc); hipblasLtDestroy(hnat);
+            hipblasLtMatrixLayoutDestroy(ld);
+            hipblasLtMatrixLayoutDestroy(lc);
+            hipblasLtMatrixLayoutDestroy(lb);
+            hipblasLtMatrixLayoutDestroy(la);
+            hipblasLtMatmulDescDestroy(desc);
+            hipblasLtDestroy(hnat);
         };
 
-        if(nat_cnt == 0) { destroy_nat(); free_all(); GTEST_SKIP() << "No native algo"; }
+        if(nat_cnt == 0)
+        {
+            destroy_nat();
+            free_all();
+            GTEST_SKIP() << "No native algo";
+        }
 
         const double alpha = 1.0, beta = 0.0;
-        hipblasLtMatmul(hnat, desc, &alpha, dA, la, dB, lb,
-                        &beta, dC, lc, dD_nat, ld,
-                        &heur.algo, nullptr, 0, nullptr);
+        hipblasLtMatmul(hnat,
+                        desc,
+                        &alpha,
+                        dA,
+                        la,
+                        dB,
+                        lb,
+                        &beta,
+                        dC,
+                        lc,
+                        dD_nat,
+                        ld,
+                        &heur.algo,
+                        nullptr,
+                        0,
+                        nullptr);
 
         /* Emulated */
         Fp64EmulationSettings emu{};
-        emu.num_moduli = 16u;
-        emu.sv_mask = 0u;
-        const rocblaslt_status st =
-            fp64EmulatedGemm(m_handle,
-                             HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K,
-                             &alpha, dA, LDA, dB, LDB,
-                             &beta,  dC, LDC, dD_emu, LDD,
-                             nullptr, emu);
+        emu.num_moduli            = 16u;
+        emu.sv_mask               = 0u;
+        const rocblaslt_status st = fp64EmulatedGemm(m_handle,
+                                                     HIPBLAS_OP_N,
+                                                     HIPBLAS_OP_N,
+                                                     M,
+                                                     N,
+                                                     K,
+                                                     &alpha,
+                                                     dA,
+                                                     LDA,
+                                                     dB,
+                                                     LDB,
+                                                     &beta,
+                                                     dC,
+                                                     LDC,
+                                                     dD_emu,
+                                                     LDD,
+                                                     nullptr,
+                                                     emu);
 
-        if(st != rocblaslt_status_success) {
-            destroy_nat(); free_all();
+        if(st != rocblaslt_status_success)
+        {
+            destroy_nat();
+            free_all();
             GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(st);
         }
 
-        ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, nD * sizeof(double), hipMemcpyDeviceToHost), hipSuccess);
-        ASSERT_EQ(hipMemcpy(hD_emu.data(), dD_emu, nD * sizeof(double), hipMemcpyDeviceToHost), hipSuccess);
-        destroy_nat(); free_all();
+        ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, nD * sizeof(double), hipMemcpyDeviceToHost),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpy(hD_emu.data(), dD_emu, nD * sizeof(double), hipMemcpyDeviceToHost),
+                  hipSuccess);
+        destroy_nat();
+        free_all();
 
         double dmax = 0.0;
         for(int64_t j = 0; j < N; ++j)
             for(int64_t i = 0; i < M; ++i)
                 dmax = std::max(dmax, std::abs(hD_nat[static_cast<size_t>(i + j * LDD)]));
-        const double norm = std::max(dmax, 1.0);
-        double max_rel = 0.0;
+        const double norm    = std::max(dmax, 1.0);
+        double       max_rel = 0.0;
         for(int64_t j = 0; j < N; ++j)
             for(int64_t i = 0; i < M; ++i)
             {
                 const size_t idx = static_cast<size_t>(i + j * LDD);
-                max_rel = std::max(max_rel, std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
+                max_rel          = std::max(max_rel, std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
             }
 
-        EXPECT_LE(max_rel, 1e-10)
-            << "NonUnitLeadingDimension: max_rel=" << max_rel;
+        EXPECT_LE(max_rel, 1e-10) << "NonUnitLeadingDimension: max_rel=" << max_rel;
     }
 
     // ── SvMaskInfInput: sv_mask=0x1 with +Inf input must return invalid_value ─
@@ -2440,7 +2760,7 @@ namespace
         set_enabled(true);
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
 
-        constexpr int64_t N = 64;
+        constexpr int64_t N     = 64;
         const size_t      N2    = static_cast<size_t>(N) * N;
         const size_t      bytes = N2 * sizeof(double);
 
@@ -2457,28 +2777,45 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
         auto cleanup = [&]() {
-            (void)hipFree(dD); (void)hipFree(dC);
-            (void)hipFree(dB); (void)hipFree(dA);
+            (void)hipFree(dD);
+            (void)hipFree(dC);
+            (void)hipFree(dB);
+            (void)hipFree(dA);
         };
 
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(m_roc, HIP_R_64F,
-                                      HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
-            if(!gate.apply) { cleanup(); GTEST_SKIP() << "Device not supported"; }
+            const Fp64EmulationDecision gate
+                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+            if(!gate.apply)
+            {
+                cleanup();
+                GTEST_SKIP() << "Device not supported";
+            }
         }
 
         Fp64EmulationSettings settings{};
         settings.num_moduli = 16u;
-        settings.sv_mask    = 0x1u;   /* enable Inf detection */
+        settings.sv_mask    = 0x1u; /* enable Inf detection */
 
-        const double alpha = 1.0, beta = 0.0;
-        const rocblaslt_status st =
-            fp64EmulatedGemm(m_handle,
-                             HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
-                             &alpha, dA, N, dB, N,
-                             &beta,  dC, N, dD, N,
-                             nullptr, settings);
+        const double           alpha = 1.0, beta = 0.0;
+        const rocblaslt_status st = fp64EmulatedGemm(m_handle,
+                                                     HIPBLAS_OP_N,
+                                                     HIPBLAS_OP_N,
+                                                     N,
+                                                     N,
+                                                     N,
+                                                     &alpha,
+                                                     dA,
+                                                     N,
+                                                     dB,
+                                                     N,
+                                                     &beta,
+                                                     dC,
+                                                     N,
+                                                     dD,
+                                                     N,
+                                                     nullptr,
+                                                     settings);
         cleanup();
 
         EXPECT_EQ(st, rocblaslt_status_invalid_value)
@@ -2495,7 +2832,7 @@ namespace
         set_enabled(true);
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
 
-        constexpr int64_t N = 128;
+        constexpr int64_t N     = 128;
         const size_t      N2    = static_cast<size_t>(N) * N;
         const size_t      bytes = N2 * sizeof(double);
 
@@ -2515,25 +2852,32 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
         auto free_all = [&]() {
-            (void)hipFree(dD_nat); (void)hipFree(dD_emu);
-            (void)hipFree(dC); (void)hipFree(dB); (void)hipFree(dA);
+            (void)hipFree(dD_nat);
+            (void)hipFree(dD_emu);
+            (void)hipFree(dC);
+            (void)hipFree(dB);
+            (void)hipFree(dA);
         };
 
         {
-            const Fp64EmulationDecision gate =
-                fp64EmulationDecision(m_roc, HIP_R_64F,
-                                      HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
-            if(!gate.apply) { free_all(); GTEST_SKIP() << "Device not supported"; }
+            const Fp64EmulationDecision gate
+                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+            if(!gate.apply)
+            {
+                free_all();
+                GTEST_SKIP() << "Device not supported";
+            }
         }
 
         /* Native reference */
-        hipblasLtHandle_t hnat = nullptr;
-        hipblasLtMatmulDesc_t desc = nullptr;
-        hipblasLtMatrixLayout_t la = nullptr, lb = nullptr, ld = nullptr;
-        hipblasLtMatmulPreference_t pref = nullptr;
+        hipblasLtHandle_t                hnat = nullptr;
+        hipblasLtMatmulDesc_t            desc = nullptr;
+        hipblasLtMatrixLayout_t          la = nullptr, lb = nullptr, ld = nullptr;
+        hipblasLtMatmulPreference_t      pref = nullptr;
         hipblasLtMatmulHeuristicResult_t heur{};
         ASSERT_EQ(hipblasLtCreate(&hnat), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F),
+                  HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatrixLayoutCreate(&la, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatrixLayoutCreate(&lb, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtMatrixLayoutCreate(&ld, HIP_R_64F, N, N, N), HIPBLAS_STATUS_SUCCESS);
@@ -2543,47 +2887,82 @@ namespace
 
         auto destroy_nat = [&]() {
             hipblasLtMatmulPreferenceDestroy(pref);
-            hipblasLtMatrixLayoutDestroy(ld); hipblasLtMatrixLayoutDestroy(lb);
-            hipblasLtMatrixLayoutDestroy(la); hipblasLtMatmulDescDestroy(desc);
+            hipblasLtMatrixLayoutDestroy(ld);
+            hipblasLtMatrixLayoutDestroy(lb);
+            hipblasLtMatrixLayoutDestroy(la);
+            hipblasLtMatmulDescDestroy(desc);
             hipblasLtDestroy(hnat);
         };
-        if(nat_cnt == 0) { destroy_nat(); free_all(); GTEST_SKIP() << "No native algo"; }
+        if(nat_cnt == 0)
+        {
+            destroy_nat();
+            free_all();
+            GTEST_SKIP() << "No native algo";
+        }
 
         const double alpha = 1.0, beta = 0.0;
-        hipblasLtMatmul(hnat, desc, &alpha, dA, la, dB, lb,
-                        &beta, dC, ld, dD_nat, ld,
-                        &heur.algo, nullptr, 0, nullptr);
+        hipblasLtMatmul(hnat,
+                        desc,
+                        &alpha,
+                        dA,
+                        la,
+                        dB,
+                        lb,
+                        &beta,
+                        dC,
+                        ld,
+                        dD_nat,
+                        ld,
+                        &heur.algo,
+                        nullptr,
+                        0,
+                        nullptr);
 
         /* Emulated with ADP, num_moduli=8 upper bound */
         Fp64EmulationSettings emu{};
-        emu.num_moduli   = 8u;
-        emu.sv_mask      = 0u;
-        emu.dynamic_mode = true;
-        const rocblaslt_status st =
-            fp64EmulatedGemm(m_handle,
-                             HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
-                             &alpha, dA, N, dB, N,
-                             &beta,  dC, N, dD_emu, N,
-                             nullptr, emu);
+        emu.num_moduli            = 8u;
+        emu.sv_mask               = 0u;
+        emu.dynamic_mode          = true;
+        const rocblaslt_status st = fp64EmulatedGemm(m_handle,
+                                                     HIPBLAS_OP_N,
+                                                     HIPBLAS_OP_N,
+                                                     N,
+                                                     N,
+                                                     N,
+                                                     &alpha,
+                                                     dA,
+                                                     N,
+                                                     dB,
+                                                     N,
+                                                     &beta,
+                                                     dC,
+                                                     N,
+                                                     dD_emu,
+                                                     N,
+                                                     nullptr,
+                                                     emu);
 
-        if(st != rocblaslt_status_success) {
-            destroy_nat(); free_all();
+        if(st != rocblaslt_status_success)
+        {
+            destroy_nat();
+            free_all();
             GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(st);
         }
 
         ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, bytes, hipMemcpyDeviceToHost), hipSuccess);
         ASSERT_EQ(hipMemcpy(hD_emu.data(), dD_emu, bytes, hipMemcpyDeviceToHost), hipSuccess);
-        destroy_nat(); free_all();
+        destroy_nat();
+        free_all();
 
         double dmax = 0.0;
-        for(double v : hD_nat) dmax = std::max(dmax, std::abs(v));
-        const double norm = std::max(dmax, 1.0);
-        double max_rel = 0.0;
+        for(double v : hD_nat)
+            dmax = std::max(dmax, std::abs(v));
+        const double norm    = std::max(dmax, 1.0);
+        double       max_rel = 0.0;
         for(size_t idx = 0; idx < N2; ++idx)
             max_rel = std::max(max_rel, std::abs(hD_emu[idx] - hD_nat[idx]) / norm);
 
-        EXPECT_LE(max_rel, 1e-4)
-            << "AdpLowModuliUpperBound (num_moduli=8): max_rel=" << max_rel;
+        EXPECT_LE(max_rel, 1e-4) << "AdpLowModuliUpperBound (num_moduli=8): max_rel=" << max_rel;
     }
 
 } // namespace
