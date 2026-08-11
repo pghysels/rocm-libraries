@@ -91,13 +91,6 @@ typedef enum {
     HIPBLASLT_EMULATION_STRATEGY_EAGER      = 2, /**<Emulate whenever the data types and epilogue are supported, regardless of problem size. */
 } hipblasLtEmulationStrategy_t;
 
-/*! \ingroup types_module
- *  \brief Mantissa precision control for FP64 fixed-point emulation.
- */
-typedef enum {
-    HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC = 0, /**<Use dynamic mantissa control. Runtime ADP is not enabled yet; current builds use the existing default emulation precision. */
-    HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED   = 1, /**<Use the fixed bit count set by hipblasLtSetFixedPointEmulationMaxMantissaBitCount(). */
-} hipblasLtEmulationMantissaControl_t;
 
 /*! \ingroup types_module
  *  \brief Specifies the enumeration type to set the postprocessing options for the epilogue.
@@ -1210,41 +1203,24 @@ hipblasStatus_t hipblasLtGetEmulationStrategy(hipblasLtHandle_t             hand
                                               hipblasLtEmulationStrategy_t* strategy);
 
 /*! \ingroup library_module
- *  \brief Set the mantissa precision control mode for FP64 emulation.
+ *  \brief Set the number of CRT moduli for FP64 emulation.
  *
  *  \details
- *  ``DYNAMIC`` (default): use dynamic mantissa control. Runtime ADP is not
- *  enabled yet; current builds use the existing default emulation precision
- *  and emit a one-time process warning when this temporary path is used.
- *  ``FIXED``: use the bit count set by
- *  hipblasLtSetFixedPointEmulationMaxMantissaBitCount().
+ *  Controls the number of INT8 GEMMs (CRT moduli) used per emulation call.
+ *  - ``numModuli = -1``  : ADP mode (default; adaptively selects the minimum
+ *                         moduli count needed for FP64 accuracy).
+ *  - ``numModuli in [2,18]``: FIXED mode with exactly that many moduli.
+ *
+ *  A one-time per-process warning is printed when FIXED mode is selected
+ *  because FIXED mode does not guarantee accuracy (CRT sign flips can occur).
  *
  *  \retval HIPBLAS_STATUS_SUCCESS         Setting applied successfully.
- *  \retval HIPBLAS_STATUS_INVALID_VALUE   \p handle is NULL.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE   handle is NULL, or numModuli
+ *                                         is not -1 and not in [2, 18].
  */
 HIPBLASLT_EXPORT
-hipblasStatus_t hipblasLtSetFixedPointEmulationMantissaControl(
-    hipblasLtHandle_t                 handle,
-    hipblasLtEmulationMantissaControl_t control);
+hipblasStatus_t hipblasLtSetEmulationNumModuli(hipblasLtHandle_t handle, int numModuli);
 
-/*! \ingroup library_module
- *  \brief Set the maximum CRT mantissa bit count for FP64 fixed-point emulation.
- *
- *  \details
- *  Specifies the total CRT capacity in bits (sum of log2 of all moduli used).
- *  The library selects the minimum number of moduli s such that
- *  CRT_capacity(s) >= maxBits.  Notable values: 16→3 GEMMs, 55→7 GEMMs,
- *  110→14 GEMMs.  Use 0 or 1 to select the minimum of 2 moduli.
- *
- *  Set to -1 to revert to the process-wide env var default. Values exceeding
- *  the maximum supported CRT capacity are rejected.
- *
- *  \retval HIPBLAS_STATUS_SUCCESS         Setting applied successfully.
- *  \retval HIPBLAS_STATUS_INVALID_VALUE   \p handle is NULL or \p maxBits is out of range.
- */
-HIPBLASLT_EXPORT
-hipblasStatus_t hipblasLtSetFixedPointEmulationMaxMantissaBitCount(hipblasLtHandle_t handle,
-                                                                    int               maxBits);
 
 /*! \ingroup library_module
  *  \brief Set the Inf/NaN special-values support mask for FP64 emulation.
@@ -1282,10 +1258,8 @@ hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t hand
  *  bytes for the workspace pointer supplied to \ref hipblasLtMatmul.
  *
  *  @param[in]  handle  hipBLASLt handle (provides device selection for the
- *                      performance model, and the configured moduli count and
- *                      mantissa-control mode — FIXED or DYNAMIC — set via
- *                      \ref hipblasLtSetFixedPointEmulationMantissaControl and
- *                      \ref hipblasLtSetFixedPointEmulationMaxMantissaBitCount).
+ *                      performance model, and the configured moduli count set via
+ *                      \ref hipblasLtSetEmulationNumModuli).
  *  @param[in]  m       Number of rows of op(A) and D.
  *  @param[in]  n       Number of columns of op(B) and D.
  *  @param[in]  k       Shared dimension of op(A) and op(B).
@@ -1293,7 +1267,7 @@ hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t hand
  *  \retval  Workspace size in bytes, or 0 on error.
  */
 HIPBLASLT_EXPORT
-size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t  handle,
+size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t  handle,
                                            hipblasOperation_t opA,
                                            hipblasOperation_t opB,
                                            int64_t            m,

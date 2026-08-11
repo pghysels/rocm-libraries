@@ -10,8 +10,13 @@
  * It is intentionally free of any HIP device types so it can be included
  * from plain C++ translation units.
  *
- * Environment variable:
+ * Environment variables:
  *   HIPBLASLT_EMULATE_DOUBLE_PRECISION=1   enables emulation
+ *   HIPBLASLT_EMULATION_NUM_MODULI=N        direct moduli count [2..18] (preferred)
+ *
+ * Setting precedence: handle setters > env vars > built-in defaults.
+ * Handle setters (hipblasLtSet* functions) permanently override env vars
+ * for the lifetime of that handle. See fp64EmulationDecision() for details.
  *
  * See docs/how-to/fp64-emulation.rst
  */
@@ -39,8 +44,6 @@ struct Fp64EmulationEnvValue
 Fp64EmulationEnvValue fp64EmulationParseEnabledEnv(const char* value);
 Fp64EmulationEnvValue fp64EmulationParseStrategyEnv(const char* value);
 Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value);
-Fp64EmulationEnvValue fp64EmulationParseMantissaBitCountEnv(const char* value);
-bool                  fp64EmulationIsValidMantissaBitCount(int value);
 
 /* Returns true when HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 is set.
  * The environment variable is read once and cached. Invalid values are reported
@@ -79,7 +82,8 @@ bool fp64EmulationIsEager();
 uint32_t fp64EmulationSpecialValuesMask();
 
 /* Returns the number of INT8 GEMMs (moduli) to use, in the range [2, 18].
- * Reads HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT; maps the
+ * Reads HIPBLASLT_EMULATION_NUM_MODULI (direct count [2..18]).
+ * Maps the
  * requested precision in bits to the minimum number of moduli required.
  * Default (env var absent): 16 moduli (~125 bits of CRT capacity).
  * A set env var is validated strictly; 0 or 1 selects the minimum of 2 moduli.
@@ -115,9 +119,8 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
 
 /* Returns the effective number of CRT moduli (2..18) given the handle's emulation
  * settings.
- *   FIXED mode (mantissa_control=1, max_mantissa_bits≥0): maps the bit count to
- *     the minimum s whose CRT capacity ≥ max_mantissa_bits.
- *   Default/env mode with HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT:
+ *   FIXED mode (num_moduli ∈ [2..18]): uses that count directly.
+ *   Default/env mode with HIPBLASLT_EMULATION_NUM_MODULI:
  *     forces FIXED at the requested bit count.
  *   DYNAMIC mode or no precision hint: uses the current non-ADP 16-moduli path. */
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h);

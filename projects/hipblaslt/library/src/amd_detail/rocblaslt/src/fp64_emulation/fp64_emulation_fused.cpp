@@ -1024,8 +1024,8 @@ rocblaslt_status oz2_launch_fused_TN(const int8_t*  A8i,
                            "num_moduli="                                                                                          \
                         << num_moduli                                                                                             \
                         << " (expected 16). Fix the emulation handle: call "                                                      \
-                           "hipblasLtSetFixedPointEmulationMantissaControl(FIXED) and "                                           \
-                           "hipblasLtSetFixedPointEmulationMaxMantissaBitCount(118)."                                             \
+                           "hipblasLtSetEmulationNumModuli(N) (N in [2..18]) for FIXED mode, or "                     \
+                           "hipblasLtSetEmulationNumModuli(-1) for ADP mode."                                          \
                         << std::endl;                                                                                             \
                     std::abort();                                                                                                 \
                 }                                                                                                                 \

@@ -883,35 +883,29 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
-hipblasStatus_t hipblasLtSetFixedPointEmulationMantissaControl(
-    hipblasLtHandle_t                 handle,
-    hipblasLtEmulationMantissaControl_t control)
-try
-{
-    if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    if(control < HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC
-       || control > HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED)
-        return HIPBLAS_STATUS_INVALID_VALUE;
-    auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    h->emulation.mantissa_control = static_cast<int>(control);
-    return HIPBLAS_STATUS_SUCCESS;
-}
-catch(...)
-{
-    return exception_to_hipblas_status();
-}
 
-hipblasStatus_t hipblasLtSetFixedPointEmulationMaxMantissaBitCount(hipblasLtHandle_t handle,
-                                                                    int               maxBits)
+
+hipblasStatus_t hipblasLtSetEmulationNumModuli(hipblasLtHandle_t handle, int numModuli)
 try
 {
     if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    /* -1 = revert to process-wide env var default. Non-negative values must
-     * be representable by the supported CRT capacity. */
-    if(!fp64EmulationIsValidMantissaBitCount(maxBits))
+    /* -1 = reset to ADP (default); [2..18] = FIXED with exactly numModuli moduli. */
+    if(numModuli != -1 && (numModuli < 2 || numModuli > 18))
         return HIPBLAS_STATUS_INVALID_VALUE;
     auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    h->emulation.max_mantissa_bits = maxBits;
+    h->emulation.num_moduli = numModuli;
+    /* Warn once per process when FIXED mode is selected. */
+    if(numModuli >= 2)
+    {
+        static std::atomic<bool> fixed_warned{false};
+        if(!fixed_warned.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                "[hipBLASLt WARNING] FP64 emulation FIXED mode selected.\n"
+                "  FIXED mode does NOT guarantee numerical accuracy or correctness.\n"
+                "  CRT sign flips can occur for inputs with large dynamic range.\n"
+                "  Use ADP mode (the default) for reliable results.\n"
+                "  Only use FIXED mode if you have validated it for your specific inputs.\n");
+    }
     return HIPBLAS_STATUS_SUCCESS;
 }
 catch(...)
@@ -933,7 +927,7 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
-size_t hipblasLtFp64EmulationWorkspaceSize(hipblasLtHandle_t  handle,
+size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t  handle,
                                            hipblasOperation_t opA,
                                            hipblasOperation_t opB,
                                            int64_t            m,

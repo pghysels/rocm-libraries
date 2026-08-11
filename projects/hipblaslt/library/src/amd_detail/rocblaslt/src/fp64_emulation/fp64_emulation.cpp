@@ -30,7 +30,7 @@
  *                                              + beta * C[i,j]
  *
  * The number of moduli s (= number of INT8 GEMMs) is configurable at runtime via
- * HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT (default: s=16, ~125 bits of CRT
+ * HIPBLASLT_EMULATION_NUM_MODULI (default: s=16 moduli; ADP mode when not set).
  * capacity, sufficient for guaranteed FP64-equivalent results on all inputs).
  *
  * Constants (tables) are taken verbatim from the open-source GEMMul8 implementation
@@ -2810,7 +2810,8 @@ bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
     const bool tB     = (opB != HIPBLAS_OP_N);
     /* Include ADP overhead when the handle is configured for dynamic (ADP) mode,
      * so the performance gate correctly accounts for the hipStreamSynchronize cost. */
-    const bool     dyn        = (h->emulation.mantissa_control != 1);
+    const bool     dyn        = (h->emulation.num_moduli < 2) &&
+                               (std::getenv("HIPBLASLT_EMULATION_NUM_MODULI") == nullptr);
     const unsigned num_moduli = fp64EmulationEffectiveNumModuli(h);
     const double   t_emul     = effective_time_ms(tA, tB, m, n, k, num_moduli, device, dyn);
     const double t_native = perf_model_times(tA, tB, m, n, k, num_moduli, device, dyn).t_native_ms;
@@ -2903,23 +2904,7 @@ Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value)
     return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
 }
 
-Fp64EmulationEnvValue fp64EmulationParseMantissaBitCountEnv(const char* value)
-{
-    using namespace FP64Emulation;
-    if(value == nullptr)
-        return {FP64_EMULATION_ENV_UNSET, 0u};
-    char*      endp = nullptr;
-    const long v    = std::strtol(value, &endp, 10);
-    if(endp == value || *endp != '\0' || v < 0 || v > 140)
-        return {FP64_EMULATION_ENV_INVALID, 0u};
-    return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
-}
 
-bool fp64EmulationIsValidMantissaBitCount(int value)
-{
-    using namespace FP64Emulation;
-    return value >= -1 && value <= 140;
-}
 
 Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
                                             hipDataType              type_a,
@@ -2930,6 +2915,16 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
                                             int64_t                  k,
                                             int                      batch_count)
 {
+    /* Setting Precedence (highest to lowest):
+     *   1. Handle setter (hipblasLtSet* functions) — set after handle creation;
+     *      permanently overrides any env var for the lifetime of this handle.
+     *   2. Environment variable — read once at first use, process-wide default.
+     *   3. Built-in default (ADP mode, 16 moduli, special-values mask = 0x3).
+     *
+     * The handle fields are initialized to sentinel values (-1 / ~0u / 0) at
+     * creation.  A sentinel means "use the env var"; a non-sentinel means "use
+     * this value".  Calling any hipblasLtSet* function writes a non-sentinel,
+     * disabling the env-var fallback for that setting on this handle.         */
     using namespace FP64Emulation;
     Fp64EmulationDecision result{};
     result.status       = rocblaslt_status_success;
@@ -2962,7 +2957,11 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
 
     /* dynamic_mode: DYNAMIC (ADP) mantissa control — adaptively selects
      * the minimum s needed for FP64 precision on the given input data.   */
-    result.dynamic_mode = (h->emulation.mantissa_control != 1);
+    /* ADP when no fixed count is set on the handle AND env var is not set.
+     * num_moduli ∈ [2..18] on the handle → FIXED; -1 (sentinel) → check env var.
+     * Env var HIPBLASLT_EMULATION_NUM_MODULI set → FIXED; absent → ADP.        */
+    result.dynamic_mode = (h->emulation.num_moduli < 2) &&
+                          (std::getenv("HIPBLASLT_EMULATION_NUM_MODULI") == nullptr);
 
     /* Strategy (eager vs performant). */
     const bool eager
@@ -2976,14 +2975,9 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
 {
     using namespace FP64Emulation;
-    if(h->emulation.mantissa_control == 1 && h->emulation.max_mantissa_bits >= 0)
-    {
-        const unsigned target = static_cast<unsigned>(h->emulation.max_mantissa_bits);
-        for(unsigned s = 2u; s <= S_MAX; ++s)
-            if(cum_bits[s - 2u] >= static_cast<double>(target))
-                return s;
-        return S_MAX;
-    }
+    /* num_moduli ∈ [2..18] → FIXED with that count; -1 → ADP (use env var or default). */
+    if(h->emulation.num_moduli >= 2 && h->emulation.num_moduli <= static_cast<int>(S_MAX))
+        return static_cast<unsigned>(h->emulation.num_moduli);
     return fp64EmulationNumModuli();
 }
 
@@ -3089,16 +3083,15 @@ unsigned fp64EmulationNumModuli()
 {
     using namespace FP64Emulation;
     static const unsigned num_moduli = []() -> unsigned {
-        const char* v = std::getenv("HIPBLASLT_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT");
-        if(v == nullptr)
-            return 16u;
-        const unsigned target = static_cast<unsigned>(std::strtoul(v, nullptr, 0));
-        if(target == 0u)
-            return S_MAX;
-        for(unsigned s = 2u; s <= S_MAX; ++s)
-            if(cum_bits[s - 2u] >= static_cast<double>(target))
-                return s;
-        return S_MAX;
+        /* HIPBLASLT_EMULATION_NUM_MODULI: direct moduli count [2..18]. */
+        const char* vn = std::getenv("HIPBLASLT_EMULATION_NUM_MODULI");
+        if(vn != nullptr)
+        {
+            const long n = std::strtol(vn, nullptr, 10);
+            if(n >= 2 && n <= static_cast<long>(S_MAX))
+                return static_cast<unsigned>(n);
+        }
+        return 16u; /* default: 16 moduli (ADP mode) */
     }();
     return num_moduli;
 }
