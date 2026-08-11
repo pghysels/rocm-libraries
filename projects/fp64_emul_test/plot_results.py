@@ -38,11 +38,12 @@ matplotlib.rcParams.update({
 EPS_FP64 = 2.220446049250313e-16
 
 # ── Representative s values to show in "accuracy vs N" and TFlop/s plots ────
-HIGHLIGHT_S = [2, 4, 7, 10, 14, 16, 18]
+# HIGHLIGHT_S = [2, 4, 7, 10, 14, 16, 18]
+HIGHLIGHT_S = [12, 14, 16, 18]
 
 # ── Colours for num_moduli (2..18) ───────────────────────────────────────────
 S_MAX = 18
-S_CMAP = cm.get_cmap("plasma", S_MAX + 1)
+S_CMAP = matplotlib.colormaps["plasma"].resampled(S_MAX + 1)
 
 def s_color(s):
     return S_CMAP(s / S_MAX)
@@ -259,7 +260,7 @@ def plot_accuracy_vs_s(df, out_path):
     nrows      = n_phi
 
     N_vals  = sorted(df["N"].unique())
-    N_cmap  = cm.get_cmap("viridis", len(N_vals) + 1)
+    N_cmap  = matplotlib.colormaps["viridis"].resampled(len(N_vals) + 1)
     N_color = {N: N_cmap(i / len(N_vals)) for i, N in enumerate(N_vals)}
 
     fig, axes = plt.subplots(nrows, ncols,
@@ -412,7 +413,7 @@ def plot_median_accuracy_vs_s(df, out_path):
     nrows      = n_phi
 
     N_vals  = sorted(df["N"].unique())
-    N_cmap  = cm.get_cmap("viridis", len(N_vals) + 1)
+    N_cmap  = matplotlib.colormaps["viridis"].resampled(len(N_vals) + 1)
     N_color = {N: N_cmap(i / len(N_vals)) for i, N in enumerate(N_vals)}
 
     fig, axes = plt.subplots(nrows, ncols,

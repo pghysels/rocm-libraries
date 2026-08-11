@@ -37,13 +37,14 @@ PHASES = [
     ("t_prelim_ms",      "prelim extract"),
     ("t_prelim_gemm_ms", "prelim GEMM"),
     ("t_refine_ms",      "shift refine"),
+    ("t_adp_ms",         "ADP reduce"),
     ("t_scale_ms",       "scale A+B"),
     ("t_int8_gemm_ms",   "INT8 GEMM"),
     ("t_accum_ms",       "CRT accum"),
-    ("t_finalize_ms",    "finalize"),
+    ("t_fused_ms",       "fused MFMA"),
 ]
-COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52",
-          "#8172B2", "#937860", "#DA8BC3"]
+COLORS = ["#4C72B0", "#DD8452", "#55A868", "#937860",
+          "#C44E52", "#8172B2", "#DA8BC3", "#55C4CC"]
 
 _TRANS_RE = re.compile(r'_([NT]{2})(?:\.csv)?$', re.IGNORECASE)
 
@@ -62,7 +63,12 @@ def load_and_aggregate(csv_path):
     df = pd.read_csv(csv_path)
     df["N"] = df["m"]
 
-    phase_cols = [c for c, _ in PHASES]
+    # Fill any phase columns missing from older/newer CSV variants with 0.
+    phase_cols = []
+    for col, _ in PHASES:
+        if col not in df.columns:
+            df[col] = 0.0
+        phase_cols.append(col)
 
     for col in ("scale_chunk_size", "gemm_chunk_size", "workspace_bytes"):
         if col not in df.columns:
@@ -70,12 +76,15 @@ def load_and_aggregate(csv_path):
 
     extra_cols = ["scale_chunk_size", "gemm_chunk_size", "workspace_bytes"]
 
-    grouped = (df.groupby("N", group_keys=False)
-                 .apply(lambda g: g.iloc[1:])
-                 .groupby("N")[phase_cols + ["t_total_ms"] + extra_cols]
-                 .mean()
-                 .reset_index()
-                 .sort_values("N"))
+    # Drop warmup row per N (first row per group) using cumcount — compatible
+    # with pandas 2.x where groupby.apply no longer preserves groupby keys.
+    mask = df.groupby("N").cumcount() > 0
+    df_warm = df[mask]
+
+    grouped = (df_warm.groupby("N")[phase_cols + ["t_total_ms"] + extra_cols]
+                      .mean()
+                      .reset_index()
+                      .sort_values("N"))
     return grouped
 
 

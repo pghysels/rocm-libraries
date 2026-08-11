@@ -33,7 +33,8 @@ NUM_RUNS="${2:-30}"
 OUTPUT="${3:-results_$(date +%Y%m%d_%H%M%S).csv}"
 EXTRA_FLAGS="${4:-}"
 
-PHI_LIST="0.5,1,2,4"
+# PHI_LIST="0.5,1,2,4"
+PHI_LIST="1"
 
 # Pin to device 0 (overridable: HIP_VISIBLE_DEVICES=2 ./run_sweep.sh)
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
@@ -70,8 +71,7 @@ echo "phi,N,transa,transb,algo,crt_bits,err_max,err_med,ms_per_run,workspace_MiB
 #   N = 32768 → max(1,  runs/32)
 #   N = 65536 → 1  (single timed run; each call is many seconds)
 # This gives stable timing at each size without wasting hours on large N.
-#for N in 1024 2048 4096 8192 16384 32768 65536; do
-for N in 16384; do
+for N in 1024 2048 4096 8192 16384 32768 65536; do
     if   [ "$N" -le  2048 ]; then RUNS="$NUM_RUNS"
     elif [ "$N" -le  4096 ]; then RUNS=$(( NUM_RUNS / 4  < 5 ? 5 : NUM_RUNS / 4  ))
     elif [ "$N" -le  8192 ]; then RUNS=$(( NUM_RUNS / 8  < 3 ? 3 : NUM_RUNS / 8  ))
