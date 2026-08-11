@@ -433,6 +433,7 @@ namespace
         hipblasOperation_t opB; /* HIPBLAS_OP_N or HIPBLAS_OP_T for B   */
         double             alpha; /* scaling factor for A*B               */
         double             beta; /* scaling factor for C                 */
+        bool               dynamic_mode = false; /* ADP: adaptively select s */
     };
 
     static std::string
@@ -459,7 +460,8 @@ namespace
             const int vi = static_cast<int>(v);
             return (static_cast<double>(vi) == v) ? std::to_string(vi) : "x";
         };
-        return "s" + std::to_string(p.s) + suf + "_" + std::to_string(p.m) + "x"
+        const char* adp_suf = p.dynamic_mode ? "_adp" : "";
+        return "s" + std::to_string(p.s) + suf + adp_suf + "_" + std::to_string(p.m) + "x"
                + std::to_string(p.n) + "x" + std::to_string(p.k) + "_" + opA_c + opB_c + "_a"
                + fmt_s(p.alpha) + "_b" + fmt_s(p.beta);
     }
@@ -683,6 +685,7 @@ namespace
         Fp64EmulationSettings emu_settings{};
         emu_settings.num_moduli      = p.s;
         emu_settings.sv_mask         = 0u; /* skip Inf/NaN detection */
+        emu_settings.dynamic_mode    = p.dynamic_mode;
         emu_settings.workspace       = nullptr; /* library allocates internally */
         emu_settings.workspace_bytes = 0u;
 
@@ -1026,11 +1029,21 @@ namespace
     //   max INT32 accumulation ≈ 63² × 16384 ≈ 65M — well within INT32 range.
     // Guards against silent overflow regressions if the extraction scale
     // were ever increased beyond 6 bits.
+    //
+    // Two sub-tests:
+    //   s=18 (fixed):  sufficient CRT capacity (log₂P₁₈ ≈ 68.7 bits) for k=16384.
+    //   ADP:           adaptive moduli selection; verifies ADP correctly handles
+    //                  the larger inner products at k=16384 without CRT overflow.
     INSTANTIATE_TEST_SUITE_P(
         LargeK,
         Fp64EmulationAccuracyTest,
-        ::testing::Values(EmulAccuracyParam{
-            16, 64, 64, 16384, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+        ::testing::Values(
+            /* Fixed s=18: 7.5 extra CRT bits vs s=16, avoids overflow at k=16384 */
+            EmulAccuracyParam{18, 64, 64, 16384, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N,
+                              HIPBLAS_OP_N, 1.0, 0.0, false},
+            /* ADP: adaptive s selection from data — must succeed without CRT overflow */
+            EmulAccuracyParam{18, 64, 64, 16384, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N,
+                              HIPBLAS_OP_N, 1.0, 0.0, true}),
         EmulAccuracyParamName);
 
     // ── RectangularShapes: non-square m×n×k to exercise different tile paths ──
