@@ -446,13 +446,13 @@ namespace FP64Emulation
      * Four kernels, named by the transpose value they handle (_T = transposed,
      * _N = non-transposed), each with optimal blockDim and SHMEM for its path:
      *
-     *   accu_prelim_A_T_kernel  TRANS_A=true  (k-fast coalesced, blockDim=256)
+     *   accu_prelim_A_T_kernel  TRANS_A=true  (k-fast double2 coalesced, blockDim=256)
      *   accu_prelim_A_N_kernel  TRANS_A=false (SHMEM transposition, blockDim=1024)
-     *   accu_prelim_B_N_kernel  TRANS_B=false (j-fast coalesced, blockDim=256)
+     *   accu_prelim_B_N_kernel  TRANS_B=false (j-fast double2 coalesced, blockDim=256)
      *   accu_prelim_B_T_kernel  TRANS_B=true  (SHMEM transposition, blockDim=1024)
      *
-     * Coalesced kernels allocate only s_wmax (tiny LDS) → 16 blocks/CU occupancy.
-     * SHMEM kernels use TILE_M=16 → 4x fewer blocks/syncs vs old TILE_M=4.
+     * Coalesced kernels use double2 loads (128-bit), tiny LDS (s_wmax only).
+     * SHMEM kernels use TILE_M=16 → 4x fewer blocks/syncs.
      * ========================================================================= */
     static constexpr int OZ2_PRELIM_TILE_K = 64; /* k-tile size for SHMEM paths */
     static constexpr int OZ2_PRELIM_SHMEM_TILE_M
@@ -821,7 +821,7 @@ namespace FP64Emulation
      * Avoids LDS atomic contention by using a standard block reduction.
      * Runs in the same stream as refine_sftA_partial_kernel so both C32i reads
      * are pipelined; downstream adp_reduce_B and refine_sftB read only the tiny col_max[n]
-     * array (n×4 bytes) instead of the full m×n C32i matrix (reducing ADP overhead ~1.2ms).
+     * array (n×4 bytes) instead of the full m×n C32i matrix.
      * Launch: dim3(n) blocks × dim3(256) threads.                                        */
     __global__ static void col_max_kernel(const int32_t* __restrict__ C32i,
                                           int64_t m,
@@ -905,10 +905,6 @@ namespace FP64Emulation
         }
     }
 
-    /* log2P is passed as a host-side float constant (from log2P[s-2]).
-     * For s=13,14,15 this is fast::log2P (1 bit below accu) to prevent the OZ2
-     * CRT invariant |X_true| < M_s/2 from being violated by floor discretisation.
-     * For all other s the full accu::log2P is used, preserving maximum precision. */
     __global__ static void refine_sftA_apply_kernel(const int32_t* __restrict__ row_max,
                                                     int16_t* __restrict__ sftA,
                                                     int64_t m,
@@ -976,13 +972,13 @@ namespace FP64Emulation
      * GPU kernels — Part 1f: multi-modulus scaling (separate per path)
      *
      * Four kernels named by the transpose value they handle:
-     *   scale_A_T_kernel  TRANS_A=true  (k-fast coalesced, blockDim=256, TILE_M=4)
-     *   scale_A_N_kernel  TRANS_A=false (SHMEM transposition, blockDim=1024, TILE_M=16)
-     *   scale_B_N_kernel  TRANS_B=false (j-fast coalesced, blockDim=256, TILE_M=4)
-     *   scale_B_T_kernel  TRANS_B=true  (SHMEM transposition, blockDim=1024, TILE_M=16)
+     *   scale_A_T_kernel  TRANS_A=true  (k-fast coalesced, blockDim=512, TILE_M=8)
+     *   scale_A_N_kernel  TRANS_A=false (SHMEM transposition, blockDim=256, TILE_M=16)
+     *   scale_B_N_kernel  TRANS_B=false (j-fast coalesced, blockDim=512, TILE_M=8)
+     *   scale_B_T_kernel  TRANS_B=true  (SHMEM transposition, blockDim=256, TILE_M=16)
      *
-     * Coalesced kernels: no SHMEM → low LDS → 16 blocks/CU, good latency hiding.
-     * SHMEM kernels: TILE_M=16 → 4× fewer blocks/syncs; 8.7 KB LDS per block.
+     * Coalesced kernels: no SHMEM → low LDS → good latency hiding.
+     * SHMEM kernels: TILE_M=16, K_UNROLL=4 → blockDim=256; 8.7 KB LDS per block.
      * ========================================================================= */
     static constexpr int OZ2_SCALE_TILE_K = 64;
     /* Coalesced kernels (A_T, B_N) process 4 k-positions per thread (K_UNROLL=4):
@@ -993,7 +989,7 @@ namespace FP64Emulation
     /* SHMEM kernels (A_N, B_T) also use K_UNROLL=4: each thread loads/stores 4
      * consecutive k-positions, packs 4 int8 bytes as uint32_t per store.
      * blockDim = (TILE_K / 4) * TILE_M = 16 * 16 = 256 threads.
-     * LDS bank conflicts drop from 4-way (old 1024-thread scheme) to 2-way.    */
+     * LDS bank conflicts drop from 4-way to 2-way.    */
     static constexpr int OZ2_SCALE_SHMEM_BLOCK_DIM
         = (OZ2_SCALE_TILE_K / 4) * OZ2_SCALE_SHMEM_TILE_M; /* 256 */
 
@@ -2390,8 +2386,6 @@ namespace FP64Emulation
             }
         }
 
-        /* log2P from the mixed table: fast::log2P for s=13,14,15 (prevents CRT overflow);
-         * accu::log2P for all other s (preserves maximum precision).               */
         const float accu_log2P = log2P[num_moduli - 2];
         _pstart();
         const unsigned sftA_m_blks = static_cast<unsigned>((m + 63) / 64);
@@ -2417,7 +2411,7 @@ namespace FP64Emulation
                            row_max);
         /* Compute col_max[n] from C32i in a separate kernel (column-major read, no LDS contention).
          * Runs concurrently with the above in the same stream; both read the same C32i buffer.
-         * adp_reduce_B and refine_sftB then read col_max instead of C32i, saving ~1.2ms in ADP mode. */
+         * adp_reduce_B and refine_sftB then read col_max instead of C32i. */
         hipLaunchKernelGGL(col_max_kernel,
                            dim3(static_cast<unsigned>(n)),
                            dim3(256),
