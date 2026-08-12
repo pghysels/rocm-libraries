@@ -70,7 +70,12 @@ namespace FP64Emulation
      * require workspace, which is necessary for very large k values where no
      * zero-workspace INT8 GEMM algorithm is available.
      * 128 MiB matches the default value of HIPBLASLT_TUNING_USER_MAX_WORKSPACE. */
-    static constexpr size_t OZ2_INT8_GEMM_WS_BYTES = 128ull << 20; /* 128 MiB */
+    /* TODO some INT8 GEMMs return wrong results for larger K when given a
+     * larger workspace, but are correct without workspace.
+     * This is why this workspace is set to size 0.
+     * For larger K this might fail to find a solution,
+     * and then we fall back to native DGEMM */
+    static constexpr size_t OZ2_INT8_GEMM_WS_BYTES = 0; // 128ull << 20; /* 128 MiB */
 
     /* Total workspace budget per modulus (A8i + B8i + C32i simultaneously resident).
      * chunk × (mn4 + slc) ≤ OZ2_CHUNK_TARGET_BYTES constrains the combined allocation. */
