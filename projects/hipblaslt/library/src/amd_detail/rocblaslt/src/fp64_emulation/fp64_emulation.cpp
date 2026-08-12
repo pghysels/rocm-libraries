@@ -2386,7 +2386,6 @@ namespace FP64Emulation
             }
         }
 
-        const float accu_log2P = log2P[num_moduli - 2];
         _pstart();
         const unsigned sftA_m_blks = static_cast<unsigned>((m + 63) / 64);
         const unsigned sftA_n_blks = static_cast<unsigned>((n + 63) / 64);
