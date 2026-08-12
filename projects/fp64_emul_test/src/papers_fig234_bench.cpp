@@ -358,12 +358,6 @@ static constexpr double CRT_BITS[19] = {
  * The library selects the minimum s' such that CRT_BITS[s'] >= maxBits,
  * so setting maxBits = floor(CRT_BITS[s-1]) + 1 forces s' = s.
  */
-static int bits_for_moduli(unsigned s)
-{
-    if(s < 2u)  s = 2u;
-    if(s > 18u) s = 18u;
-    return static_cast<int>(CRT_BITS[s - 1]) + 1;
-}
 
 /* Moduli configurations for Figure 2 (BLAS Test 2) */
 static const unsigned MODULI_LIST_FIG2[] = {6, 8, 10, 12, 14, 15, 16, 17, 18};
@@ -444,20 +438,15 @@ struct DgemmRunner {
     /* Configure emulation to use exactly s moduli (fixed, no fallback). */
     void set_fixed_s(unsigned s)
     {
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-            handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(
-            handle, bits_for_moduli(s)));
+        HLT_CHECK(hipblasLtSetEmulationNumModuli(handle, static_cast<int>(s)));
         requery();
     }
 
     /* Configure emulation to use ADP (Adaptive Precision) mode.
-     * The effective s is chosen per-GEMM from the data; s=num_moduli is
-     * the upper bound (default 16 from fp64EmulationNumModuli()). */
+     * numModuli=-1 resets to ADP; the library picks s per-GEMM from the data. */
     void set_dynamic()
     {
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-            handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC));
+        HLT_CHECK(hipblasLtSetEmulationNumModuli(handle, -1));
         requery();
     }
 

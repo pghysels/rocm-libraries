@@ -347,15 +347,13 @@ int main(int argc, char** argv)
     /* Emulated handle: eager mode, S fixed at 16.
      * OZ2_DISPATCH_SHAPE_OVERRIDE now always dispatches oz2_fused_TN_kernel<16,...>,
      * so the library must also prepare exactly 16 sets of INT8 data.
-     * maxBits=118 selects s=16 moduli (verified in fp64_emul_scale_bench.cpp). */
+     * s=16 moduli (verified in fp64_emul_scale_bench.cpp). */
     hipblasLtHandle_t handle_emul;
     HLT_CHECK(hipblasLtCreate(&handle_emul));
     HLT_CHECK(hipblasLtSetEmulationEnabled(handle_emul, true));
     HLT_CHECK(hipblasLtSetEmulationStrategy(handle_emul,
                                              HIPBLASLT_EMULATION_STRATEGY_EAGER));
-    HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-        handle_emul, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
-    HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(handle_emul, 118)); /* s=16 */
+    HLT_CHECK(hipblasLtSetEmulationNumModuli(handle_emul, 16)); /* s=16 */
 
     /* Reference handle: native DGEMM */
     hipblasLtHandle_t handle_ref;

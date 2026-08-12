@@ -106,9 +106,7 @@ int main(int argc, char**)
     HLT_CHECK(hipblasLtSetEmulationStrategy(handle, HIPBLASLT_EMULATION_STRATEGY_EAGER));
     HLT_CHECK(hipblasLtSetEmulationSpecialValuesSupport(handle, 0u));
     /* Fix at s=16 moduli */
-    HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-        handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
-    HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(handle, 118)); /* s=16 */
+    HLT_CHECK(hipblasLtSetEmulationNumModuli(handle, 16)); /* s=16 */
 
     printf("%-5s %-5s %-8s %-5s %-5s  %s\n",
            "m", "n", "k", "tA", "tB", "t_total_ms (per run)");

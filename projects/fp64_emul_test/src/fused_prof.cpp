@@ -63,16 +63,13 @@ int main(int argc, char** argv)
     HLT_CHECK(hipblasLtSetEmulationEnabled(h, true));
     HLT_CHECK(hipblasLtSetEmulationStrategy(h, HIPBLASLT_EMULATION_STRATEGY_EAGER));
     if (adp_mode) {
-        /* Adaptive (DYNAMIC) mode: let the library choose S per-problem via ADP kernels.
-         * Do NOT fix S=16 — this enables oz2_adp_reduce_* kernel calls.             */
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-            h, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC));
+        /* Adaptive (ADP) mode: numModuli=-1 resets to ADP (default),
+         * enabling oz2_adp_reduce_* kernels per-problem.              */
+        HLT_CHECK(hipblasLtSetEmulationNumModuli(h, -1));
         std::fprintf(stderr, "Mantissa mode: DYNAMIC (adaptive S, ADP kernels enabled)\n");
     } else {
         /* Fixed S=16: required for OZ2_FUSED_SHAPE_OVERRIDE and the fused kernel guard. */
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-            h, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(h, 118)); /* s=16 */
+        HLT_CHECK(hipblasLtSetEmulationNumModuli(h, 16)); /* s=16 */
         std::fprintf(stderr, "Mantissa mode: FIXED S=16\n");
     }
 

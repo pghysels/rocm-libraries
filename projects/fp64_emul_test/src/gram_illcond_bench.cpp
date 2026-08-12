@@ -64,7 +64,7 @@ struct GemmRunner {
     hipblasLtMatmulHeuristicResult_t heur{};
     bool                         hasAlgo = false;
 
-    void init(int64_t N, bool set_emul, int mantissa_bits = 0)
+    void init(int64_t N, bool set_emul, int num_moduli = 0)
     {
         HLT_CHECK(hipblasLtCreate(&handle));
         if(set_emul) {
@@ -72,11 +72,8 @@ struct GemmRunner {
             HLT_CHECK(hipblasLtSetEmulationStrategy(
                           handle, HIPBLASLT_EMULATION_STRATEGY_EAGER));
             HLT_CHECK(hipblasLtSetEmulationSpecialValuesSupport(handle, 0u));
-            HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-                          handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
-            if(mantissa_bits > 0)
-                HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(
-                               handle, mantissa_bits));
+            if(num_moduli > 0)
+                HLT_CHECK(hipblasLtSetEmulationNumModuli(handle, num_moduli));
         }
 
         HLT_CHECK(hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F));
@@ -181,19 +178,19 @@ int main(int argc, char** argv)
     struct Config {
         const char* label;
         bool        emul;
-        int         bits;   /* target mantissa bits (0 = use library default) */
+        int         num_moduli; /* moduli count (0 = library default/ADP) */
     };
     const Config configs[] = {
         { "native    ", false,   0 },
-        { "s=8 (~64b)", true,   55 },  /* 55 bits → 7 moduli (ceiling to s=8 ≈ 63.6 bits) */
-        { "s=12(~95b)", true,   87 },  /* 87 bits → 12 moduli (~94.8 bits)                 */
-        { "s=16(125b)", true,  125 },  /* 125 bits → 16 moduli (~125.4 bits, default)      */
+        { "s=8 (~64b)", true,    8 },  /* 55 bits → 7 moduli (ceiling to s=8 ≈ 63.6 bits) */
+        { "s=12(~95b)", true,   12 },  /* 87 bits → 12 moduli (~94.8 bits)                 */
+        { "s=16(125b)", true,   16 },  /* 125 bits → 16 moduli (~125.4 bits, default)      */
     };
     constexpr int N_CONFIGS = static_cast<int>(sizeof(configs) / sizeof(configs[0]));
 
     GemmRunner runners[N_CONFIGS];
     for(int c = 0; c < N_CONFIGS; ++c)
-        runners[c].init(N, configs[c].emul, configs[c].bits);
+        runners[c].init(N, configs[c].emul, configs[c].num_moduli);
 
     /* ── GPU buffers ──────────────────────────────────────────────────────── */
     double *dA = nullptr, *dD = nullptr;

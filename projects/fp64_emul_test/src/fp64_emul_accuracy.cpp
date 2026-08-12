@@ -528,22 +528,6 @@ static constexpr double CRT_BITS[19] = {
    140.448, /* s=18 */
 };
 
-/**
- * bits_for_moduli(s): returns the integer maxBits value that causes the
- * library to select exactly s moduli.
- *
- * The library picks the minimum s' such that CRT_BITS[s'] >= maxBits.
- * To select exactly s, we need:
- *   CRT_BITS[s-1] < maxBits <= CRT_BITS[s]
- * Using maxBits = (int)CRT_BITS[s-1] + 1 satisfies this for s=2..18.
- */
-static int bits_for_moduli(unsigned s)
-{
-    if(s < 2u)  s = 2u;
-    if(s > 18u) s = 18u;
-    return static_cast<int>(CRT_BITS[s - 1]) + 1;
-}
-
 /* =========================================================================
  * CLI parsing
  * ========================================================================= */
@@ -815,8 +799,8 @@ int main(int argc, char** argv)
                 : HIPBLASLT_EMULATION_STRATEGY_PERFORMANT;
             HLT_CHECK(hipblasLtSetEmulationStrategy(emulated.handle, strat));
 
-            HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-                emulated.handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_DYNAMIC));
+            HLT_CHECK(hipblasLtSetEmulationNumModuli(
+                emulated.handle, -1)); /* -1 = ADP mode */
             emulated.requery();
             const size_t emu_ws = emulated.workspaceSize();
             ensure_ws(emu_ws);
@@ -844,10 +828,8 @@ int main(int argc, char** argv)
         HLT_CHECK(hipblasLtSetEmulationStrategy(emulated.handle,
                                                 HIPBLASLT_EMULATION_STRATEGY_EAGER));
         for(unsigned s = cfg.min_s; s <= cfg.max_s; ++s) {
-            HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(
-                emulated.handle, HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
-            HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(
-                emulated.handle, bits_for_moduli(s)));
+            HLT_CHECK(hipblasLtSetEmulationNumModuli(
+                emulated.handle, static_cast<int>(s)));
             emulated.requery();
             const size_t emu_ws = emulated.workspaceSize();
             ensure_ws(emu_ws);

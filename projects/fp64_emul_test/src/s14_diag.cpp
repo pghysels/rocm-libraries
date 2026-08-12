@@ -135,16 +135,6 @@ fill_uniform(size_t n_elems, double* A, uint64_t seed)
     A[idx]=bits_to_uniform_dev(xorshift64_dev(s));
 }
 
-/* ─── CRT bits table ─────────────────────────────────────────────────────── */
-static constexpr double CRT_BITS[19] = {
-    0,0, 15.994,23.976, 31.945,39.894, 47.807,55.708,
-    63.572,71.411, 79.238,87.040, 94.801,102.522,
-    110.160,117.782, 125.374,132.949, 140.448,
-};
-static int bits_for_moduli(unsigned s) {
-    if(s<2) s=2; if(s>18) s=18;
-    return static_cast<int>(CRT_BITS[s-1])+1;
-}
 
 /* ─── DgemmRunner ────────────────────────────────────────────────────────── */
 struct Runner {
@@ -176,8 +166,7 @@ struct Runner {
         requery();
     }
     void set_s(unsigned s) {
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMantissaControl(handle,HIPBLASLT_EMULATION_MANTISSA_CONTROL_FIXED));
-        HLT_CHECK(hipblasLtSetFixedPointEmulationMaxMantissaBitCount(handle,bits_for_moduli(s)));
+        HLT_CHECK(hipblasLtSetEmulationNumModuli(handle, static_cast<int>(s)));
         requery();
     }
     void run(const double* A,const double* B,double* D,void* ws,size_t wsz,hipStream_t st) const {
