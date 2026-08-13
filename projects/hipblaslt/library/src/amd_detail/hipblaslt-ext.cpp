@@ -1112,7 +1112,7 @@ namespace hipblaslt_ext
             const Fp64EmulationDecision emulDecision =
                 fp64EmulationDecision(h, problemtype.getTypeA(),
                                       problemtype.getOpA(), problemtype.getOpB(),
-                                      m, n, k, static_cast<int>(batch_count));
+                                      m, n, k, batch_count, ~size_t{0});
             m_emul_workspace_bytes = emulDecision.apply
                 ? fp64EmulationWorkspaceSize(h, problemtype.getOpA(), problemtype.getOpB(),
                                              m, n, k, emulDecision)
@@ -1169,7 +1169,7 @@ namespace hipblaslt_ext
             const Fp64EmulationDecision emulDecision =
                 fp64EmulationDecision(h, A_layout->type,
                                       desc_ptr->op_A, desc_ptr->op_B,
-                                      m_sz, n_sz, k_sz, batch);
+                                      m_sz, n_sz, k_sz, batch, ~size_t{0});
             m_emul_workspace_bytes = emulDecision.apply
                 ? fp64EmulationWorkspaceSize(h, desc_ptr->op_A, desc_ptr->op_B,
                                              m_sz, n_sz, k_sz, emulDecision)

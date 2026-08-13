@@ -534,7 +534,8 @@ try
         const hipDataType type_a      = A_layout->type;
 
         const Fp64EmulationDecision emulDecision =
-            fp64EmulationDecision(h, type_a, m, n, k, batch_count);
+            fp64EmulationDecision(h, type_a, desc_ptr->op_A, desc_ptr->op_B, m, n, k, batch_count,
+                                          reinterpret_cast<const _rocblaslt_matmul_preference*>(pref)->max_workspace_bytes);
         if(emulDecision.status != rocblaslt_status_success)
             return RocBlasLtStatusToHIPStatus(emulDecision.status);
         if(emulDecision.apply && *returnAlgoCount > 0)
@@ -943,7 +944,7 @@ try
      * emulation disabled on the handle) — no emulation workspace needed.    */
     const auto* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
     const Fp64EmulationDecision d =
-        fp64EmulationDecision(h, HIP_R_64F, opA, opB, m, n, k, /*batch_count=*/1);
+        fp64EmulationDecision(h, HIP_R_64F, opA, opB, m, n, k, 1, ~size_t{0});
     if(d.status != rocblaslt_status_success || !d.apply) return 0;
     return fp64EmulationWorkspaceSize(h, opA, opB, m, n, k, d);
 }

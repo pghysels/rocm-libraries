@@ -29,12 +29,6 @@
  * Part 4 – Per-element inverse scale: D[i,j] = alpha * X[i,j] * 2^-(sftA[i]+sftB[j])
  *                                              + beta * C[i,j]
  *
- * The number of moduli s (= number of INT8 GEMMs) is configurable at runtime via
- * HIPBLASLT_EMULATION_NUM_MODULI (default: s=16 moduli; ADP mode when not set).
- * capacity, sufficient for guaranteed FP64-equivalent results on all inputs).
- *
- * Constants (tables) are taken verbatim from the open-source GEMMul8 implementation
- * (Y. Uchino, RIKEN R-CCS, https://github.com/RIKEN-RCCS/GEMMul8).
  *
  * This file MUST be compiled as HIP (LANGUAGE HIP in CMakeLists.txt).
  * Inner INT8 GEMMs use hipblasLtMatmul (INT8 tensor cores, INT32 accumulate).
@@ -86,7 +80,8 @@ namespace FP64Emulation
      * Scale and GEMM share the same chunk — one scale launch followed by one
      * batched GEMM per pass.  The final pass handles the remainder naturally
      * via min(chunk, effective_s - chunk_start).                             */
-    static unsigned compute_chunk_size(int64_t m, int64_t n, int64_t k, unsigned s)
+    static unsigned compute_chunk_size(int64_t m, int64_t n, int64_t k, unsigned s,
+                                    size_t budget)
     {
         const size_t mn4    = static_cast<size_t>(m) * static_cast<size_t>(n) * 4u;
         const size_t lda8i  = pad(static_cast<size_t>(k));
@@ -95,7 +90,7 @@ namespace FP64Emulation
 
         size_t chunk = s;
         if(mn4 > 0u || slc > 0u)
-            chunk = std::min(chunk, OZ2_CHUNK_TARGET_BYTES / (mn4 + slc));
+            chunk = std::min(chunk, budget / (mn4 + slc));
         return static_cast<unsigned>(std::max(size_t(1u), chunk));
     }
 
@@ -104,7 +99,8 @@ namespace FP64Emulation
      * to fit in the budget, so the INT32 output term (mn4) is excluded.
      * A larger chunk (up to s) is achievable, potentially fitting all S moduli
      * in a single scale pass and eliminating the need for binary M/N halving.  */
-    static unsigned compute_chunk_size_fused(int64_t m, int64_t n, int64_t k, unsigned s)
+    static unsigned compute_chunk_size_fused(int64_t m, int64_t n, int64_t k, unsigned s,
+                                          size_t budget)
     {
         const size_t lda8i  = pad(static_cast<size_t>(k));
         const size_t cola8i = pad(static_cast<size_t>(m));
@@ -112,7 +108,7 @@ namespace FP64Emulation
             = lda8i * cola8i + lda8i * static_cast<size_t>(n); /* A8i + B8i per modulus */
         size_t chunk = s;
         if(slc > 0u)
-            chunk = std::min(chunk, OZ2_CHUNK_TARGET_BYTES / slc);
+            chunk = std::min(chunk, budget / slc);
         return static_cast<unsigned>(std::max(size_t(1u), chunk));
     }
 
@@ -205,7 +201,8 @@ namespace FP64Emulation
                                            int64_t  k,
                                            unsigned num_moduli,
                                            int      device,
-                                           bool     dynamic_mode)
+                                           bool     dynamic_mode,
+                                           size_t   budget)
     {
         using K           = PerfModelKernelEffs;
         const auto hw_opt = get_perf_model_params(device);
@@ -222,7 +219,7 @@ namespace FP64Emulation
         const double kn  = static_cast<double>(k) * static_cast<double>(n);
         const double mnk = mn * static_cast<double>(k);
 
-        const double chunk_sz       = static_cast<double>(compute_chunk_size(m, n, k, num_moduli));
+        const double chunk_sz       = static_cast<double>(compute_chunk_size(m, n, k, num_moduli, budget));
         const double n_chunks       = std::ceil(s / chunk_sz);
         const double n_scale_chunks = n_chunks; /* scale and GEMM share the same chunk */
 
@@ -289,6 +286,11 @@ namespace FP64Emulation
                 t_native * s2ms};
     }
 
+    /* Minimum problem size for efficient INT8 tensor core execution.
+     * Below this threshold MFMA tiles are under-utilised and native DGEMM wins.
+     * Both effective_time_ms and emulated_gemm_impl fall back immediately.      */
+    static constexpr int64_t FP64_EMUL_MIN_MN = 16;
+
     /* Returns the minimum achievable emulation time in ms, accounting for the
      * recursive binary-halving that fp64EmulatedGemm applies when n_chunks > 1.
      * Both halves execute sequentially so the effective time is additive.
@@ -305,11 +307,14 @@ namespace FP64Emulation
                                     int64_t  k,
                                     unsigned s,
                                     int      device,
-                                    bool     dynamic_mode)
+                                    bool     dynamic_mode,
+                                    size_t   budget)
     {
-        const double t_mono = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode).t_total_ms;
+        if(m < FP64_EMUL_MIN_MN || n < FP64_EMUL_MIN_MN)
+            return perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget).t_native_ms;
+        const double t_mono = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget).t_total_ms;
 
-        const unsigned chunk_sz = compute_chunk_size(m, n, k, s);
+        const unsigned chunk_sz = compute_chunk_size(m, n, k, s, budget);
         const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
         if(n_chunks > 1u)
         {
@@ -320,7 +325,7 @@ namespace FP64Emulation
             /* Both halves are nearly identical in size (differ by at most 1 when
              * m or n is odd), so approximate t_split = 2 × t_half.             */
             const double t_split
-                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode);
+                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode, budget);
             if(t_split < t_mono)
                 return t_split;
         }
@@ -338,11 +343,12 @@ namespace FP64Emulation
                                                      int64_t  k,
                                                      unsigned s,
                                                      int      device,
-                                                     bool     dynamic_mode)
+                                                     bool     dynamic_mode,
+                                                     size_t   budget)
     {
-        PerfModelTimes mono = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode);
+        PerfModelTimes mono = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget);
 
-        const unsigned chunk_sz = compute_chunk_size(m, n, k, s);
+        const unsigned chunk_sz = compute_chunk_size(m, n, k, s, budget);
         const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
         if(n_chunks > 1u)
         {
@@ -351,14 +357,11 @@ namespace FP64Emulation
             const int64_t half_n  = split_m ? n : n / 2;
 
             const double t_split
-                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode);
+                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode, budget);
             if(t_split < mono.t_total_ms)
             {
-                /* Recurse on one half, then double all components.
-                 * Both halves are ≈ equal in size so the approximation is exact
-                 * when m (or n) is even and negligible otherwise.               */
                 PerfModelTimes half = effective_perf_model_times(
-                    tA, tB, half_m, half_n, k, s, device, dynamic_mode);
+                    tA, tB, half_m, half_n, k, s, device, dynamic_mode, budget);
                 half.t_prelim_ms *= 2.0;
                 half.t_prelim_gemm_ms *= 2.0;
                 half.t_refine_ms *= 2.0;
@@ -2072,20 +2075,47 @@ namespace FP64Emulation
                                                const Fp64EmulationSettings& settings,
                                                ProfileAccum*                prof)
     {
+        /* settings.num_moduli comes from fp64EmulationEffectiveNumModuli (≥2).
+         * The fp64EmulationNumModuli() fallback would return 0 if env var absent;
+         * fp64EmulationEffectiveNumModuli properly converts that to 16.           */
         const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
                                         ? settings.num_moduli
-                                        : fp64EmulationNumModuli();
+                                        : fp64EmulationEffectiveNumModuli(h);
+        /* Workspace budget: derive from workspace_bytes using two-call approach. */
+        const size_t W_wb_i   = settings.workspace_bytes;
+        const size_t co_i     = pad(static_cast<size_t>(m));
+        const size_t pn_i     = pad(static_cast<size_t>(n));
+        const size_t boh_i    = co_i*sizeof(int16_t)+pn_i*sizeof(int16_t)+sizeof(uint32_t)
+                              + co_i*sizeof(int32_t)+pn_i*sizeof(int32_t)+2*sizeof(float)
+                              + OZ2_INT8_GEMM_WS_BYTES;
+        const bool   ff_i     = (oz2_fused_mode() == Oz2FusedMode::ON);
+        const unsigned sl_i   = ff_i ? num_moduli : (settings.dynamic_mode ? S_MAX : num_moduli);
+        const size_t W1_i     = (W_wb_i > boh_i) ? W_wb_i - boh_i : 0u;
+        const unsigned cs1_i  = ff_i ? compute_chunk_size_fused(m, n, k, sl_i, W1_i)
+                                     : compute_chunk_size(m, n, k, sl_i, W1_i);
+        size_t ws_budget;
+        if(cs1_i < sl_i) {
+            const size_t zoh_i = 2u * co_i * static_cast<size_t>(n) * sizeof(double);
+            ws_budget = (W_wb_i > boh_i + zoh_i) ? W_wb_i - boh_i - zoh_i : 0u;
+        } else { ws_budget = W1_i; }
         {
             /* When fused mode is active (HIPBLASLT_EMULATION_FUSED=on/force), use the
              * fused chunk formula (no C32i in workspace budget): chunk_size = S for all
              * practical shapes → n_chunks = 1 → no binary-halving split.
              */
             const bool     fused_forced = (oz2_fused_mode() == Oz2FusedMode::ON);
-            const unsigned chunk_sz = fused_forced ? compute_chunk_size_fused(m, n, k, num_moduli)
-                                                   : compute_chunk_size(m, n, k, num_moduli);
+            const unsigned chunk_sz = fused_forced
+                                          ? compute_chunk_size_fused(m, n, k, num_moduli, ws_budget)
+                                          : compute_chunk_size(m, n, k, num_moduli, ws_budget);
             const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
 
-            if(n_chunks > 1u)
+            /* ws_budget == 0 means the Zhi/Zlo double-accumulator arrays (each m×n
+             * doubles) cannot fit alongside the INT8 arrays in the workspace.
+             * The monolithic path would write beyond the workspace buffer → unsafe.
+             * Force a binary spatial split on the larger of m or n to reduce m×n
+             * (and hence the Zhi/Zlo requirement) until ws_budget > 0.
+             * This case is also entered when n_chunks > 1 (multiple chunk passes). */
+            if(n_chunks > 1u || ws_budget == 0u)
             {
                 const bool    split_m = (m >= n);
                 const int64_t half_m  = split_m ? m / 2 : m;
@@ -2096,15 +2126,22 @@ namespace FP64Emulation
                 const int    device = h->device;
                 const bool   tA     = (opA != HIPBLAS_OP_N);
                 const bool   tB     = (opB != HIPBLAS_OP_N);
-                const double t_mono
-                    = perf_model_times(tA, tB, m, n, k, num_moduli, device, settings.dynamic_mode)
-                          .t_total_ms;
-                const double t_split
-                    = 2.
-                      * effective_time_ms(
-                          tA, tB, half_m, half_n, k, num_moduli, device, settings.dynamic_mode);
 
-                if(t_split < t_mono)
+                /* When ws_budget == 0, the performance model would return degenerate
+                 * predictions (chunk_size=1, always-split to tiny sub-GEMMs that look
+                 * fast but are not).  Skip the model and force the split immediately. */
+                const bool force_split = (ws_budget == 0u);
+                const double t_mono = force_split ? 0.0
+                    : perf_model_times(tA, tB, m, n, k, num_moduli, device, settings.dynamic_mode,
+                                       ws_budget)
+                          .t_total_ms;
+                const double t_split = force_split ? 0.0
+                    : 2.
+                      * effective_time_ms(
+                          tA, tB, half_m, half_n, k, num_moduli, device, settings.dynamic_mode,
+                          ws_budget);
+
+                if(force_split || t_split < t_mono)
                 {
                     {
                         rocblaslt_status st = emulated_gemm_impl(h,
@@ -2185,6 +2222,11 @@ namespace FP64Emulation
         }
         /* ── Existing monolithic path ────────────────────────────────────── */
 
+        /* Minimum problem size guard — see FP64_EMUL_MIN_MN. */
+        if(m < FP64_EMUL_MIN_MN || n < FP64_EMUL_MIN_MN)
+            return native_dgemm_fallback(h, opA, opB, m, n, k, alpha, A, lda, B, ldb,
+                                         beta, C, ldc, D, ldd, stream);
+
         const bool    _prof = (prof != nullptr);
         Ozaki2Context context;
         float         _t_prelim = 0, _t_prelim_gemm = 0, _t_refine = 0, _t_adp = 0, _t_fused = 0,
@@ -2212,8 +2254,9 @@ namespace FP64Emulation
         const bool     fused_forced = (oz2_fused_mode() == Oz2FusedMode::ON);
         const unsigned layout_moduli
             = fused_forced ? num_moduli : (settings.dynamic_mode ? S_MAX : num_moduli);
-        const unsigned chunk_size = fused_forced ? compute_chunk_size_fused(m, n, k, layout_moduli)
-                                                 : compute_chunk_size(m, n, k, layout_moduli);
+        const unsigned chunk_size = fused_forced
+                                       ? compute_chunk_size_fused(m, n, k, layout_moduli, ws_budget)
+                                       : compute_chunk_size(m, n, k, layout_moduli, ws_budget);
 
         const size_t lda8i  = pad(static_cast<size_t>(k));
         const size_t cola8i = pad(static_cast<size_t>(m));
@@ -2557,7 +2600,8 @@ namespace FP64Emulation
             if(get_perf_model_params(dev).has_value())
             {
                 const PerfModelTimes pm
-                    = perf_model_times(tA, tB, m, n, k, num_moduli, dev, settings.dynamic_mode);
+                    = perf_model_times(tA, tB, m, n, k, num_moduli, dev, settings.dynamic_mode,
+                                       ws_budget);
                 /* Gate: fused replaces only INT8 GEMM + accum; scale always runs.
                  * Works for all transpose combinations (A8i/B8i always in canonical format).
                  * HIPBLASLT_EMULATION_FUSED=off disables the fused path entirely;
@@ -2778,27 +2822,16 @@ namespace FP64Emulation
         return took_fused_path ? fused_st : rocblaslt_status_success;
     }
 
-    /* =========================================================================
-     * fp64EmulatedGemm — public wrapper
-     *
-     * Owns the profiling accumulator.  Records a single HIP event pair around
-     * the entire call (including all recursive sub-GEMMs) to measure the true
-     * GPU wall-clock time, then writes one summary CSV row with:
-     *   – summed component times across all leaf sub-GEMMs
-     *   – the measured t_total_ms for the full call
-     *   – num_sub_gemms (number of monolithic leaf calls executed)
-     * ========================================================================= */
-
 } // namespace FP64Emulation
 
 bool fp64EmulationIsEnabled()
 {
-    using namespace FP64Emulation;
-    static const bool enabled = []() -> bool {
-        const char* v = std::getenv("HIPBLASLT_EMULATE_DOUBLE_PRECISION");
-        return (v != nullptr && std::strcmp(v, "1") == 0);
+    static const bool v = []() -> bool {
+        const auto parsed = fp64EmulationParseEnabledEnv(
+            std::getenv("HIPBLASLT_EMULATE_DOUBLE_PRECISION"));
+        return parsed.state == FP64_EMULATION_ENV_VALID && parsed.value != 0u;
     }();
-    return enabled;
+    return v;
 }
 
 bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
@@ -2806,7 +2839,8 @@ bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
                                    hipblasOperation_t       opB,
                                    int64_t                  m,
                                    int64_t                  n,
-                                   int64_t                  k)
+                                   int64_t                  k,
+                                   size_t                   workspace_bytes)
 {
     using namespace FP64Emulation;
     const int  device = h->device;
@@ -2814,34 +2848,55 @@ bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
     const bool tB     = (opB != HIPBLAS_OP_N);
     /* Include ADP overhead when the handle is configured for dynamic (ADP) mode,
      * so the performance gate correctly accounts for the hipStreamSynchronize cost. */
-    const bool     dyn        = (h->emulation.num_moduli < 2) &&
-                               (std::getenv("HIPBLASLT_EMULATION_NUM_MODULI") == nullptr);
+    /* ADP (dynamic) mode: handle is at sentinel (-1) AND the env var is not
+     * set to a valid fixed count.  Use the cached helper — same pattern as
+     * fp64EmulationIsEager() — to avoid raw getenv() calls at the call site. */
+    /* ADP: handle sentinel (-1) AND env var absent (returns 0). */
+    const bool     dyn        = (h->emulation.num_moduli < 2) && (fp64EmulationNumModuli() == 0u);
     const unsigned num_moduli = fp64EmulationEffectiveNumModuli(h);
-    const double   t_emul     = effective_time_ms(tA, tB, m, n, k, num_moduli, device, dyn);
-    const double t_native = perf_model_times(tA, tB, m, n, k, num_moduli, device, dyn).t_native_ms;
+    /* Compute effective budget from workspace_bytes.
+     * SIZE_MAX (default) = no constraint → chunk_size = s (optimal). */
+    size_t budget;
+    {
+        const bool   fused_g = (oz2_fused_mode() == Oz2FusedMode::ON);
+        const unsigned s_lay = (dyn && !fused_g) ? S_MAX : num_moduli;
+        const size_t co_g = pad(static_cast<size_t>(m)), pn_g = pad(static_cast<size_t>(n));
+        const size_t boh = co_g*sizeof(int16_t)+pn_g*sizeof(int16_t)+sizeof(uint32_t)
+                         + co_g*sizeof(int32_t)+pn_g*sizeof(int32_t)+2*sizeof(float)
+                         + OZ2_INT8_GEMM_WS_BYTES;
+        const size_t W1 = (workspace_bytes > boh) ? workspace_bytes - boh : 0u;
+        const unsigned cs1 = fused_g ? compute_chunk_size_fused(m, n, k, s_lay, W1)
+                                     : compute_chunk_size(m, n, k, s_lay, W1);
+        if(cs1 < s_lay) {
+            const size_t zoh = 2u * co_g * static_cast<size_t>(n) * sizeof(double);
+            budget = (workspace_bytes > boh + zoh) ? workspace_bytes - boh - zoh : 0u;
+        } else { budget = W1; }
+    }
+    const double   t_emul     = effective_time_ms(tA, tB, m, n, k, num_moduli, device, dyn, budget);
+    const double t_native = perf_model_times(tA, tB, m, n, k, num_moduli, device, dyn, ~size_t{0}).t_native_ms;
     return t_emul <= t_native;
 }
 
 bool fp64EmulationIsEager()
 {
-    using namespace FP64Emulation;
-    static const bool eager = []() -> bool {
-        const char* v = std::getenv("HIPBLASLT_EMULATION_STRATEGY");
-        return (v != nullptr && std::strcmp(v, "eager") == 0);
+    static const bool v = []() -> bool {
+        const auto parsed = fp64EmulationParseStrategyEnv(
+            std::getenv("HIPBLASLT_EMULATION_STRATEGY"));
+        return parsed.state == FP64_EMULATION_ENV_VALID &&
+               parsed.value == static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_EAGER);
     }();
-    return eager;
+    return v;
 }
+
 
 uint32_t fp64EmulationSpecialValuesMask()
 {
-    using namespace FP64Emulation;
-    static const uint32_t mask = []() -> uint32_t {
-        const char* v = std::getenv("HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK");
-        if(v == nullptr)
-            return 0x3u;
-        return static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+    static const uint32_t v = []() -> uint32_t {
+        const auto parsed = fp64EmulationParseSpecialValuesMaskEnv(
+            std::getenv("HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK"));
+        return (parsed.state == FP64_EMULATION_ENV_VALID) ? parsed.value : 0x3u;
     }();
-    return mask;
+    return v;
 }
 
 bool fp64EmulationWouldApply(const _rocblaslt_handle* h,
@@ -2851,7 +2906,7 @@ bool fp64EmulationWouldApply(const _rocblaslt_handle* h,
                              int64_t                  m,
                              int64_t                  n,
                              int64_t                  k,
-                             int                      batch_count)
+                             int32_t                  batch_count)
 {
     using namespace FP64Emulation;
     if(type_a != HIP_R_64F || batch_count != 1)
@@ -2867,7 +2922,7 @@ bool fp64EmulationWouldApply(const _rocblaslt_handle* h,
         return false;
     const bool eager
         = (h->emulation.strategy == 2) || (h->emulation.strategy != 1 && fp64EmulationIsEager());
-    return eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k);
+    return eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, /*workspace_bytes=*/~size_t{0u});
 }
 
 Fp64EmulationEnvValue fp64EmulationParseEnabledEnv(const char* value)
@@ -2908,6 +2963,18 @@ Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value)
     return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
 }
 
+Fp64EmulationEnvValue fp64EmulationParseNumModuliEnv(const char* value)
+{
+    using namespace FP64Emulation;
+    if(value == nullptr)
+        return {FP64_EMULATION_ENV_UNSET, 0u};
+    char*      endp = nullptr;
+    const long n    = std::strtol(value, &endp, 10);
+    if(endp == value || *endp != '\0' || n < 2 || n > static_cast<long>(S_MAX))
+        return {FP64_EMULATION_ENV_INVALID, 0u};
+    return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(n)};
+}
+
 
 
 Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
@@ -2917,7 +2984,8 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
                                             int64_t                  m,
                                             int64_t                  n,
                                             int64_t                  k,
-                                            int                      batch_count)
+                                            int32_t                  batch_count,
+                                            size_t                   workspace_bytes)
 {
     /* Setting Precedence (highest to lowest):
      *   1. Handle setter (hipblasLtSet* functions) — set after handle creation;
@@ -2933,7 +3001,7 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
     Fp64EmulationDecision result{};
     result.status       = rocblaslt_status_success;
     result.apply        = false;
-    result.num_moduli   = fp64EmulationNumModuli();
+    result.num_moduli   = S_MAX; /* ADP upper-bound; overridden below by fp64EmulationEffectiveNumModuli */
     result.sv_mask      = fp64EmulationSpecialValuesMask();
     result.dynamic_mode = false;
 
@@ -2964,13 +3032,15 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
     /* ADP when no fixed count is set on the handle AND env var is not set.
      * num_moduli ∈ [2..18] on the handle → FIXED; -1 (sentinel) → check env var.
      * Env var HIPBLASLT_EMULATION_NUM_MODULI set → FIXED; absent → ADP.        */
-    result.dynamic_mode = (h->emulation.num_moduli < 2) &&
-                          (std::getenv("HIPBLASLT_EMULATION_NUM_MODULI") == nullptr);
+    /* ADP (dynamic) mode: handle is at sentinel (-1) AND env var is not set.
+     * Use the cached fp64EmulationNumModuliIsFixed() — avoids raw getenv(). */
+    /* ADP: handle sentinel (-1) AND env var absent (fp64EmulationNumModuli() == 0). */
+    result.dynamic_mode = (h->emulation.num_moduli < 2) && (fp64EmulationNumModuli() == 0u);
 
     /* Strategy (eager vs performant). */
     const bool eager
         = (h->emulation.strategy == 2) || (h->emulation.strategy != 1 && fp64EmulationIsEager());
-    if(eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k))
+    if(eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, workspace_bytes))
         result.apply = true;
 
     return result;
@@ -2979,10 +3049,16 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
 {
     using namespace FP64Emulation;
-    /* num_moduli ∈ [2..18] → FIXED with that count; -1 → ADP (use env var or default). */
+    /* Priority: handle setter > env var > built-in default (16 = ADP upper bound).
+     * handle ∈ [2..18] → FIXED from handle.
+     * handle == -1 (sentinel) → check env var; if absent → default 16 for ADP.  */
     if(h->emulation.num_moduli >= 2 && h->emulation.num_moduli <= static_cast<int>(S_MAX))
         return static_cast<unsigned>(h->emulation.num_moduli);
-    return fp64EmulationNumModuli();
+    const unsigned env_s = fp64EmulationNumModuli();
+    /* 0 = env var absent → ADP mode: return S_MAX as the moduli upper bound.
+     * ADP selects the actual per-call s from the data; the workspace always
+     * uses S_MAX.  Fixed env var → use that exact count.                    */
+    return env_s != 0u ? env_s : S_MAX;
 }
 
 size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
@@ -2999,11 +3075,7 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
      * adaptive effective_s fits without reallocation.  In fixed mode use
      * the resolved moduli count directly.                                   */
     const unsigned num_moduli = decision.dynamic_mode ? S_MAX : decision.num_moduli;
-    const int      device     = h->device;
-    const bool     tA         = (opA != HIPBLAS_OP_N);
-    const bool     tB         = (opB != HIPBLAS_OP_N);
-
-    /* Mirror the splitting decision in emulated_gemm_impl exactly.
+    /* Optimal workspace: chunk_size = s (all moduli in one pass).
      *
      * emulated_gemm_impl uses settings.num_moduli (= fp64EmulationEffectiveNumModuli(h))
      * for the chunk-size / n_chunks check that decides whether to split, regardless of
@@ -3021,35 +3093,8 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
      * binary-halving for all practical shapes, avoiding per-leaf pipeline overhead.
      * Consistent with the split decision in emulated_gemm_impl.              */
     const bool     fused_on_ws = (oz2_fused_mode() == Oz2FusedMode::ON);
-    const unsigned chunk_sz    = fused_on_ws ? compute_chunk_size_fused(m, n, k, split_num_moduli)
-                                             : compute_chunk_size(m, n, k, split_num_moduli);
-    const unsigned n_chunks    = (split_num_moduli + chunk_sz - 1u) / chunk_sz;
-
-    if(n_chunks > 1u)
-    {
-        const bool    split_m = (m >= n);
-        const int64_t half_m  = split_m ? m / 2 : m;
-        const int64_t half_n  = split_m ? n : n / 2;
-        const int64_t m2      = split_m ? (m - m / 2) : m;
-        const int64_t n2      = split_m ? n : (n - n / 2);
-
-        const double t_mono
-            = perf_model_times(tA, tB, m, n, k, split_num_moduli, device, decision.dynamic_mode)
-                  .t_total_ms;
-        const double t_split
-            = 2.
-              * effective_time_ms(
-                  tA, tB, half_m, half_n, k, split_num_moduli, device, decision.dynamic_mode);
-
-        if(t_split < t_mono)
-        {
-            /* num_moduli (= ws_moduli) is forwarded to the recursive calls so that
-             * the monolithic workspace at each leaf is sized for the correct layout
-             * (e.g. S_MAX in dynamic mode, matching layout_moduli in the impl). */
-            return std::max(fp64EmulationWorkspaceSize(h, opA, opB, half_m, half_n, k, decision),
-                            fp64EmulationWorkspaceSize(h, opA, opB, m2, n2, k, decision));
-        }
-    }
+    /* Optimal workspace: chunk_size = split_num_moduli (single pass, no budget constraint).
+     * n_chunks = 1 → split check never fires.  Always return monolithic workspace.  */
 
     /* Monolithic path workspace. */
     const size_t lda8i  = pad(static_cast<size_t>(k));
@@ -3060,8 +3105,8 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
     const size_t szC32i = ldc32i * static_cast<size_t>(n);
     /* Fused path: no C32i workspace needed for production (registers hold it).
      * Non-fused path: standard chunk formula (includes C32i in budget).        */
-    const unsigned chunk_ws = fused_on_ws ? compute_chunk_size_fused(m, n, k, num_moduli)
-                                          : compute_chunk_size(m, n, k, num_moduli);
+    /* chunk_ws = num_moduli: optimal single-pass workspace (no budget constraint). */
+    const unsigned chunk_ws = num_moduli;
 
     /* Zhi/Zlo accumulators are only needed when there are multiple passes
      * (chunk_ws < num_moduli).  Single-pass finalize writes D directly.  */
@@ -3085,21 +3130,29 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
 
 unsigned fp64EmulationNumModuli()
 {
-    using namespace FP64Emulation;
-    static const unsigned num_moduli = []() -> unsigned {
-        /* HIPBLASLT_EMULATION_NUM_MODULI: direct moduli count [2..18]. */
-        const char* vn = std::getenv("HIPBLASLT_EMULATION_NUM_MODULI");
-        if(vn != nullptr)
-        {
-            const long n = std::strtol(vn, nullptr, 10);
-            if(n >= 2 && n <= static_cast<long>(S_MAX))
-                return static_cast<unsigned>(n);
-        }
-        return 16u; /* default: 16 moduli (ADP mode) */
+    /* Returns 0 when the env var is absent or invalid, meaning pure ADP mode.
+     * Returns [2..S_MAX] when the env var sets a fixed moduli count.
+     * Callers that need a concrete upper bound for ADP should substitute S_MAX
+     * for a 0 return value; use fp64EmulationEffectiveNumModuli(h) to get the
+     * fully resolved count (handle override → env var → S_MAX for ADP).       */
+    static const unsigned v = []() -> unsigned {
+        const auto parsed = fp64EmulationParseNumModuliEnv(
+            std::getenv("HIPBLASLT_EMULATION_NUM_MODULI"));
+        return (parsed.state == FP64_EMULATION_ENV_VALID) ? parsed.value : 0u;
     }();
-    return num_moduli;
+    return v;
 }
 
+/* =========================================================================
+ * fp64EmulatedGemm — public wrapper
+ *
+ * Owns the profiling accumulator.  Records a single HIP event pair around
+ * the entire call (including all recursive sub-GEMMs) to measure the true
+ * GPU wall-clock time, then writes one summary CSV row with:
+ *   – summed component times across all leaf sub-GEMMs
+ *   – the measured t_total_ms for the full call
+ *   – num_sub_gemms (number of monolithic leaf calls executed)
+ * ========================================================================= */
 rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                                   hipblasOperation_t           opA,
                                   hipblasOperation_t           opB,
@@ -3120,41 +3173,102 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                                   const Fp64EmulationSettings& settings)
 {
     using namespace FP64Emulation;
-    /* ── Pre-allocate a single workspace for the entire call ──────────────────
-     * emulated_gemm_impl recurses for split shapes; without a pre-allocated
-     * buffer each leaf sub-GEMM would do its own hipMallocAsync/hipFreeAsync.
-     * Allocating once here and passing it through settings eliminates that
-     * overhead (e.g. 16 redundant alloc/free pairs for the 65K square case).
-     * If the caller already provided a sufficient workspace we use it as-is.  */
+    /* ── Change 4: Workspace Graceful Degradation ────────────────────────────
+     * No internal hipMalloc.  The caller must provide workspace via
+     * settings.workspace / settings.workspace_bytes.  If none is provided
+     * or the budget makes emulation slower than native, fall back to native. */
     const _rocblaslt_handle* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
+    /* Use the effective resolved count; 0 from fp64EmulationNumModuli() means
+     * env var absent → substitute the ADP default of 16.                      */
     const unsigned num_moduli  = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
                                      ? settings.num_moduli
-                                     : fp64EmulationNumModuli();
+                                     : fp64EmulationEffectiveNumModuli(
+                                           reinterpret_cast<const _rocblaslt_handle*>(handle));
     const int      device      = h->device;
-    /* Build a lightweight decision just to communicate dynamic_mode and
-     * num_moduli to fp64EmulationWorkspaceSize — only those two fields are
-     * consulted by the workspace function.                                  */
-    Fp64EmulationDecision ws_decision{};
-    ws_decision.dynamic_mode = settings.dynamic_mode;
-    ws_decision.num_moduli   = num_moduli;
-    const size_t wsNeeded    = fp64EmulationWorkspaceSize(h, opA, opB, m, n, k, ws_decision);
 
     Fp64EmulationSettings effectiveSettings = settings;
-    void*                 ws_toplevel       = nullptr;
 
-    if(wsNeeded > 0
-       && (effectiveSettings.workspace == nullptr || effectiveSettings.workspace_bytes < wsNeeded))
     {
-        /* Use hipMalloc (not hipMallocAsync) so that:
-         *  (1) The allocation is not affected by any HIP stream error state from
-         *      a previous GPU fault on the same stream.  hipMallocAsync fails
-         *      immediately when the stream has a sticky error, even with plenty
-         *      of free device memory.
-         */
-        if(hipMalloc(&ws_toplevel, wsNeeded) != hipSuccess)
+        const size_t W = settings.workspace_bytes;
+        const void*  P = settings.workspace;
+
+        static std::atomic<int> s_ws_absent_warns{0};
+        static std::atomic<int> s_ws_small_warns{0};
+
+        /* Case 1: no workspace — warn + fall back immediately. */
+        if(P == nullptr || W == 0)
+        {
+            if(s_ws_absent_warns.fetch_add(1, std::memory_order_relaxed) < 5)
+                hipblaslt_cerr
+                    << "[hipBLASLt WARNING] FP64 emulation requires a workspace.\n"
+                    << "  Call hipblasLtEmulationWorkspaceSize() for the optimal size.\n"
+                    << "  Falling back to native DGEMM." << std::endl;
             return rocblaslt_status_memory_error;
-        effectiveSettings.workspace       = ws_toplevel;
-        effectiveSettings.workspace_bytes = wsNeeded;
+        }
+
+        /* Case 2: workspace provided — compute budget-constrained chunk_size. */
+        const bool tA_g = (opA != HIPBLAS_OP_N), tB_g = (opB != HIPBLAS_OP_N);
+        const bool dyn_g = effectiveSettings.dynamic_mode;
+        const bool fused_g = (oz2_fused_mode() == Oz2FusedMode::ON);
+
+        const size_t cola8i_g = pad(static_cast<size_t>(m));
+        const size_t padn_g   = pad(static_cast<size_t>(n));
+        const size_t base_oh  =
+              cola8i_g * sizeof(int16_t)   /* sftA       */
+            + padn_g   * sizeof(int16_t)   /* sftB       */
+            + sizeof(uint32_t)              /* nan_flag   */
+            + cola8i_g * sizeof(int32_t)   /* row_max    */
+            + padn_g   * sizeof(int32_t)   /* col_max    */
+            + 2 * sizeof(float)             /* adp_buf    */
+            + OZ2_INT8_GEMM_WS_BYTES;       /* = 0        */
+
+        const unsigned s_layout_g = (dyn_g && !fused_g) ? S_MAX : num_moduli;
+        const size_t   W_var1 = (W > base_oh) ? W - base_oh : 0u;
+        const unsigned cs1    = compute_chunk_size(m, n, k, s_layout_g, W_var1);
+
+        size_t W_var;
+        if(cs1 < s_layout_g)
+        {
+            const size_t ldc32i_g  = cola8i_g;
+            const size_t szC32i_g  = ldc32i_g * static_cast<size_t>(n);
+            const size_t zlo_oh    = 2u * szC32i_g * sizeof(double);
+            W_var = (W > base_oh + zlo_oh) ? W - base_oh - zlo_oh : 0u;
+        }
+        else { W_var = W_var1; }
+
+        /* EAGER strategy means "always emulate, bypass the performance model".
+         * Only apply the performance gate in PERFORMANT mode.
+         * In EAGER mode the gate is skipped so small N problems (where the
+         * performance model is inaccurate and incorrectly predicts emulation
+         * is slower) still proceed with emulation as the user requested.      */
+        const bool is_eager_g = (h->emulation.strategy == 2) ||
+                                 (h->emulation.strategy != 1 && fp64EmulationIsEager());
+
+        const double t_emul_W  = is_eager_g ? 0.0
+            : effective_time_ms(tA_g, tB_g, m, n, k, num_moduli, device, dyn_g, W_var);
+        const double t_native_g = is_eager_g ? 1.0
+            : perf_model_times(tA_g, tB_g, m, n, k, num_moduli,
+                               device, dyn_g, ~size_t{0}).t_native_ms;
+        if(!is_eager_g && t_emul_W > t_native_g)
+        {
+            const double t_emul_opt = effective_time_ms(tA_g, tB_g, m, n, k,
+                                                        num_moduli, device, dyn_g, ~size_t{0});
+            if(t_emul_opt <= t_native_g
+               && s_ws_small_warns.fetch_add(1, std::memory_order_relaxed) < 5)
+            {
+                Fp64EmulationDecision ws_dec{};
+                ws_dec.dynamic_mode = dyn_g;
+                ws_dec.num_moduli   = num_moduli;
+                const size_t opt_ws = fp64EmulationWorkspaceSize(h, opA, opB, m, n, k, ws_dec);
+                hipblaslt_cerr
+                    << "[hipBLASLt WARNING] FP64 emulation workspace (" << (W >> 20)
+                    << " MiB) too small (m=" << m << ",n=" << n << ",k=" << k << ").\n"
+                    << "  Optimal: " << (opt_ws >> 20) << " MiB."
+                    << " Falling back to native DGEMM." << std::endl;
+            }
+            return rocblaslt_status_memory_error;
+        }
+
     }
     /* ────────────────────────────────────────────────────────────────────── */
 
@@ -3190,10 +3304,6 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                                                    effectiveSettings,
                                                    _prof ? &accum : nullptr);
 
-    /* Release the top-level workspace now that all leaves have finished.    */
-    if(ws_toplevel != nullptr)
-        (void)hipFree(ws_toplevel);
-
     if(_prof)
     {
         (void)hipEventRecord(ev_end, stream);
@@ -3204,14 +3314,14 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
         /* Use effective_s_used for profiling chunk sizes so the CSV reflects
          * what was actually computed per pass (not the configured maximum).  */
         const unsigned prof_s     = accum.effective_s_used ? accum.effective_s_used : num_moduli;
-        const unsigned chunk_size = compute_chunk_size(m, n, k, prof_s);
+        const unsigned chunk_size = compute_chunk_size(m, n, k, prof_s, ~size_t{0});
         const unsigned scale_chunk_size = chunk_size;
         const bool     tA               = (opA != HIPBLAS_OP_N);
         const bool     tB               = (opB != HIPBLAS_OP_N);
         /* Use the split-aware model: each component is the sum across all leaves.
          * t_native_ms remains for the original (m,n,k) problem.           */
         const PerfModelTimes pm = effective_perf_model_times(
-            tA, tB, m, n, k, num_moduli, device, settings.dynamic_mode);
+            tA, tB, m, n, k, num_moduli, device, settings.dynamic_mode, ~size_t{0});
 
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f)
@@ -3242,7 +3352,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                          accum.effective_s_used,
                          scale_chunk_size,
                          chunk_size,
-                         (unsigned long long)wsNeeded,
+                         (unsigned long long)settings.workspace_bytes,
                          accum.n_sub_gemms,
                          accum.t_prelim,
                          accum.t_prelim_gemm,

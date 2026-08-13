@@ -191,26 +191,32 @@ double box_muller(double u1, double u2)
     return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
 }
 
+/* Grid-stride loop so that a capped grid can cover arbitrarily many elements.
+ * Needed for N=65536 where n_elems = 2^32 would require grd > 16M blocks,
+ * potentially exceeding the HIP grid-dimension limit.                         */
 __global__ static void
 randmat_kernel(size_t n_elems, double* __restrict__ A, double phi, uint64_t seed)
 {
-    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if(idx >= n_elems) return;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for(size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        idx < n_elems;
+        idx += stride)
+    {
+        uint64_t s = seed ^ (idx * 0x9e3779b97f4a7c15ULL + 1442695040888963407ULL);
+        s = xorshift64(s);
+        s = xorshift64(s);
 
-    uint64_t s = seed ^ (idx * 0x9e3779b97f4a7c15ULL + 1442695040888963407ULL);
-    s = xorshift64(s);
-    s = xorshift64(s);
+        uint64_t b0 = xorshift64(s);
+        uint64_t b1 = xorshift64(b0);
+        uint64_t b2 = xorshift64(b1);
 
-    uint64_t b0 = xorshift64(s);
-    uint64_t b1 = xorshift64(b0);
-    uint64_t b2 = xorshift64(b1);
+        const double u0 = bits_to_uniform(b0);
+        const double u1 = bits_to_uniform(b1);
+        const double u2 = bits_to_uniform(b2);
 
-    const double u0 = bits_to_uniform(b0);
-    const double u1 = bits_to_uniform(b1);
-    const double u2 = bits_to_uniform(b2);
-
-    const double randn = box_muller(u0, u1);
-    A[idx] = (phi < 0.0) ? randn : ((u2 - 0.5) * exp(randn * phi));
+        const double randn = box_muller(u0, u1);
+        A[idx] = (phi < 0.0) ? randn : ((u2 - 0.5) * exp(randn * phi));
+    }
 }
 
 /* =========================================================================
@@ -311,7 +317,10 @@ static void launch_randmat(size_t m, size_t n, double* d_A, double phi,
 {
     const size_t n_elems = m * n;
     const unsigned blk   = 256u;
-    const unsigned grd   = static_cast<unsigned>((n_elems + blk - 1) / blk);
+    /* Cap grid to 65535 so total thread count never overflows 32-bit.
+     * The kernel uses a grid-stride loop to cover all elements.        */
+    const size_t  n_grd  = (n_elems + blk - 1) / blk;
+    const unsigned grd   = static_cast<unsigned>(std::min(n_grd, size_t(65535)));
     hipLaunchKernelGGL(randmat_kernel, dim3(grd), dim3(blk), 0, stream,
                        n_elems, d_A, phi, seed);
     HIP_CHECK(hipGetLastError());
@@ -544,6 +553,15 @@ struct Config {
     /* true  -> HIPBLASLT_EMULATION_STRATEGY_EAGER  (default, always emulate)
      * false -> HIPBLASLT_EMULATION_STRATEGY_PERFORMANT (perf-model gate)   */
     bool                run_eager    = true;
+    /* Workspace budget offered to hipblasLtMatmulAlgoGetHeuristic.
+     * size_t(-1) = unlimited (let the library pick the best algorithm);
+     * a finite value caps the workspace so only algorithms that fit within
+     * this budget are considered.  Use --workspace-bytes to set this.       */
+    size_t              ws_budget    = size_t(-1);
+    /* Number of native DGEMM warmup iterations to run before the main sweep.
+     * Drains the GPU burst-frequency boost so all algo comparisons happen at
+     * the same sustained clock.  Default 10 × ~15 ms ≈ 150 ms for N=8192.  */
+    unsigned            global_warmup = 10;
 };
 
 static void print_usage(const char* prog)
@@ -568,6 +586,16 @@ static void print_usage(const char* prog)
         "  --no-check     Skip the double-double reference GEMM and error\n"
         "                 computation.  err_max and err_med are printed as 'nan'.\n"
         "                 Useful for fast timing-only sweeps at large N.\n"
+        "  --workspace-bytes W\n"
+        "                 Cap the workspace budget offered to hipBLASLt (bytes).\n"
+        "                 Default: unlimited (library picks the optimal algorithm).\n"
+        "                 Use this to measure performance under a fixed workspace\n"
+        "                 constraint, e.g. --workspace-bytes 4294967296 for 4 GiB.\n"
+        "  --global-warmup G\n"
+        "                 Number of native DGEMM warmup iterations to run before the\n"
+        "                 main sweep (default: 10).  Drains the GPU burst-frequency\n"
+        "                 boost so all algos are measured at the sustained clock.\n"
+        "                 Use 0 to skip the warmup entirely.\n"
         "  -h, --help     Print this help and exit\n"
         "\n"
         "Output: CSV columns: phi,N,transa,transb,algo,crt_bits,err_max,err_med,ms_per_run\n"
@@ -641,6 +669,10 @@ static Config parse_args(int argc, char** argv)
             cfg.run_eager = false;
         } else if(a == "--no-check") {
             cfg.check_errors = false;
+        } else if((a == "--workspace-bytes") && i + 1 < argc) {
+            cfg.ws_budget = static_cast<size_t>(std::stoull(argv[++i]));
+        } else if((a == "--global-warmup") && i + 1 < argc) {
+            cfg.global_warmup = static_cast<unsigned>(std::stoul(argv[++i]));
         } else {
             std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
             print_usage(argv[0]);
@@ -685,8 +717,13 @@ int main(int argc, char** argv)
                  N, num_runs, cfg.min_s, cfg.max_s);
     for(size_t i = 0; i < cfg.phi_list.size(); ++i)
         std::fprintf(stderr, "%s%.4g", (i ? "," : ""), cfg.phi_list[i]);
-    std::fprintf(stderr, "]  strategy=%s\n\n",
-                 cfg.run_eager ? "eager" : "performant");
+    if(cfg.ws_budget == size_t(-1))
+        std::fprintf(stderr, "]  ws_budget=unlimited  strategy=%s\n\n",
+                     cfg.run_eager ? "eager" : "performant");
+    else
+        std::fprintf(stderr, "]  ws_budget=%.3f GiB  strategy=%s\n\n",
+                     cfg.ws_budget / static_cast<double>(1ull << 30),
+                     cfg.run_eager ? "eager" : "performant");
 
     /* -- GPU allocations ---------------------------------------------------- */
     double*  d_A    = nullptr;
@@ -707,21 +744,37 @@ int main(int argc, char** argv)
 
     /*
      * Workspace budget offered to hipblasLtMatmulAlgoGetHeuristic.
-     * Setting this large lets the heuristic choose the optimal algorithm;
-     * the actual memory allocated per-run equals heur.workspaceSize, which
-     * the emulation library computes exactly from the problem size and s.
+     * By default (size_t(-1)) the heuristic is free to pick any algorithm;
+     * --workspace-bytes caps this so only algorithms fitting within the
+     * budget are considered.  The actual allocation (ws_bytes) grows lazily
+     * to match heur.workspaceSize, which is ≤ WS_BUDGET.
      */
-    constexpr size_t WS_BUDGET = size_t(-1);    /* no limit */
+    const size_t WS_BUDGET = cfg.ws_budget;
     size_t ws_bytes = 0;
     void*  d_ws     = nullptr;
 
-    /* Grow the workspace buffer lazily to match what the heuristic requires. */
+    /* Grow the workspace buffer lazily up to min(needed, WS_BUDGET).
+     * When WS_BUDGET is unlimited (size_t(-1)) we allocate whatever the
+     * heuristic requests.  When a budget is set we cap the allocation so
+     * that hipblasLtMatmul receives at most WS_BUDGET bytes of workspace;
+     * the library must then either K-split or return an error.
+     * A [ws-cap] warning is printed to stderr whenever the cap is active. */
     auto ensure_ws = [&](size_t needed) {
-        if(needed > ws_bytes) {
+        const size_t to_alloc = (WS_BUDGET == size_t(-1))
+                               ? needed
+                               : std::min(needed, WS_BUDGET);
+        if(to_alloc > ws_bytes) {
             HIP_CHECK(hipFree(d_ws));
-            ws_bytes = needed;
+            ws_bytes = to_alloc;
             HIP_CHECK(hipMalloc(&d_ws, ws_bytes));
         }
+        if(WS_BUDGET != size_t(-1) && needed > WS_BUDGET)
+            std::fprintf(stderr,
+                "[ws-cap] requested=%.3f GiB  budget=%.3f GiB"
+                "  passing=%.3f GiB to hipblasLtMatmul\n",
+                needed / static_cast<double>(1ull << 30),
+                WS_BUDGET / static_cast<double>(1ull << 30),
+                ws_bytes / static_cast<double>(1ull << 30));
     };
 
     hipStream_t stream;
@@ -738,9 +791,38 @@ int main(int argc, char** argv)
     emulated.init(static_cast<int64_t>(N), /*emulation_enabled=*/true, WS_BUDGET);
     ensure_ws(emulated.workspaceSize());
 
+    /* -- Global GPU warm-up ------------------------------------------------- */
+    /* Run global_warmup native DGEMM iterations before any timed measurement.
+     * This drains the GPU burst-frequency boost so all subsequent measurements
+     * (DGEMM, adaptive, fixed-s) happen at the same sustained clock frequency.
+     * The warmup uses NN transpose (same as the runner's initial state);
+     * transpose is updated per-combination in the main sweep below.           */
+    if(cfg.global_warmup > 0) {
+        std::fprintf(stderr, "# Global GPU warm-up: %u native DGEMM iters (draining burst clock)...\n",
+                     cfg.global_warmup);
+        auto warmup_fn = [&]{ native.run(d_A, d_B, d_D, d_ws, ws_bytes, stream); };
+        for(unsigned i = 0; i < cfg.global_warmup; ++i) warmup_fn();
+        HIP_CHECK(hipStreamSynchronize(stream));
+        std::fprintf(stderr, "# Global warm-up complete.\n");
+    }
+
     /* -- CSV header --------------------------------------------------------- */
     std::printf("phi,N,transa,transb,algo,crt_bits,err_max,err_med,ms_per_run,workspace_MiB\n");
     std::fflush(stdout);
+
+    /* Number of warmup iterations for emulation calls.
+     * Native DGEMM is already warmed up by the global warmup above, so it
+     * only needs num_runs warmup iterations.  Emulation uses completely
+     * different shader code (scale, INT8 GEMM, CRT accumulation), so the
+     * global DGEMM warmup does not drain the emulation burst clock.  We
+     * therefore use at least global_warmup iterations of emulation warmup
+     * before each timed emulation measurement.                               */
+    /* Use num_runs + 2 extra warmup iterations for emulation calls.
+     * Two extra iterations drain the emulation burst clock (scale, INT8 GEMM,
+     * CRT accumulation kernels) without generating an excessive number of
+     * recursive leaf sub-GEMMs for large N (e.g. N=65536 with 4 GiB workspace).
+     * Using max(num_runs, global_warmup) was too many for large N.            */
+    const unsigned emul_warmup = num_runs + 2u;
 
     /* -- Main sweep: outer = transpose combination, inner = phi ------------- */
     for(const auto& tc : cfg.trans_list) {
@@ -806,16 +888,14 @@ int main(int argc, char** argv)
             ensure_ws(emu_ws);
 
             auto fn = [&]{ emulated.run(d_A, d_B, d_D, d_ws, ws_bytes, stream); };
-            double ms = run_and_time(fn, num_runs, num_runs, stream);
+            double ms = run_and_time(fn, emul_warmup, num_runs, stream);
 
             double err_max = std::nan(""), err_med = std::nan("");
             if(cfg.check_errors)
                 std::tie(err_max, err_med) = compute_errors(
                     N, d_D, d_C_dd, d_err, h_err, stream);
 
-            const char* algo_label = cfg.run_eager
-                ? "OS2-accu-adaptive"
-                : "OS2-accu-performant";
+            const char* algo_label = "OS2-accu-adaptive";
 
             std::printf("%.4g,%zu,%c,%c,%s,%.1f,%.4e,%.4e,%.3f,%.3f\n",
                         phi, N, cTA, cTB, algo_label, CRT_BITS[16],
@@ -824,9 +904,11 @@ int main(int argc, char** argv)
         }
 
         /* -- Emulation sweep over num_moduli = min_s .. max_s --------------- */
-        /* Fixed-s sweep always uses EAGER (emulation forced regardless of N). */
+        /* Apply the same EAGER/PERFORMANT strategy as the adaptive run. */
         HLT_CHECK(hipblasLtSetEmulationStrategy(emulated.handle,
-                                                HIPBLASLT_EMULATION_STRATEGY_EAGER));
+                                                cfg.run_eager
+                                                    ? HIPBLASLT_EMULATION_STRATEGY_EAGER
+                                                    : HIPBLASLT_EMULATION_STRATEGY_PERFORMANT));
         for(unsigned s = cfg.min_s; s <= cfg.max_s; ++s) {
             HLT_CHECK(hipblasLtSetEmulationNumModuli(
                 emulated.handle, static_cast<int>(s)));
@@ -835,7 +917,7 @@ int main(int argc, char** argv)
             ensure_ws(emu_ws);
 
             auto fn = [&]{ emulated.run(d_A, d_B, d_D, d_ws, ws_bytes, stream); };
-            double ms = run_and_time(fn, num_runs, num_runs, stream);
+            double ms = run_and_time(fn, emul_warmup, num_runs, stream);
 
             double err_max = std::nan(""), err_med = std::nan("");
             if(cfg.check_errors)

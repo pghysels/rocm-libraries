@@ -71,7 +71,7 @@ echo "phi,N,transa,transb,algo,crt_bits,err_max,err_med,ms_per_run,workspace_MiB
 #   N = 32768 → max(1,  runs/32)
 #   N = 65536 → 1  (single timed run; each call is many seconds)
 # This gives stable timing at each size without wasting hours on large N.
-for N in 1024 2048 4096 8192 16384 32768 65536; do
+for N in 1024 2048 4096 8192 16384 32768 65536; do  # 65536
     if   [ "$N" -le  2048 ]; then RUNS="$NUM_RUNS"
     elif [ "$N" -le  4096 ]; then RUNS=$(( NUM_RUNS / 4  < 5 ? 5 : NUM_RUNS / 4  ))
     elif [ "$N" -le  8192 ]; then RUNS=$(( NUM_RUNS / 8  < 3 ? 3 : NUM_RUNS / 8  ))
@@ -85,6 +85,7 @@ for N in 1024 2048 4096 8192 16384 32768 65536; do
         -n         "$N"        \
         --num-runs "$RUNS"     \
         --phi-list "$PHI_LIST" \
+        --performant           \
         $EXTRA_FLAGS           \
       | grep -v "^phi,"   \
       >> "$OUTPUT"

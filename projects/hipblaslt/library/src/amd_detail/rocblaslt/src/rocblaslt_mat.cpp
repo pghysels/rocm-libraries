@@ -148,7 +148,7 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
        && epilogue      == ROCBLASLT_EPILOGUE_DEFAULT)
     {
         const Fp64EmulationDecision emulDecision =
-            fp64EmulationDecision(handle, type_a, m, n, k, num_batches_a);
+            fp64EmulationDecision(handle, type_a, opA, opB, m, n, k, num_batches_a, workspaceSizeInBytes);
         if(emulDecision.status != rocblaslt_status_success)
             return emulDecision.status;
         if(emulDecision.apply)
@@ -184,7 +184,7 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
                 if(fallback_warns.fetch_add(1u, std::memory_order_relaxed) < 5u) {
                     const char* reason =
                         (emulSt == rocblaslt_status_memory_error)  ?
-                            "workspace allocation failed (hipMallocAsync)" :
+                            "workspace absent or too small (see stderr for details)" :
                         (emulSt == rocblaslt_status_invalid_value)  ?
                             "NaN/Inf detected in inputs or ADP precision overflow" :
                             "INT8 GEMM failed (hipblasLtMatmul returned error)";

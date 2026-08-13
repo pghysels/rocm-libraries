@@ -154,10 +154,10 @@ namespace
             ASSERT_EQ(hipblasLtSetEmulationStrategy(m_handle, s), HIPBLAS_STATUS_SUCCESS);
         }
 
-        bool would_apply(hipDataType t, int64_t m, int64_t n, int64_t k, int batch)
+        bool would_apply(hipDataType t, int64_t m, int64_t n, int64_t k, int32_t batch)
         {
             const Fp64EmulationDecision decision
-                = fp64EmulationDecision(m_roc, t, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, batch);
+                = fp64EmulationDecision(m_roc, t, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, batch, ~size_t{0});
             EXPECT_EQ(decision.status, rocblaslt_status_success);
             return decision.apply;
         }
@@ -561,7 +561,7 @@ namespace
                                         p.m,
                                         p.n,
                                         p.k,
-                                        1);
+                                        1, ~size_t{0});
             if(!gate.apply)
             {
                 cleanup(hem, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -1061,7 +1061,7 @@ namespace
         // Skip unsupported devices
         {
             const Fp64EmulationDecision gate = fp64EmulationDecision(
-                m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 128, 128, 128, 1);
+                m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 128, 128, 128, 1, ~size_t{0});
             if(!gate.apply)
                 GTEST_SKIP() << "Device not supported by emulation";
         }
@@ -1223,7 +1223,7 @@ namespace
                                         N,
                                         N,
                                         N,
-                                        1);
+                                        1, ~size_t{0});
             if(!gate.apply)
             {
                 (void)hipblasLtDestroy(hem);
@@ -1467,7 +1467,7 @@ namespace
         {
             const Fp64EmulationDecision gate =
                 fp64EmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
-                                      HIP_R_64F, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N, 1);
+                                      HIP_R_64F, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N, 1, ~size_t{0});
             if(!gate.apply)
             {
                 (void)hipblasLtDestroy(hem);
@@ -1833,7 +1833,7 @@ namespace
                                         N,
                                         N,
                                         N,
-                                        1);
+                                        1, ~size_t{0});
             if(!gate.apply)
             {
                 cleanup(hem, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -2010,7 +2010,7 @@ namespace
                   HIPBLAS_STATUS_SUCCESS);
         {
             const Fp64EmulationDecision gate = fp64EmulationDecision(
-                m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, 64, 1);
+                m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, 64, 1, ~size_t{0});
             if(!gate.apply)
                 GTEST_SKIP() << "Device not supported by emulation";
         }
@@ -2331,7 +2331,7 @@ namespace
         /* Skip on unsupported devices. */
         {
             const Fp64EmulationDecision gate
-                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
+                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1, ~size_t{0});
             if(!gate.apply)
             {
                 cleanup();
@@ -2574,7 +2574,7 @@ namespace
 
         {
             const Fp64EmulationDecision gate
-                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
+                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1, ~size_t{0});
             if(!gate.apply)
             {
                 free_all();
@@ -2722,7 +2722,7 @@ namespace
 
         {
             const Fp64EmulationDecision gate
-                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1, ~size_t{0});
             if(!gate.apply)
             {
                 cleanup();
@@ -2798,7 +2798,7 @@ namespace
 
         {
             const Fp64EmulationDecision gate
-                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
+                = fp64EmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1, ~size_t{0});
             if(!gate.apply)
             {
                 free_all();

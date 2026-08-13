@@ -17,6 +17,9 @@
  * This file may be included by any HIP translation unit; it is intentionally
  * separate from fp64_emulation.hpp (which must stay free of __device__ code
  * so it can be included from plain C++ units).
+ *
+ * Constants (tables) are taken verbatim from the open-source GEMMul8 implementation
+ * (Y. Uchino, RIKEN R-CCS, https://github.com/RIKEN-RCCS/GEMMul8).
  */
 
 #include <hip/hip_runtime.h>
