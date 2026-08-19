@@ -26,6 +26,8 @@
 
 #include "hipblaslt/hipblaslt-ext.hpp"
 #include "exceptions.hpp"
+#include "fp64_emulation.hpp"
+#include "handle.h"
 #include "hipblaslt_internal.hpp"
 #include <Debug.hpp>
 #include <algorithm>
@@ -797,6 +799,14 @@ namespace hipblaslt_ext
                                              m_streamk_tile_scheduling_mode,
                                              requestedAlgoCount,
                                              *results));
+        /* Augment each result's workspaceSize with the FP64 emulation workspace
+         * so that callers (e.g. hipblaslt-bench) see the true total workspace
+         * requirement and pre-allocate it before the timed GEMM iterations.   */
+        if(status == HIPBLAS_STATUS_SUCCESS && m_emul_workspace_bytes > 0)
+        {
+            for(auto& r : heuristicResults)
+                r.workspaceSize = std::max(r.workspaceSize, m_emul_workspace_bytes);
+        }
         rocblaslt::Debug::Instance().markerStop();
         return status;
     }
@@ -812,6 +822,8 @@ namespace hipblaslt_ext
         rocblaslt::RocTuningV2* tuning   = nullptr;
         auto                    status = RocBlasLtStatusToHIPStatus(rocblaslt_is_algo_supported_cpp(
             (rocblaslt_handle)m_handle, gemmType, m_data, *rocalgo, tuning, workspaceSizeInBytes));
+        if(status == HIPBLAS_STATUS_SUCCESS)
+            workspaceSizeInBytes = std::max(workspaceSizeInBytes, m_emul_workspace_bytes);
         rocblaslt::Debug::Instance().markerStop();
         return status;
     }
@@ -837,6 +849,8 @@ namespace hipblaslt_ext
                                                                          *rocalgo,
                                                                          roctuning,
                                                                          workspaceSizeInBytes));
+        if(status == HIPBLAS_STATUS_SUCCESS)
+            workspaceSizeInBytes = std::max(workspaceSizeInBytes, m_emul_workspace_bytes);
         rocblaslt::Debug::Instance().markerStop();
         return status;
     }
@@ -1091,6 +1105,18 @@ namespace hipblaslt_ext
         if(status == HIPBLAS_STATUS_SUCCESS)
         {
             m_problem_types[0] = problemtype;
+            /* Cache the FP64 emulation workspace requirement for this problem.
+             * Used by algoGetHeuristic / isAlgoSupported to report the true
+             * total workspace so callers can pre-allocate it.                */
+            const auto* h = reinterpret_cast<const _rocblaslt_handle*>(m_handle);
+            const Fp64EmulationDecision emulDecision =
+                fp64EmulationDecision(h, problemtype.getTypeA(),
+                                      problemtype.getOpA(), problemtype.getOpB(),
+                                      m, n, k, batch_count, ~size_t{0});
+            m_emul_workspace_bytes = emulDecision.apply
+                ? fp64EmulationWorkspaceSize(h, problemtype.getOpA(), problemtype.getOpB(),
+                                             m, n, k, emulDecision)
+                : 0u;
         }
         rocblaslt::Debug::Instance().markerStop();
         return status;
@@ -1127,6 +1153,28 @@ namespace hipblaslt_ext
                                       (*rocproblemtypes)[0],
                                       m_data,
                                       m_gemm_count));
+        if(status == HIPBLAS_STATUS_SUCCESS && matmul_descr && matA && matD)
+        {
+            /* Cache the FP64 emulation workspace requirement for this problem. */
+            const auto* h        = reinterpret_cast<const _rocblaslt_handle*>(m_handle);
+            const auto* A_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(matA);
+            const auto* D_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(matD);
+            const auto* desc_ptr = reinterpret_cast<const _rocblaslt_matmul_desc*>(matmul_descr);
+            const int64_t m_sz = static_cast<int64_t>(D_layout->m);
+            const int64_t n_sz = static_cast<int64_t>(D_layout->n);
+            const int64_t k_sz = (desc_ptr->op_A == HIPBLAS_OP_N)
+                                     ? static_cast<int64_t>(A_layout->n)
+                                     : static_cast<int64_t>(A_layout->m);
+            const int32_t batch = A_layout->batch_count;
+            const Fp64EmulationDecision emulDecision =
+                fp64EmulationDecision(h, A_layout->type,
+                                      desc_ptr->op_A, desc_ptr->op_B,
+                                      m_sz, n_sz, k_sz, batch, ~size_t{0});
+            m_emul_workspace_bytes = emulDecision.apply
+                ? fp64EmulationWorkspaceSize(h, desc_ptr->op_A, desc_ptr->op_B,
+                                             m_sz, n_sz, k_sz, emulDecision)
+                : 0u;
+        }
         rocblaslt::Debug::Instance().markerStop();
         return status;
     }

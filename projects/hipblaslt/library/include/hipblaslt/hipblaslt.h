@@ -82,6 +82,19 @@
 /*! \ingroup types_module
  *  \brief Specifies the enumeration type to set the postprocessing options for the epilogue.
  */
+/*! \ingroup types_module
+ *  \brief Emulation strategy for FP64 GEMM via Ozaki Scheme II.
+ */
+typedef enum {
+    HIPBLASLT_EMULATION_STRATEGY_DEFAULT    = 0, /**<Use the process-wide default (from HIPBLASLT_EMULATION_STRATEGY env var). */
+    HIPBLASLT_EMULATION_STRATEGY_PERFORMANT = 1, /**<Emulate only when the arithmetic-intensity heuristic predicts a speedup. */
+    HIPBLASLT_EMULATION_STRATEGY_EAGER      = 2, /**<Emulate whenever the data types and epilogue are supported, regardless of problem size. */
+} hipblasLtEmulationStrategy_t;
+
+
+/*! \ingroup types_module
+ *  \brief Specifies the enumeration type to set the postprocessing options for the epilogue.
+ */
 typedef enum {
   HIPBLASLT_EPILOGUE_DEFAULT = 1,                 /**<No special postprocessing. Scale and quantize the results if necessary.*/
   HIPBLASLT_EPILOGUE_RELU = 2,                    /**<Apply ReLU pointwise transform to the results (``x:=max(x, 0)``)*/
@@ -1139,6 +1152,128 @@ hipblasStatus_t hipblasLtMatrixTransform(hipblasLtHandle_t              lightHan
                                          void*                   C,
                                          hipblasLtMatrixLayout_t Cdesc,
                                          hipStream_t             stream);
+/*! \ingroup library_module
+ *  \brief Enable or disable FP64 emulation for a hipBLASLt handle.
+ *
+ *  \details
+ *  When \p enabled is \c true, the handle will use FP64 emulation via
+ *  Ozaki Scheme II for supported DGEMM calls, overriding the
+ *  \c HIPBLASLT_EMULATE_DOUBLE_PRECISION environment variable.
+ *  When \p enabled is \c false, emulation is suppressed for this handle
+ *  even if the environment variable is set.  After \ref hipblasLtCreate()
+ *  the default is to defer to the environment variable.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS         Setting applied successfully.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE   \p handle is NULL.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtSetEmulationEnabled(hipblasLtHandle_t handle, bool enabled);
+
+/*! \ingroup library_module
+ *  \brief Set the FP64 emulation strategy for a hipBLASLt handle.
+ *
+ *  \details
+ *  Controls whether FP64 GEMM emulation via Ozaki Scheme II is applied only
+ *  when it is projected to be faster than native FP64 (``PERFORMANT``) or
+ *  for every supported call regardless of problem size (``EAGER``).  The
+ *  ``DEFAULT`` value selects ``PERFORMANT`` unless the
+ *  ``HIPBLASLT_EMULATION_STRATEGY`` environment variable is set.
+ *
+ *  To match the cuBLAS environment-variable contract, an explicitly set
+ *  ``HIPBLASLT_EMULATION_STRATEGY`` environment variable takes precedence
+ *  over this handle setting. Invalid FP64 emulation environment-variable
+ *  values cause affected matmul calls to return an invalid-value status.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS         Setting applied successfully.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE   \p handle is NULL or \p strategy
+ *                                         is out of range.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtSetEmulationStrategy(hipblasLtHandle_t            handle,
+                                              hipblasLtEmulationStrategy_t strategy);
+
+/*! \ingroup library_module
+ *  \brief Query the FP64 emulation strategy for a hipBLASLt handle.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS       \p *strategy has been written.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE \p handle or \p strategy is NULL.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtGetEmulationStrategy(hipblasLtHandle_t             handle,
+                                              hipblasLtEmulationStrategy_t* strategy);
+
+/*! \ingroup library_module
+ *  \brief Set the number of CRT moduli for FP64 emulation.
+ *
+ *  \details
+ *  Controls the number of INT8 GEMMs (CRT moduli) used per emulation call.
+ *  - ``numModuli = -1``  : ADP mode (default; adaptively selects the minimum
+ *                         moduli count needed for FP64 accuracy).
+ *  - ``numModuli in [2,18]``: FIXED mode with exactly that many moduli.
+ *
+ *  A one-time per-process warning is printed when FIXED mode is selected
+ *  because FIXED mode does not guarantee accuracy (CRT sign flips can occur).
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS         Setting applied successfully.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE   handle is NULL, or numModuli
+ *                                         is not -1 and not in [2, 18].
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtSetEmulationNumModuli(hipblasLtHandle_t handle, int numModuli);
+
+
+/*! \ingroup library_module
+ *  \brief Set the Inf/NaN special-values support mask for FP64 emulation.
+ *
+ *  \details
+ *  Bit 0: Inf detection enabled (fall back to native FP64 if Inf found).
+ *  Bit 1: NaN detection enabled (fall back to native FP64 if NaN found).
+ *  Default (both bits set): fall back for any non-finite input.
+ *  Set to 0 to disable all detection (faster for guaranteed-clean inputs).
+ *
+ *  To match the cuBLAS environment-variable contract, an explicitly set
+ *  ``HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK`` environment variable
+ *  takes precedence over this handle setting. Invalid FP64 emulation
+ *  environment-variable values cause affected matmul calls to return an
+ *  invalid-value status.
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS         Setting applied successfully.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE   \p handle is NULL.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t handle,
+                                                          unsigned int      mask);
+
+/*! \ingroup library_module
+ *  \brief Compute the GPU workspace required by the FP64 emulation for a given problem.
+ *
+ *  \details
+ *  Returns the number of bytes needed in the workspace buffer that must be
+ *  passed to \ref hipblasLtMatmul when FP64 emulation is active.  The size
+ *  depends on the matrix dimensions and the number of CRT moduli used.
+ *
+ *  Pass the return value to \ref hipblasLtMatmulPreferenceSetAttribute as
+ *  \c HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES to guarantee that the
+ *  heuristic selects a compatible algorithm, and allocate at least this many
+ *  bytes for the workspace pointer supplied to \ref hipblasLtMatmul.
+ *
+ *  @param[in]  handle  hipBLASLt handle (provides device selection for the
+ *                      performance model, and the configured moduli count set via
+ *                      \ref hipblasLtSetEmulationNumModuli).
+ *  @param[in]  m       Number of rows of op(A) and D.
+ *  @param[in]  n       Number of columns of op(B) and D.
+ *  @param[in]  k       Shared dimension of op(A) and op(B).
+ *
+ *  \retval  Workspace size in bytes, or 0 on error.
+ */
+HIPBLASLT_EXPORT
+size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t  handle,
+                                           hipblasOperation_t opA,
+                                           hipblasOperation_t opB,
+                                           int64_t            m,
+                                           int64_t            n,
+                                           int64_t            k);
+
 #ifdef __cplusplus
 }
 #endif

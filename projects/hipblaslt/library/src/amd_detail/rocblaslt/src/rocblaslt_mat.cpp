@@ -26,6 +26,7 @@
 
 #include "check_numerics_matrix.hpp"
 #include "definitions.h"
+#include "fp64_emulation.hpp"
 #include "handle.h"
 #include "rocblaslt_mat_utils.hpp"
 #include "tensile_host.hpp"
@@ -129,6 +130,79 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
     void*              scaleE        = matmul_descr->scaleE;
     void*              amaxD         = matmul_descr->amaxD;
     hipDataType        scale_type    = matmul_descr->scale_type;
+
+    // -----------------------------------------------------------------------
+    // FP64 emulation intercept via Ozaki Scheme II
+    //
+    // Conditions for emulation:
+    //   • Data type is FP64 (HIP_R_64F)
+    //   • Non-batched (batch_count == 1)
+    //   • Plain GEMM epilogue (no activation, no bias, no auxiliary outputs)
+    //   • alpha/beta are host (non-device-pointer) scalars
+    //   • Emulation is enabled: handle override (1=on, 0=off) or env var
+    //   • Arithmetic intensity exceeds the threshold (compute-bound region)
+    // Invalid FP64 emulation env-var values return invalid_value instead of
+    // silently falling back to native FP64.
+    //
+    // On success the emulated result is returned directly; the native path
+    // is used as fall-back when fp64EmulatedGemm returns non-success.
+    // -----------------------------------------------------------------------
+    if(bias          == nullptr
+       && scaleAlphaVec == nullptr
+       && E             == nullptr
+       && !matmul_descr->pointermode
+       && epilogue      == ROCBLASLT_EPILOGUE_DEFAULT)
+    {
+        const Fp64EmulationDecision emulDecision =
+            fp64EmulationDecision(handle, type_a, opA, opB, m, n, k, num_batches_a, workspaceSizeInBytes);
+        if(emulDecision.status != rocblaslt_status_success)
+            return emulDecision.status;
+        if(emulDecision.apply)
+        {
+            /* Build per-call settings from handle overrides + env var fallbacks. */
+            Fp64EmulationSettings emulSettings;
+            emulSettings.num_moduli = emulDecision.num_moduli;
+
+            /* special_values_mask: env var overrides handle API when set. */
+            emulSettings.sv_mask = emulDecision.sv_mask;
+            emulSettings.dynamic_mode = emulDecision.dynamic_mode;
+
+            /* caller workspace: pass through from the hipblasLtMatmul call */
+            emulSettings.workspace       = workspace;
+            emulSettings.workspace_bytes = workspaceSizeInBytes;
+
+            const rocblaslt_status emulSt =
+                fp64EmulatedGemm(handle, opA, opB, m, n, k,
+                                 static_cast<const double*>(alpha),
+                                 static_cast<const double*>(A), lda,
+                                 static_cast<const double*>(B), ldb,
+                                 static_cast<const double*>(beta),
+                                 static_cast<const double*>(C), ldc,
+                                 static_cast<double*>(D), ldd,
+                                 stream, emulSettings);
+            if(emulSt == rocblaslt_status_success)
+                return rocblaslt_status_success;
+            /* Non-success: fall through to native DGEMM.
+             * Emit a rate-limited warning so the caller knows emulation was skipped
+             * and the reason why.  Rate cap: ≤5 messages per process lifetime.   */
+            {
+                static std::atomic<unsigned> fallback_warns{0u};
+                if(fallback_warns.fetch_add(1u, std::memory_order_relaxed) < 5u) {
+                    const char* reason =
+                        (emulSt == rocblaslt_status_memory_error)  ?
+                            "workspace absent or too small (see stderr for details)" :
+                        (emulSt == rocblaslt_status_invalid_value)  ?
+                            "NaN/Inf detected in inputs or ADP precision overflow" :
+                            "INT8 GEMM failed (hipblasLtMatmul returned error)";
+                    std::fprintf(stderr,
+                        "[hipBLASLt FP64 emulation] INFO: falling back to native DGEMM "
+                        "(m=%lld, n=%lld, k=%lld, reason: %s).\n",
+                        (long long)m, (long long)n, (long long)k, reason);
+                }
+            }
+        }
+    }
+
 
     // Others
     // Use strided_batch=true for kernel selection (StridedBatched=true kernels with SupportUserArgs)
