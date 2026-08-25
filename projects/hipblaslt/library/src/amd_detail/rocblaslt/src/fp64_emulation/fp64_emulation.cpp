@@ -44,6 +44,7 @@
 
 #include <atomic> // std::atomic (ADP overflow warning rate-limiter)
 #include <cassert> // assert
+#include <chrono> // std::chrono::steady_clock (CPU-side profiling)
 #include <cmath> // std::log2, std::floor, etc.
 #include <cstdio> // std::fopen / std::fprintf / std::fclose / std::ftell
 #include <cstdlib> // std::getenv
@@ -68,7 +69,7 @@ namespace FP64Emulation
      * This is why this workspace is set to size 0.
      * For larger K this might fail to find a solution,
      * and then we fall back to native DGEMM */
-    static constexpr size_t OZ2_INT8_GEMM_WS_BYTES = 0; // 128ull << 20; /* 128 MiB */
+    static constexpr size_t OZ2_INT8_GEMM_WS_BYTES = 128ull << 20; /* 128 MiB */
 
     /* Total workspace budget per modulus (A8i + B8i + C32i simultaneously resident).
      * chunk × (mn4 + slc) ≤ OZ2_CHUNK_TARGET_BYTES constrains the combined allocation. */
@@ -1574,6 +1575,11 @@ namespace FP64Emulation
         float    t_scale = 0.f;
         float    t_int8  = 0.f;
         float    t_accum = 0.f;
+        /* CPU-side overhead timers (wall-clock, not GPU events) */
+        float    t_ctx_create_ms  = 0.f; /* hipblasLtCreate                               */
+        float    t_layout_ms      = 0.f; /* 3× MatrixLayoutCreate + DescCreate + 2× SetAttr */
+        float    t_svmask_sync_ms = 0.f; /* NaN-flag hipStreamSynchronize + hipMemcpy       */
+        float    t_batch_attr_ms  = 0.f; /* 6× MatrixLayoutSetAttribute for strided-batch   */
         unsigned effective_s_used = 0u; /* ADP: actual s chosen (= num_moduli in fixed mode) */
         unsigned n_sub_gemms      = 0u;
     };
@@ -2183,6 +2189,10 @@ namespace FP64Emulation
         Ozaki2Context context;
         float         _t_prelim = 0, _t_prelim_gemm = 0, _t_refine = 0, _t_adp = 0,
               _t_scale = 0, _t_int8 = 0, _t_accum = 0;
+        /* CPU-side overhead timers — wall-clock, only used when profiling. */
+        using WallClock = std::chrono::steady_clock;
+        using WallMs    = std::chrono::duration<float, std::milli>;
+        float _t_ctx_create = 0.f, _t_layout = 0.f, _t_svmask_sync = 0.f, _t_batch_attr = 0.f;
         if(_prof)
         {
             (void)hipEventCreate(&context.ev0);
@@ -2258,32 +2268,41 @@ namespace FP64Emulation
             }
         }
 
-        if(hipblasLtCreate(&context.int8_handle) != HIPBLAS_STATUS_SUCCESS)
         {
-            return rocblaslt_status_internal_error;
+            auto _wt0 = WallClock::now();
+            if(hipblasLtCreate(&context.int8_handle) != HIPBLAS_STATUS_SUCCESS)
+            {
+                return rocblaslt_status_internal_error;
+            }
+            if(_prof) _t_ctx_create = WallMs(WallClock::now() - _wt0).count();
         }
-        hipblasLtMatrixLayoutCreate(&context.layoutA,
-                                    HIP_R_8I,
-                                    static_cast<uint64_t>(k),
-                                    static_cast<uint64_t>(m),
-                                    static_cast<int64_t>(lda8i));
-        hipblasLtMatrixLayoutCreate(&context.layoutB,
-                                    HIP_R_8I,
-                                    static_cast<uint64_t>(k),
-                                    static_cast<uint64_t>(n),
-                                    static_cast<int64_t>(ldb8i));
-        hipblasLtMatrixLayoutCreate(&context.layoutCD,
-                                    HIP_R_32I,
-                                    static_cast<uint64_t>(m),
-                                    static_cast<uint64_t>(n),
-                                    static_cast<int64_t>(ldc32i));
-        hipblasLtMatmulDescCreate(&context.matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I);
+
         {
-            hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
-            hipblasLtMatmulDescSetAttribute(
-                context.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
-            hipblasLtMatmulDescSetAttribute(
-                context.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+            auto _wt0 = WallClock::now();
+            hipblasLtMatrixLayoutCreate(&context.layoutA,
+                                        HIP_R_8I,
+                                        static_cast<uint64_t>(k),
+                                        static_cast<uint64_t>(m),
+                                        static_cast<int64_t>(lda8i));
+            hipblasLtMatrixLayoutCreate(&context.layoutB,
+                                        HIP_R_8I,
+                                        static_cast<uint64_t>(k),
+                                        static_cast<uint64_t>(n),
+                                        static_cast<int64_t>(ldb8i));
+            hipblasLtMatrixLayoutCreate(&context.layoutCD,
+                                        HIP_R_32I,
+                                        static_cast<uint64_t>(m),
+                                        static_cast<uint64_t>(n),
+                                        static_cast<int64_t>(ldc32i));
+            hipblasLtMatmulDescCreate(&context.matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I);
+            {
+                hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
+                hipblasLtMatmulDescSetAttribute(
+                    context.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+                hipblasLtMatmulDescSetAttribute(
+                    context.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+            }
+            if(_prof) _t_layout = WallMs(WallClock::now() - _wt0).count();
         }
 
         const int32_t one_i = 1, zero_i = 0;
@@ -2332,6 +2351,7 @@ namespace FP64Emulation
 
         if(svmask != 0u)
         {
+            auto _wt0 = WallClock::now();
             if(hipStreamSynchronize(stream) != hipSuccess)
             {
                 return rocblaslt_status_internal_error;
@@ -2342,6 +2362,7 @@ namespace FP64Emulation
             {
                 return rocblaslt_status_internal_error;
             }
+            if(_prof) _t_svmask_sync = WallMs(WallClock::now() - _wt0).count();
             if(detected & svmask)
             {
                 return rocblaslt_status_invalid_value;
@@ -2547,18 +2568,22 @@ namespace FP64Emulation
             const int64_t stride_A_b = static_cast<int64_t>(strideA8i);
             const int64_t stride_B_b = static_cast<int64_t>(strideB8i);
             const int64_t stride_C_b = static_cast<int64_t>(szC32i);
-            hipblasLtMatrixLayoutSetAttribute(context.layoutA,
-                                              HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                              &stride_A_b,
-                                              sizeof(stride_A_b));
-            hipblasLtMatrixLayoutSetAttribute(context.layoutB,
-                                              HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                              &stride_B_b,
-                                              sizeof(stride_B_b));
-            hipblasLtMatrixLayoutSetAttribute(context.layoutCD,
-                                              HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                              &stride_C_b,
-                                              sizeof(stride_C_b));
+            {
+                auto _wt0 = WallClock::now();
+                hipblasLtMatrixLayoutSetAttribute(context.layoutA,
+                                                  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                                  &stride_A_b,
+                                                  sizeof(stride_A_b));
+                hipblasLtMatrixLayoutSetAttribute(context.layoutB,
+                                                  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                                  &stride_B_b,
+                                                  sizeof(stride_B_b));
+                hipblasLtMatrixLayoutSetAttribute(context.layoutCD,
+                                                  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                                  &stride_C_b,
+                                                  sizeof(stride_C_b));
+                if(_prof) _t_batch_attr += WallMs(WallClock::now() - _wt0).count();
+            }
 
             for(unsigned chunk_start = 0; chunk_start < effective_s; chunk_start += chunk_size)
             {
@@ -2572,6 +2597,7 @@ namespace FP64Emulation
                 if(static_cast<int32_t>(actual) != batch_cur)
                 {
                     batch_cur = static_cast<int32_t>(actual);
+                    auto _wt0 = WallClock::now();
                     hipblasLtMatrixLayoutSetAttribute(context.layoutA,
                                                       HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
                                                       &batch_cur,
@@ -2584,6 +2610,7 @@ namespace FP64Emulation
                                                       HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
                                                       &batch_cur,
                                                       sizeof(batch_cur));
+                    if(_prof) _t_batch_attr += WallMs(WallClock::now() - _wt0).count();
                 }
 
                 _pstart();
@@ -2663,6 +2690,10 @@ namespace FP64Emulation
             prof->t_scale += _t_scale;
             prof->t_int8 += _t_int8;
             prof->t_accum += _t_accum;
+            prof->t_ctx_create_ms  += _t_ctx_create;
+            prof->t_layout_ms      += _t_layout;
+            prof->t_svmask_sync_ms += _t_svmask_sync;
+            prof->t_batch_attr_ms  += _t_batch_attr;
             prof->effective_s_used = std::max(prof->effective_s_used, effective_s);
             prof->n_sub_gemms += 1u;
         }
@@ -3174,14 +3205,15 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                     "t_prelim_ms,t_prelim_gemm_ms,t_refine_ms,"
                     "t_adp_ms,t_scale_ms,t_int8_gemm_ms,t_accum_ms,"
                     "t_total_ms,"
+                    "cpu_ctx_create_ms,cpu_layout_ms,cpu_svmask_sync_ms,cpu_batch_attr_ms,"
                     "pred_prelim_ms,pred_prelim_gemm_ms,pred_refine_ms,pred_adp_ms,"
                     "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
-                    "pred_host_ms,pred_total_ms,pred_native_dgemm_"
-                    "ms\n");
+                    "pred_host_ms,pred_total_ms,pred_native_dgemm_ms\n");
             std::fprintf(_f,
                          "%lld,%lld,%lld,%c,%c,%u,%u,%u,%u,"
                          "%llu,%u,"
                          "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                         "%.4f,%.4f,%.4f,%.4f,"
                          "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                          (long long)m,
                          (long long)n,
@@ -3202,6 +3234,10 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                          accum.t_int8,
                          accum.t_accum,
                          t_total,
+                         accum.t_ctx_create_ms,
+                         accum.t_layout_ms,
+                         accum.t_svmask_sync_ms,
+                         accum.t_batch_attr_ms,
                          pm.t_prelim_ms,
                          pm.t_prelim_gemm_ms,
                          pm.t_refine_ms,
