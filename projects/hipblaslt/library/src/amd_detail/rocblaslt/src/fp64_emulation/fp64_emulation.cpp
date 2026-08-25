@@ -70,11 +70,7 @@ namespace FP64Emulation
      * This is why this workspace is set to size 0.
      * For larger K this might fail to find a solution,
      * and then we fall back to native DGEMM */
-    static constexpr size_t OZ2_INT8_GEMM_WS_BYTES = 128ull << 20; /* 128 MiB */
-
-    /* Total workspace budget per modulus (A8i + B8i + C32i simultaneously resident).
-     * chunk × (mn4 + slc) ≤ OZ2_CHUNK_TARGET_BYTES constrains the combined allocation. */
-    static constexpr size_t OZ2_CHUNK_TARGET_BYTES = 32ull << 30; /* 32 GiB */
+    static constexpr size_t OZ2_INT8_GEMM_WS_BYTES = 0; //128ull << 20; /* 128 MiB */
 
     /* Number of moduli processed per pass: the largest value ≤ s such that
      * the simultaneous allocation of A8i + B8i + C32i fits in the total budget.
