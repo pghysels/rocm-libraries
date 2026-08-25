@@ -43,6 +43,7 @@
 #include <hip/hip_runtime.h>
 
 #include <atomic> // std::atomic (ADP overflow warning rate-limiter)
+#include <mutex>  // std::mutex  (per-device INT8 handle/desc cache)
 #include <cassert> // assert
 #include <chrono> // std::chrono::steady_clock (CPU-side profiling)
 #include <cmath> // std::log2, std::floor, etc.
@@ -1984,6 +1985,37 @@ namespace FP64Emulation
         }
     }
 
+    /* =========================================================================
+     * Per-device cache for the INT8 hipblasLtHandle and matmulDesc.
+     *
+     * hipblasLtCreate (profiled as cpu_ctx_create_ms) is the dominant overhead
+     * for small problems because it is called once per emulated_gemm_impl leaf
+     * invocation and can take several hundred microseconds.
+     *
+     * Both objects are completely device-specific but problem-shape–agnostic:
+     *   • int8_handle — a plain hipblasLt context; no per-call mutable state.
+     *   • matmulDesc  — always TRANSA=T, TRANSB=N, COMPUTE_32I, R_32I; never
+     *                   mutated after creation (batch attributes live in the
+     *                   per-call MatrixLayout objects, not in matmulDesc).
+     *
+     * layoutA/B/CD are NOT cached: they encode (k, m, n) dimensions and their
+     * batch_count attribute is updated per-chunk, so they remain per-call.
+     *
+     * Thread safety: the mutex is held only during the one-time initialisation.
+     * After warm-up the mutex is taken and released immediately (~30 ns) and
+     * the pointers read under it never change, so there is no contention on
+     * the hot path.  hipblasLtMatmul is safe to call concurrently from multiple
+     * threads sharing the same handle (the library protects its internal
+     * algorithm-selection cache, mirroring the cublasLt threading model).
+     * ========================================================================= */
+    struct DeviceInt8Cache
+    {
+        std::mutex            mu;
+        hipblasLtHandle_t     int8_handle = nullptr;
+        hipblasLtMatmulDesc_t matmulDesc  = nullptr;
+    };
+    static DeviceInt8Cache s_device_cache[64]; /* one slot per HIP device index */
+
     /* ── RAII guard for INT8 GEMM handles and profiling events ───────────────── */
     /* Destroyed automatically on scope exit — covers both normal return and  */
     /* all early-return error paths, eliminating explicit oz2_cleanup() calls. */
@@ -1996,6 +2028,12 @@ namespace FP64Emulation
         hipblasLtMatmulDesc_t   matmulDesc  = nullptr;
         hipEvent_t              ev0         = nullptr;
         hipEvent_t              ev1         = nullptr;
+        /* When true the destructor owns and destroys the object.
+         * When false the per-device cache owns the lifetime and the
+         * destructor skips it — avoiding a premature hipblasLtDestroy
+         * that would invalidate the cached handle for all future calls. */
+        bool                    owns_handle = true;
+        bool                    owns_desc   = true;
 
         Ozaki2Context()                                = default;
         Ozaki2Context(const Ozaki2Context&)            = delete;
@@ -2003,7 +2041,7 @@ namespace FP64Emulation
 
         ~Ozaki2Context() noexcept
         {
-            if(matmulDesc)
+            if(matmulDesc && owns_desc)
                 (void)hipblasLtMatmulDescDestroy(matmulDesc);
             if(layoutCD)
                 (void)hipblasLtMatrixLayoutDestroy(layoutCD);
@@ -2011,7 +2049,7 @@ namespace FP64Emulation
                 (void)hipblasLtMatrixLayoutDestroy(layoutB);
             if(layoutA)
                 (void)hipblasLtMatrixLayoutDestroy(layoutA);
-            if(int8_handle)
+            if(int8_handle && owns_handle)
                 (void)hipblasLtDestroy(int8_handle);
             if(ev1)
                 (void)hipEventDestroy(ev1);
@@ -2269,10 +2307,30 @@ namespace FP64Emulation
         }
 
         {
-            auto _wt0 = WallClock::now();
-            if(hipblasLtCreate(&context.int8_handle) != HIPBLAS_STATUS_SUCCESS)
+            /* Obtain the INT8 handle from the per-device cache.
+             * First call for this device: create and cache under the mutex.
+             * Subsequent calls: mutex acquired/released (~30 ns), pointer copied.
+             * Exotic device index (≥64): fall back to per-call creation.        */
+            auto      _wt0 = WallClock::now();
+            const int dev  = h->device;
+            if(dev >= 0 && dev < 64)
             {
-                return rocblaslt_status_internal_error;
+                auto&                       slot = s_device_cache[dev];
+                std::lock_guard<std::mutex> lk(slot.mu);
+                if(slot.int8_handle == nullptr)
+                {
+                    if(hipblasLtCreate(&slot.int8_handle) != HIPBLAS_STATUS_SUCCESS)
+                        return rocblaslt_status_internal_error;
+                }
+                context.int8_handle = slot.int8_handle;
+                context.owns_handle = false; /* cache owns the lifetime */
+            }
+            else
+            {
+                /* Exotic device index: fall back to per-call creation. */
+                if(hipblasLtCreate(&context.int8_handle) != HIPBLAS_STATUS_SUCCESS)
+                    return rocblaslt_status_internal_error;
+                /* owns_handle remains true; destructor will destroy it. */
             }
             if(_prof) _t_ctx_create = WallMs(WallClock::now() - _wt0).count();
         }
@@ -2294,13 +2352,40 @@ namespace FP64Emulation
                                         static_cast<uint64_t>(m),
                                         static_cast<uint64_t>(n),
                                         static_cast<int64_t>(ldc32i));
-            hipblasLtMatmulDescCreate(&context.matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I);
+            /* matmulDesc is always TRANSA=T, TRANSB=N, COMPUTE_32I, R_32I —
+             * identical for every emulated_gemm_impl call on a given device.
+             * Obtain it from the per-device cache (same slot used for int8_handle
+             * above; mutex guards the one-time initialisation only).             */
             {
-                hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
-                hipblasLtMatmulDescSetAttribute(
-                    context.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
-                hipblasLtMatmulDescSetAttribute(
-                    context.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+                const int dev = h->device;
+                if(dev >= 0 && dev < 64)
+                {
+                    auto&                       slot = s_device_cache[dev];
+                    std::lock_guard<std::mutex> lk(slot.mu);
+                    if(slot.matmulDesc == nullptr)
+                    {
+                        hipblasLtMatmulDescCreate(
+                            &slot.matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I);
+                        hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
+                        hipblasLtMatmulDescSetAttribute(
+                            slot.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+                        hipblasLtMatmulDescSetAttribute(
+                            slot.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+                    }
+                    context.matmulDesc = slot.matmulDesc;
+                    context.owns_desc  = false; /* cache owns the lifetime */
+                }
+                else
+                {
+                    /* Exotic device index: fall back to per-call creation. */
+                    hipblasLtMatmulDescCreate(&context.matmulDesc, HIPBLAS_COMPUTE_32I, HIP_R_32I);
+                    hipblasOperation_t opT = HIPBLAS_OP_T, opN = HIPBLAS_OP_N;
+                    hipblasLtMatmulDescSetAttribute(
+                        context.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+                    hipblasLtMatmulDescSetAttribute(
+                        context.matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+                    /* owns_desc remains true; destructor will destroy it. */
+                }
             }
             if(_prof) _t_layout = WallMs(WallClock::now() - _wt0).count();
         }
