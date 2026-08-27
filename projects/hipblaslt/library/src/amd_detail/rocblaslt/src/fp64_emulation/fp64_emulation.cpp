@@ -885,8 +885,13 @@ namespace FP64Emulation
         int32_t max_val = row_max[row];
         if(max_val < 1)
             max_val = 1;
+        /* mh4u_ru = -round_up(0.5/(1 - 4·2^-24)), slightly more negative than -0.5F,
+         * compensates for __log2f's ≤1 ULP rounding error so the shift is never
+         * overestimated.  __int2float_ru gives a conservative (rounded-up) float of
+         * the INT32 max, preventing underestimation of log2(max). */
+        static constexpr float mh4u_ru = -0x1.0000060000000p-1F;
         sftA[row]
-            += static_cast<int16_t>(floorf(-0.5f * log2f(static_cast<float>(max_val)) + log2P));
+            += static_cast<int16_t>(floorf(fmaf(mh4u_ru, __log2f(__int2float_ru(max_val)), log2P)));
     }
 
     /* adp_reduce_B_kernel — reads the precomputed col_max[j] (NOT the full C32i
@@ -932,8 +937,9 @@ namespace FP64Emulation
         int32_t local_max = col_max[col];
         if(local_max < 1)
             local_max = 1;
+        static constexpr float mh4u_ru = -0x1.0000060000000p-1F; /* see refine_sftA_apply_kernel */
         sftB[col]
-            += static_cast<int16_t>(floorf(-0.5f * log2f(static_cast<float>(local_max)) + log2P));
+            += static_cast<int16_t>(floorf(fmaf(mh4u_ru, __log2f(__int2float_ru(local_max)), log2P)));
     }
 
     /* =========================================================================
