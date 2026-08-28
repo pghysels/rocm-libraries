@@ -60,6 +60,19 @@ Set ``HIPBLASLT_EMULATE_DOUBLE_PRECISION=1`` before launching your application:
    // Optionally set the strategy to EAGER to emulate all FP64 GEMMs.
    hipblasLtSetEmulationStrategy(handle, HIPBLASLT_EMULATION_STRATEGY_EAGER);
 
+   // Allocate 16 GiB workspace — sufficient for near-optimal performance on all problem sizes.
+   const size_t ws_size = 16ull << 30;
+   void* d_workspace = nullptr;
+   hipMalloc(&d_workspace, ws_size);
+
+   // ... create matmul_desc and matrix layouts ...
+
+   // Run the GEMM — pass d_workspace and ws_size as the workspace arguments.
+   hipblasLtMatmul(handle, matmul_desc, &alpha,
+                   A, layout_a, B, layout_b,
+                   &beta, C, layout_c, D, layout_d,
+                   nullptr, d_workspace, ws_size, stream);
+
 Once emulation is enabled, the normal ``hipblasLtMatmul`` call is used — no other code changes
 are required.
 
@@ -94,7 +107,7 @@ Configuring the number of CRT moduli
 The emulation uses a set of coprime moduli to represent the matrix entries in the CRT domain.
 More moduli mean higher CRT capacity (more mantissa bits) at the cost of more INT8 GEMMs.
 The default is ADP mode, which adaptively selects the minimum number of moduli needed to achieve
-FP64 accuracy on each call. In ADP mode up to 16 moduli (~125 mantissa bits) may be used.
+FP64 accuracy on each call. In ADP mode up to 20 moduli (~155 CRT bits) may be used.
 
 **ADP mode (default — library selects number of moduli automatically)**
 
@@ -103,7 +116,7 @@ maintain accuracy for the given input data. No configuration is required.
 
 **Fixed mode via environment variable**
 
-Set ``HIPBLASLT_EMULATION_NUM_MODULI`` to a fixed moduli count in [2..18]:
+Set ``HIPBLASLT_EMULATION_NUM_MODULI`` to a fixed moduli count in [2..20]:
 
 .. code-block:: bash
 
@@ -126,28 +139,9 @@ Set ``HIPBLASLT_EMULATION_NUM_MODULI`` to a fixed moduli count in [2..18]:
    // ADP mode (default): library adaptively selects the number of moduli.
    hipblasLtSetEmulationNumModuli(handle, -1);
 
-   // Fixed mode: use exactly N moduli (N in [2..18]).
+   // Fixed mode: use exactly N moduli (N in [2..20]).
    // Warning: does not guarantee accuracy for all inputs.
    hipblasLtSetEmulationNumModuli(handle, 16);
-
-Configuring Inf/NaN detection
-================================
-
-By default, the emulation checks for Inf and NaN values in the input matrices.
-On each call, a small device-to-host synchronization is performed to read the detection flag.
-This can add latency for very small GEMMs.
-If your application guarantees clean (finite, non-NaN) inputs, you can disable the check:
-
-.. code-block:: bash
-
-   # Disable both Inf and NaN detection (bit 0 = Inf, bit 1 = NaN).
-   export HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK=0
-
-Or via the API:
-
-.. code-block:: c
-
-   hipblasLtSetEmulationSpecialValuesSupport(handle, 0u);
 
 Numerical behavior and limitations
 =====================================
@@ -155,14 +149,32 @@ Numerical behavior and limitations
 Inf and NaN inputs
 ------------------
 
-By default (``HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK=3``), the emulation checks every
-element of the input matrices for Inf and NaN before computing.
-If any Inf or NaN is found, the emulation falls back internally to native FP64 DGEMM, which
-propagates the Inf or NaN to the output in the standard IEEE 754 manner.
+Special-value detection is controlled by a bitmask:
+
+*  Bit 0 — detect Inf values in the input matrices.
+*  Bit 1 — detect NaN values in the input matrices.
+*  Default mask: ``3`` (``0b11``) — both bits set, so both Inf and NaN detection are enabled.
+
+With the default mask ``3``, the emulation scans every element of the input matrices before
+computing.  If any Inf or NaN is found, it falls back internally to native FP64 DGEMM, which
+propagates the non-finite value to the output in the standard IEEE 754 manner.
 ``hipblasLtMatmul`` returns ``HIPBLAS_STATUS_SUCCESS``; non-finite values appear in D exactly
 as they would without emulation.
-The per-call device-to-host synchronization for the check can be skipped by setting mask ``0``
-if your application guarantees finite inputs.
+
+Each detection call performs a small device-to-host synchronization to read the flag, which
+can add latency for very small GEMMs.  If your application guarantees finite, non-NaN inputs,
+disable both checks:
+
+.. code-block:: bash
+
+   # Disable both Inf and NaN detection (mask 0 = no bits set).
+   export HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK=0
+
+Or via the API:
+
+.. code-block:: c
+
+   hipblasLtSetEmulationSpecialValuesSupport(handle, 0u);
 
 Subnormal inputs (flush-to-zero semantics)
 -------------------------------------------
@@ -203,13 +215,13 @@ so it must detect these cases and fall back rather than returning a wrong finite
 In **ADP mode** (the default, set with ``hipblasLtSetEmulationNumModuli(handle, -1)``), the library
 estimates the required CRT capacity from the preliminary INT8 GEMM result.
 For inputs that would overflow native FP64 DGEMM, the required CRT capacity is far above the
-maximum supported (~140 bits, 18 moduli), so ADP detects this and falls back internally to
+maximum supported (~155 bits, 20 moduli), so ADP detects this and falls back internally to
 native FP64 DGEMM.
 The native path then correctly computes the result, including ``Inf`` when appropriate.
 ``hipblasLtMatmul`` returns ``HIPBLAS_STATUS_SUCCESS``.
 A rate-limited warning is also printed to ``stderr`` (at most 5 times per process).
 
-In **fixed-s mode** (set with ``hipblasLtSetEmulationNumModuli(handle, N)`` for N in [2..18]),
+In **fixed-s mode** (set with ``hipblasLtSetEmulationNumModuli(handle, N)`` for N in [2..20]),
 no CRT overflow check is performed.
 For inputs that would overflow native FP64 DGEMM, fixed-s emulation silently produces a wrong
 finite result instead of ``Inf``.
@@ -229,8 +241,8 @@ per-handle API settings to match the cuBLAS environment-variable contract.
 
    "``HIPBLASLT_EMULATE_DOUBLE_PRECISION``", "``0``", "Set to ``1`` to enable FP64 emulation for all handles in the process."
    "``HIPBLASLT_EMULATION_STRATEGY``", "``performant``", "Controls when emulation is applied: ``performant`` (arithmetic-intensity heuristic) or ``eager`` (always)."
-   "``HIPBLASLT_EMULATION_NUM_MODULI``", "*(unset → ADP)*", "Fixed number of CRT moduli to use [2..18]. When unset, ADP mode is active and the library selects the moduli count adaptively per call. Warning: fixed mode does not guarantee accuracy for all inputs."
-   "``HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK``", "``3``", "Bitmask controlling Inf/NaN detection. Bit 0 = Inf detection; bit 1 = NaN detection. Set to ``0`` to disable both and avoid the associated device-to-host synchronization."
+   "``HIPBLASLT_EMULATION_NUM_MODULI``", "*(unset → ADP)*", "Fixed number of CRT moduli to use [2..20]. When unset, ADP mode is active and the library selects the moduli count adaptively per call. Warning: fixed mode does not guarantee accuracy for all inputs."
+   "``HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK``", "``3``", "Bitmask controlling Inf/NaN detection. Bit 0 = Inf detection; bit 1 = NaN detection. Default ``3`` enables both; set to ``0`` to disable both and avoid the associated device-to-host synchronization."
 
 API reference
 ===============
@@ -279,7 +291,7 @@ Sets the number of CRT moduli used per emulation call.
 
 *  ``numModuli = -1`` — ADP mode (default). The library adaptively selects the minimum number of
    moduli needed to achieve FP64 accuracy on each call based on the input data.
-*  ``numModuli`` in [2..18] — FIXED mode. Exactly that many moduli are used regardless of input.
+*  ``numModuli`` in [2..20] — FIXED mode. Exactly that many moduli are used regardless of input.
 
 .. warning::
 
@@ -292,7 +304,8 @@ Notable CRT capacity values:
 *  ``7`` → ~55.7 CRT bits
 *  ``10`` → ~79.2 CRT bits
 *  ``16`` → ~125.4 CRT bits (exceeds IEEE 754 double precision)
-*  ``18`` → ~140.4 CRT bits (maximum)
+*  ``18`` → ~140.4 CRT bits
+*  ``20`` → ~155 CRT bits (maximum)
 
 hipblasLtSetEmulationSpecialValuesSupport
 ------------------------------------------
@@ -306,7 +319,7 @@ Sets the bitmask that controls Inf/NaN detection for a handle.
 
 *  Bit 0 — detect Inf values.
 *  Bit 1 — detect NaN values.
-*  Default mask: ``3`` (both enabled).
+*  Default mask: ``3`` (``0b11``) — both bits set, enabling both Inf and NaN detection.
 *  Set to ``0`` to disable detection and avoid the associated device-to-host synchronization.
 
 hipblasLtEmulationWorkspaceSize
@@ -328,7 +341,92 @@ The ``handle`` provides the device selection and the configured moduli count (as
 Returns ``0`` if emulation is not supported for the current device or if the handle is
 configured for native-only mode.
 
-This workspace must be provided to ``hipblasLtMatmul`` via the heuristic preference object
-(``HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES``).
+**Workspace sizing**
+
+The optimal workspace holds all INT8 and INT32 buffers for *s* moduli simultaneously
+(single-pass, no chunking).  Its size scales approximately as:
+
+.. code-block:: none
+
+   optimal ≈ s × (m·k + k·n + 4·m·n)  bytes
+
+where *s* is at most 20 in ADP mode.  For a square GEMM with M = N = K = 32768 and ADP
+(s = 20) this amounts to roughly **120 GiB**.
+
+The emulation accepts *any* workspace smaller than the optimal size.
+When the available workspace is insufficient for a single pass, moduli are split into
+multiple sequential passes; performance degrades gracefully rather than failing.
+**16 GiB** is a practical upper bound that yields near-optimal performance for all
+problem sizes encountered in practice.
+
+Passing ``nullptr`` workspace (zero bytes) is also valid: the library will fall back to a
+minimal workspace allocation and process one modulus at a time.
+
+The following example allocates workspace and passes it to ``hipblasLtMatmul`` via the
+heuristic preference:
+
+.. code-block:: c
+
+   /* Query optimal workspace for this problem. */
+   const size_t ws_bytes = hipblasLtEmulationWorkspaceSize(
+       handle, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k);
+
+   /* Cap at 16 GiB for near-optimal performance on any problem size. */
+   const size_t alloc_bytes = (ws_bytes < 16ull << 30) ? ws_bytes : 16ull << 30;
+
+   void* d_workspace = nullptr;
+   if (alloc_bytes > 0)
+       hipMalloc(&d_workspace, alloc_bytes);
+
+   /* Inform the heuristic search of the available budget. */
+   hipblasLtMatmulPreference_t pref;
+   hipblasLtMatmulPreferenceCreate(&pref);
+   hipblasLtMatmulPreferenceSetAttribute(pref,
+       HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+       &alloc_bytes, sizeof(alloc_bytes));
+
+   /* Run the GEMM with the pre-allocated workspace. */
+   hipblasLtMatmulAlgoGetHeuristic(handle, matmul_desc, layout_a, layout_b,
+                                   layout_c, layout_d, pref, 1, &heuristic, &algo_count);
+   hipblasLtMatmul(handle, matmul_desc, &alpha,
+                   A, layout_a, B, layout_b,
+                   &beta, C, layout_c, D, layout_d,
+                   &heuristic.algo, d_workspace, alloc_bytes, stream);
+
+   if (d_workspace) hipFree(d_workspace);
+
 Alternatively, call ``hipblasLtMatmulAlgoGetHeuristic`` with a sufficiently large workspace budget;
 the heuristic result will report the exact bytes required in ``hipblasLtMatmulHeuristicResult_t::workspaceSize``.
+
+Benchmarking emulation with hipblaslt-bench
+============================================
+
+``hipblaslt-bench`` supports two ways to set the workspace budget when benchmarking FP64
+emulation.
+
+**Command-line** (``--workspace <bytes>``, default: 128 MiB)
+
+.. code-block:: bash
+
+   HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 \
+   HIPBLASLT_EMULATION_STRATEGY=eager \
+     hipblaslt-bench -m 32768 -n 32768 -k 32768 -r f64_r \
+                     --workspace 17179869184
+
+The ``--workspace`` value sets the workspace budget in bytes.
+16 GiB = 17179869184 bytes covers the optimal single-pass workspace for all problem sizes
+that fit on a typical GPU.
+
+**YAML** (``user_allocated_workspace: <bytes>``)
+
+.. code-block:: yaml
+
+   - {function: matmul, type_a: f64_r, type_b: f64_r, type_c: f64_r, type_d: f64_r, m: 32768, n: 32768, k: 32768, user_allocated_workspace: 17179869184}
+
+Run the YAML file with:
+
+.. code-block:: bash
+
+   HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 \
+   HIPBLASLT_EMULATION_STRATEGY=eager \
+     hipblaslt-bench --yaml my_bench.yaml

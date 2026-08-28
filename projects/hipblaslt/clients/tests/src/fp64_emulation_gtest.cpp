@@ -70,8 +70,8 @@ namespace
     TEST_F(Fp64EmulationHostTest, NumModuliInValidRange)
     {
         const unsigned s = fp64EmulationNumModuli();
-        // 0 = env var absent → ADP mode (no fixed count); [2..18] = fixed count
-        EXPECT_TRUE(s == 0u || (s >= 2u && s <= 18u));
+        // 0 = env var absent → ADP mode (no fixed count); [2..20] = fixed count
+        EXPECT_TRUE(s == 0u || (s >= 2u && s <= 20u));
     }
 
     TEST_F(Fp64EmulationHostTest, ParseEnabledEnv)
@@ -167,19 +167,33 @@ namespace
     };
 
     // Workspace must be non-empty and not shrink as the moduli count grows.
+    // Also verifies that workspace_cap is respected.
     TEST_F(Fp64EmulationTest, WorkspaceSizePositiveAndMonotonic)
     {
-        const int64_t         m = 1024, n = 1024, k = 1024;
+        const int64_t m = 1024, n = 1024, k = 1024;
+
+        // ── Uncapped: return the full optimal size ────────────────────────
         Fp64EmulationDecision d{};
-        d.dynamic_mode = false;
-        d.num_moduli   = 8;
-        const size_t ws8
-            = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
-        d.num_moduli = 16;
-        const size_t ws16
-            = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+        d.dynamic_mode  = false;
+        d.workspace_cap = ~size_t{0}; // no cap
+
+        d.num_moduli      = 8;
+        const size_t ws8  = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+        d.num_moduli      = 16;
+        const size_t ws16 = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+
         EXPECT_GT(ws8, 0u);
         EXPECT_GE(ws16, ws8);
+
+        // ── Capped: returned size must not exceed the cap ─────────────────
+        // Use ws8/2 as a cap that is guaranteed to be strictly less than ws8
+        // (ws8 > 0 was asserted above), so the cap genuinely constrains the result.
+        const size_t cap    = ws8 / 2;
+        d.num_moduli        = 8;
+        d.workspace_cap     = cap;
+        const size_t ws8_capped
+            = fp64EmulationWorkspaceSize(m_roc, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+        EXPECT_LE(ws8_capped, cap);
     }
 
     TEST_F(Fp64EmulationTest, PublicWorkspaceSizeRejectsNegativeDimensions)
@@ -800,7 +814,11 @@ namespace
             EmulAccuracyParam{
                 17, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
             EmulAccuracyParam{
-                18, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+                18, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                19, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                20, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
         EmulAccuracyParamName);
 
     // ── NearSignFlip: adversarial distributions pushing X_true toward M_s/2 ──
@@ -840,6 +858,10 @@ namespace
                 17, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
             EmulAccuracyParam{
                 18, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                19, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                20, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
             // Geometric row-/col-scaling (wide dynamic range)
             EmulAccuracyParam{
                 7, 128, 128, 4096, 5e-4, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
@@ -864,7 +886,11 @@ namespace
             EmulAccuracyParam{
                 17, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
             EmulAccuracyParam{
-                18, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+                18, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                19, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{
+                20, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
         EmulAccuracyParamName);
 
     // ── TransposeCombinations: all 4 op(A)×op(B) transpose variants ──────────
@@ -1331,6 +1357,8 @@ namespace
     //   s=16 (log2P≈61.19): b_max = 8  → powers of 2 in [1,8]  = {1,2,4,8}
     //   s=17 (log2P≈64.98): b_max = 11 → powers of 2 in [1,11] = {1,2,4,8}
     //   s=18 (log2P≈68.73): b_max = 15 → powers of 2 in [1,15] = {1,2,4,8}
+    //   s=19 (log2P≈73.47): b_max = 20 → powers of 2 in [1,20] = {1,2,4,8,16}
+    //   s=20 (log2P≈77.19): b_max = 24 → powers of 2 in [1,24] = {1,2,4,8,16}
     //
     // n=512 gives 262144 output elements per test (vs 16384 for n=128) while
     // keeping the host h_lag reference computation at O(n²) ≈ 3 ms.
@@ -1366,7 +1394,19 @@ namespace
             EmulDemmelParam{18, 512, 1, 1e-13},
             EmulDemmelParam{18, 512, 2, 1e-13},
             EmulDemmelParam{18, 512, 4, 1e-13},
-            EmulDemmelParam{18, 512, 8, 1e-13}),
+            EmulDemmelParam{18, 512, 8, 1e-13},
+            // s=19 (~148 CRT bits), b_max=20 — b=16 is newly safe for s≥19
+            EmulDemmelParam{19, 512, 1, 1e-13},
+            EmulDemmelParam{19, 512, 2, 1e-13},
+            EmulDemmelParam{19, 512, 4, 1e-13},
+            EmulDemmelParam{19, 512, 8, 1e-13},
+            EmulDemmelParam{19, 512, 16, 1e-13},
+            // s=20 (~155 CRT bits), b_max=24 — b=16 safe for s≥19
+            EmulDemmelParam{20, 512, 1, 1e-13},
+            EmulDemmelParam{20, 512, 2, 1e-13},
+            EmulDemmelParam{20, 512, 4, 1e-13},
+            EmulDemmelParam{20, 512, 8, 1e-13},
+            EmulDemmelParam{20, 512, 16, 1e-13}),
         EmulDemmelParamName);
 
     // ── IllConditionedGramMatrix: disabled ─────────────────────────────────────
@@ -1905,7 +1945,7 @@ namespace
         }
 
         Fp64EmulationSettings emu_settings{};
-        emu_settings.num_moduli      = 18u; /* ADP upper bound */
+        emu_settings.num_moduli      = 20u; /* ADP upper bound */
         emu_settings.dynamic_mode    = true; /* ADP: select s from data */
         emu_settings.sv_mask         = 0u;
         const size_t _struct_ws_sz = hipblasLtEmulationWorkspaceSize(

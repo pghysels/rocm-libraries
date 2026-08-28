@@ -91,6 +91,33 @@ namespace FP64Emulation
         return static_cast<unsigned>(std::max(size_t(1u), chunk));
     }
 
+    /* Compute the effective INT8 workspace budget for the monolithic path given
+     * workspace_bytes and sub-problem dimensions (m, n).  Mirrors the two-step
+     * budget derivation in emulated_gemm_impl so that effective_time_ms accurately
+     * models the available budget at each recursive split level.             */
+    static size_t compute_budget_from_ws(int64_t  m,
+                                         int64_t  n,
+                                         int64_t  k,
+                                         unsigned s,
+                                         bool     dynamic_mode,
+                                         size_t   workspace_bytes)
+    {
+        const unsigned s_lay  = dynamic_mode ? S_MAX : s;
+        const size_t   co     = pad(static_cast<size_t>(m));
+        const size_t   pn     = pad(static_cast<size_t>(n));
+        const size_t   boh    = co * sizeof(int16_t) + pn * sizeof(int16_t) + sizeof(uint32_t)
+                              + co * sizeof(int32_t) + pn * sizeof(int32_t) + 2 * sizeof(float)
+                              + OZ2_INT8_GEMM_WS_BYTES;
+        const size_t   W1     = (workspace_bytes > boh) ? workspace_bytes - boh : 0u;
+        const unsigned cs1    = compute_chunk_size(m, n, k, s_lay, W1);
+        if(cs1 < s_lay)
+        {
+            const size_t zoh = 2u * co * static_cast<size_t>(n) * sizeof(double);
+            return (workspace_bytes > boh + zoh) ? workspace_bytes - boh - zoh : 0u;
+        }
+        return W1;
+    }
+
     /* Kernel efficiency factors and latency constants calibrated on MI355X. */
     struct PerfModelKernelEffs
     {
@@ -261,6 +288,10 @@ namespace FP64Emulation
      * one split does not yet reduce n_chunks but further splitting would: the
      * recursive sub-call for the half discovers and accounts for those deeper
      * splits, returning the true best achievable time for that half.       */
+    /* workspace_bytes is passed through to each recursive sub-call so that every
+     * level recomputes its own budget from the current sub-problem dimensions —
+     * mirroring the behaviour of emulated_gemm_impl, where smaller sub-problems
+     * have smaller Zhi/Zlo requirements and thus a larger effective budget.    */
     static double effective_time_ms(bool     tA,
                                     bool     tB,
                                     int64_t  m,
@@ -269,11 +300,19 @@ namespace FP64Emulation
                                     unsigned s,
                                     int      device,
                                     bool     dynamic_mode,
-                                    size_t   budget)
+                                    size_t   workspace_bytes)
     {
         if(m < FP64_EMUL_MIN_MN || n < FP64_EMUL_MIN_MN)
-            return perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget).t_native_ms;
-        const double t_mono = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget).t_total_ms;
+        {
+            /* For sub-threshold shapes (m or n < 16) emulated_gemm_impl falls back to
+             * native DGEMM immediately, so emulation has strictly more overhead than
+             * native.  Return t_native * (1 + ε) so the performance gate always prefers
+             * native for these shapes.                                                  */
+            const double t_nat = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, ~size_t{0}).t_native_ms;
+            return t_nat * (1.0 + 1e-6);
+        }
+        const size_t budget  = compute_budget_from_ws(m, n, k, s, dynamic_mode, workspace_bytes);
+        const double t_mono  = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget).t_total_ms;
 
         const unsigned chunk_sz = compute_chunk_size(m, n, k, s, budget);
         const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -283,10 +322,11 @@ namespace FP64Emulation
             const int64_t half_m  = split_m ? m / 2 : m;
             const int64_t half_n  = split_m ? n : n / 2;
 
-            /* Both halves are nearly identical in size (differ by at most 1 when
-             * m or n is odd), so approximate t_split = 2 × t_half.             */
+            /* Pass workspace_bytes (not budget) so each recursive sub-call recomputes
+             * its own budget from its own (half_m, half_n) dimensions.          */
             const double t_split
-                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode, budget);
+                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode,
+                                         workspace_bytes);
             if(t_split < t_mono)
                 return t_split;
         }
@@ -305,9 +345,10 @@ namespace FP64Emulation
                                                      unsigned s,
                                                      int      device,
                                                      bool     dynamic_mode,
-                                                     size_t   budget)
+                                                     size_t   workspace_bytes)
     {
-        PerfModelTimes mono = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget);
+        const size_t   budget = compute_budget_from_ws(m, n, k, s, dynamic_mode, workspace_bytes);
+        PerfModelTimes mono   = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget);
 
         const unsigned chunk_sz = compute_chunk_size(m, n, k, s, budget);
         const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -318,11 +359,12 @@ namespace FP64Emulation
             const int64_t half_n  = split_m ? n : n / 2;
 
             const double t_split
-                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode, budget);
+                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode,
+                                         workspace_bytes);
             if(t_split < mono.t_total_ms)
             {
                 PerfModelTimes half = effective_perf_model_times(
-                    tA, tB, half_m, half_n, k, s, device, dynamic_mode, budget);
+                    tA, tB, half_m, half_n, k, s, device, dynamic_mode, workspace_bytes);
                 half.t_prelim_ms *= 2.0;
                 half.t_prelim_gemm_ms *= 2.0;
                 half.t_refine_ms *= 2.0;
@@ -2133,11 +2175,13 @@ namespace FP64Emulation
                     : perf_model_times(tA, tB, m, n, k, num_moduli, device, settings.dynamic_mode,
                                        ws_budget)
                           .t_total_ms;
+                /* Pass settings.workspace_bytes (not ws_budget) so the sub-call recomputes
+                 * its own budget from the smaller (half_m, half_n) dimensions.           */
                 const double t_split = force_split ? 0.0
                     : 2.
                       * effective_time_ms(
                           tA, tB, half_m, half_n, k, num_moduli, device, settings.dynamic_mode,
-                          ws_budget);
+                          settings.workspace_bytes);
 
                 if(force_split || t_split < t_mono)
                 {
@@ -2819,24 +2863,12 @@ bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
     /* ADP: handle sentinel (-1) AND env var absent (returns 0). */
     const bool     dyn        = (h->emulation.num_moduli < 2) && (fp64EmulationNumModuli() == 0u);
     const unsigned num_moduli = fp64EmulationEffectiveNumModuli(h);
-    /* Compute effective budget from workspace_bytes.
-     * SIZE_MAX (default) = no constraint → chunk_size = s (optimal). */
-    size_t budget;
-    {
-        const unsigned s_lay = dyn ? S_MAX : num_moduli;
-        const size_t co_g = pad(static_cast<size_t>(m)), pn_g = pad(static_cast<size_t>(n));
-        const size_t boh = co_g*sizeof(int16_t)+pn_g*sizeof(int16_t)+sizeof(uint32_t)
-                         + co_g*sizeof(int32_t)+pn_g*sizeof(int32_t)+2*sizeof(float)
-                         + OZ2_INT8_GEMM_WS_BYTES;
-        const size_t W1 = (workspace_bytes > boh) ? workspace_bytes - boh : 0u;
-        const unsigned cs1 = compute_chunk_size(m, n, k, s_lay, W1);
-        if(cs1 < s_lay) {
-            const size_t zoh = 2u * co_g * static_cast<size_t>(n) * sizeof(double);
-            budget = (workspace_bytes > boh + zoh) ? workspace_bytes - boh - zoh : 0u;
-        } else { budget = W1; }
-    }
-    const double   t_emul     = effective_time_ms(tA, tB, m, n, k, num_moduli, device, dyn, budget);
-    const double t_native = perf_model_times(tA, tB, m, n, k, num_moduli, device, dyn, ~size_t{0}).t_native_ms;
+    /* effective_time_ms now accepts workspace_bytes directly and recomputes the
+     * budget at each recursive split level, mirroring emulated_gemm_impl.     */
+    const double t_emul  = effective_time_ms(tA, tB, m, n, k, num_moduli, device, dyn,
+                                              workspace_bytes);
+    const double t_native = perf_model_times(tA, tB, m, n, k, num_moduli, device, dyn,
+                                              ~size_t{0}).t_native_ms;
     return t_emul <= t_native;
 }
 
@@ -3004,7 +3036,14 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
     const bool eager
         = (h->emulation.strategy == 2) || (h->emulation.strategy != 1 && fp64EmulationIsEager());
     if(eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, workspace_bytes))
+    {
         result.apply = true;
+        /* Store the caller's workspace preference so fp64EmulationWorkspaceSize
+         * can cap the returned size at min(optimal, workspace_cap).  This
+         * ensures the library never reports a workspace larger than the user
+         * allocated.                                       */
+        result.workspace_cap = workspace_bytes;
+    }
 
     return result;
 }
@@ -3078,7 +3117,7 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
      *   Non-fused:  chunk_ws slots for the batched INT8 GEMMs.                */
     const size_t n_c32i_ws = static_cast<size_t>(chunk_ws);
 
-    return chunk_ws * lda8i * cola8i * sizeof(int8_t)
+    const size_t optimal = chunk_ws * lda8i * cola8i * sizeof(int8_t)
            + chunk_ws * ldb8i * static_cast<size_t>(n) * sizeof(int8_t)
            + n_c32i_ws * szC32i * sizeof(int32_t) + szZhi_ws * sizeof(double) * 2
            + cola8i * sizeof(int16_t) + padn * sizeof(int16_t) + sizeof(uint32_t)
@@ -3086,6 +3125,7 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
            + padn * sizeof(int32_t) /* col_max[n] — precomputed by partial kernel */
            + 2 * sizeof(float) /* ADP float buffer: adp_buf[0..1] (bias ±200) */
            + OZ2_INT8_GEMM_WS_BYTES; /* INT8 GEMM workspace (preliminary + batch)  */
+    return std::min(optimal, decision.workspace_cap);
 }
 
 unsigned fp64EmulationNumModuli()
@@ -3202,8 +3242,10 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
         const bool is_eager_g = (h->emulation.strategy == 2) ||
                                  (h->emulation.strategy != 1 && fp64EmulationIsEager());
 
+        /* Pass W (workspace_bytes) so effective_time_ms recomputes the budget at each
+         * recursive level — consistent with the fix to fp64EmulationPerformanceCheck. */
         const double t_emul_W  = is_eager_g ? 0.0
-            : effective_time_ms(tA_g, tB_g, m, n, k, num_moduli, device, dyn_g, W_var);
+            : effective_time_ms(tA_g, tB_g, m, n, k, num_moduli, device, dyn_g, W);
         const double t_native_g = is_eager_g ? 1.0
             : perf_model_times(tA_g, tB_g, m, n, k, num_moduli,
                                device, dyn_g, ~size_t{0}).t_native_ms;

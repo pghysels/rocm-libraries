@@ -12,7 +12,7 @@
  *
  * Environment variables:
  *   HIPBLASLT_EMULATE_DOUBLE_PRECISION=1   enables emulation
- *   HIPBLASLT_EMULATION_NUM_MODULI=N        force fixed moduli count [2..18].
+ *   HIPBLASLT_EMULATION_NUM_MODULI=N        force fixed moduli count [2..20].
  *     WARNING: bypasses the adaptive (ADP) precision check; accuracy is not
  *     guaranteed for all inputs.  The recommended usage is NOT to set this
  *     variable and rely on the default ADP mode instead.
@@ -100,11 +100,11 @@ bool fp64EmulationIsEager();
  * A return value of 0 means no Inf/NaN checking is performed. */
 uint32_t fp64EmulationSpecialValuesMask();
 
-/* Returns the fixed moduli count from HIPBLASLT_EMULATION_NUM_MODULI [2..18],
+/* Returns the fixed moduli count from HIPBLASLT_EMULATION_NUM_MODULI [2..20],
  * or 0 if the env var is absent or invalid (= ADP/dynamic mode).
  * Cached on first call.  Use fp64EmulationEffectiveNumModuli(h) to get the
  * fully-resolved count (handle override → env var → S_MAX for ADP).
- * Maximum supported: 18 moduli (~140 bits of CRT capacity). */
+ * Maximum supported: 20 moduli (~155 bits of CRT capacity). */
 unsigned fp64EmulationNumModuli();
 
 /* =========================================================================
@@ -117,6 +117,7 @@ struct Fp64EmulationDecision
     unsigned int     num_moduli; /* resolved moduli count to pass to settings  */
     unsigned int     sv_mask; /* resolved special-values mask               */
     bool             dynamic_mode; /* true when DYNAMIC (ADP) mode selected      */
+    size_t           workspace_cap; /* caller workspace limit; ~size_t{0} = none */
 };
 
 /* Status-returning FP64 emulation gate. Invalid env-var values return
@@ -136,20 +137,24 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
                                             int32_t                  batch_count,
                                             size_t                   workspace_bytes);
 
-/* Returns the upper bound on CRT moduli (2..18) for the given handle.
+/* Returns the upper bound on CRT moduli (2..20) for the given handle.
  * Used as the workspace layout count and the ADP upper bound.
- *   FIXED (num_moduli ∈ [2..18]): returns that count directly.
- *   ADP  (sentinel/unset, env var absent): returns S_MAX (= 18), the upper
+ *   FIXED (num_moduli ∈ [2..20]): returns that count directly.
+ *   ADP  (sentinel/unset, env var absent): returns S_MAX (= 20), the upper
  *     bound used for workspace pre-allocation.  ADP selects the actual per-call
  *     s from the input data at run time; there is no fixed default. */
 unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h);
 
-/* Returns the optimal (single-pass, maximum-performance) workspace size in bytes
- * for the given problem.  The decision selects the layout moduli (S_MAX=18 in
- * ADP mode, decision.num_moduli in FIXED mode).
- * Callers should pass this size to hipblasLtMatmul as the workspace budget for
- * best performance.  Providing less will cause multi-pass execution or fallback
- * to native DGEMM if emulation cannot beat native with the reduced budget. */
+/* Returns the workspace size in bytes for the given problem.
+ * The decision selects the layout moduli (S_MAX=20 in ADP mode,
+ * decision.num_moduli in FIXED mode).
+ * When decision.workspace_cap != ~size_t{0} (set by fp64EmulationDecision
+ * from the caller's workspace preference), the returned size is capped at
+ * min(optimal, decision.workspace_cap).  This allows the library to report a
+ * workspace size that never exceeds the user's allocation, while the
+ * performance model correctly accounts for the constrained (split) execution.
+ * Providing less workspace than optimal will cause multi-pass or spatial-split
+ * execution; the performance model accounts for this correctly. */
 size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
                                   hipblasOperation_t           opA,
                                   hipblasOperation_t           opB,
@@ -163,7 +168,7 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
  * function to fall back to the process-wide env var defaults.              */
 struct Fp64EmulationSettings
 {
-    unsigned int num_moduli; /* 2..18; 0 = derive from env var          */
+    unsigned int num_moduli; /* 2..20; 0 = derive from env var          */
     unsigned int sv_mask; /* special-values mask; ~0u = env var      */
     bool         dynamic_mode; /* true when ADP (Adaptive Precision) mode */
     void*        workspace; /* caller workspace; nullptr = no workspace */
@@ -176,22 +181,12 @@ struct Fp64EmulationSettings
  * device pointers to double arrays. C and D may be the same pointer.
  * Only non-batched (batch count == 1) FP64 GEMM is supported.
  *
- * Subnormal inputs (flush-to-zero semantics)
- * -------------------------------------------
- * Subnormal FP64 values in A or B (magnitudes in the range [DBL_TRUE_MIN,
- * DBL_MIN)) are silently treated as zero during the INT8 extraction step.
- * Any dot-product element whose true value would be subnormal may therefore
- * be returned as 0.0 instead of the correct subnormal.  The absolute error
- * is at most DBL_MIN ≈ 2.2e-308.
- * If subnormal correctness is required, disable emulation for the affected
- * GEMMs or fall back to native FP64 DGEMM.
- *
  * Returns rocblaslt_status_success on success,
  *         rocblaslt_status_memory_error if no workspace is provided (W==0)
  *             or the workspace is too small for emulation to outperform native DGEMM,
  *         rocblaslt_status_invalid_value if Inf/NaN is detected in the inputs
  *             (controlled by the sv_mask field in settings), or if dynamic
- *             mode (ADP) determines that even s=18 is insufficient for the
+ *             mode (ADP) determines that even s=20 is insufficient for the
  *             given input's dynamic range.
  *             In both invalid_value cases the caller should fall back to native FP64. */
 rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
