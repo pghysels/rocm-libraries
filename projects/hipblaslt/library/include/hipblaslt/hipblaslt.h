@@ -1245,6 +1245,38 @@ hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t hand
                                                           unsigned int      mask);
 
 /*! \ingroup library_module
+ *  \brief Set the ADP target accuracy tolerance for FP64 emulation.
+ *
+ *  \details
+ *  Controls the minimum relative accuracy that ADP (Adaptive Precision) mode
+ *  must achieve.  ADP selects the fewest CRT moduli needed to meet this
+ *  threshold; a looser tolerance allows fewer moduli and therefore faster
+ *  GEMMs at reduced precision.
+ *
+ *  The tolerance is converted internally to a mantissa-bit count via
+ *  \c floor(-log2(tolerance)):
+ *
+ *  | tolerance | mantissa bits | typical use case |
+ *  |-----------|---------------|------------------|
+ *  | ~1.11e-16 | 52 (default)  | full FP64        |
+ *  | 1e-8      | 26            | mixed-precision  |
+ *
+ *  Only affects ADP (dynamic) mode.  Has no effect when
+ *  \ref hipblasLtSetEmulationNumModuli is called with a fixed count.
+ *
+ *  @param[in]  handle     hipBLASLt handle.
+ *  @param[in]  tolerance  Target relative accuracy, in (0, 1].  Pass 0 or a
+ *                         value > 1 to reset to the process-wide default
+ *                         (HIPBLASLT_EMULATION_TOLERANCE or 52 bits).
+ *
+ *  \retval HIPBLAS_STATUS_SUCCESS         Setting applied successfully.
+ *  \retval HIPBLAS_STATUS_INVALID_VALUE   \p handle is NULL.
+ */
+HIPBLASLT_EXPORT
+hipblasStatus_t hipblasLtSetEmulationTolerance(hipblasLtHandle_t handle,
+                                                   double            tolerance);
+
+/*! \ingroup library_module
  *  \brief Compute the GPU workspace required by the FP64 emulation for a given problem.
  *
  *  \details

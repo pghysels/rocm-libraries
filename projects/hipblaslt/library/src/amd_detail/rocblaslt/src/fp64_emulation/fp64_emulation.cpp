@@ -873,7 +873,8 @@ namespace FP64Emulation
     __global__ static void adp_reduce_A_kernel(const int32_t* __restrict__ row_max,
                                                const int16_t* __restrict__ sftA_init,
                                                int64_t m,
-                                               float* __restrict__ adp_A_out)
+                                               float* __restrict__ adp_A_out,
+                                               float adp_bits)
     {
         __shared__ float s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
         const int64_t    row
@@ -882,14 +883,14 @@ namespace FP64Emulation
         /* Biased log2P requirement for this row.
          * Skip rows where row_max == 0: those rows have all-zero preliminary inner
          * products (e.g. zero-matrix inputs) and need zero CRT precision (s=2).
-         * Using max(row_max,1) would incorrectly return (52 − sftA_init) bits for
-         * zero rows because sftA_init=6 is a dummy value set for zero inputs.    */
+         * Using max(row_max,1) would incorrectly return (adp_bits − sftA_init)
+         * bits for zero rows because sftA_init=6 is a dummy value set for zero inputs. */
         float local_val = 0.0f; /* 0.0f = biased −200 = needs no precision */
         if(row < m && row_max[row] > 0)
         {
             const int32_t rm     = row_max[row];
             const float   sftA_f = static_cast<float>(sftA_init[row]);
-            local_val            = (52.0f - sftA_f) + 0.5f * log2f(static_cast<float>(rm)) + 200.0f;
+            local_val            = (adp_bits - sftA_f) + 0.5f * log2f(static_cast<float>(rm)) + 200.0f;
         }
 
         /* Warp-level max reduction. */
@@ -946,7 +947,8 @@ namespace FP64Emulation
     __global__ static void adp_reduce_B_kernel(const int32_t* __restrict__ col_max,
                                                int64_t n,
                                                const int16_t* __restrict__ sftB_init,
-                                               float* __restrict__ adp_B_out)
+                                               float* __restrict__ adp_B_out,
+                                               float adp_bits)
     {
         const int64_t col
             = static_cast<int64_t>(blockIdx.x) * blockDim.x + static_cast<int64_t>(threadIdx.x);
@@ -959,7 +961,7 @@ namespace FP64Emulation
         {
             const float sftB_f = static_cast<float>(sftB_init[col]);
             const float req_biased
-                = (52.0f - sftB_f) + 0.5f * log2f(static_cast<float>(local_max)) + 200.0f;
+                = (adp_bits - sftB_f) + 0.5f * log2f(static_cast<float>(local_max)) + 200.0f;
             adp_atomicMaxF(adp_B_out, req_biased);
         }
     }
@@ -1599,9 +1601,21 @@ namespace FP64Emulation
                                                    nullptr,
                                                    0,
                                                    stream);
+        /* Synchronize the stream before destroying the handle.
+         * hipblasLtMatmul() is asynchronous: the DGEMM kernel is enqueued on
+         * the stream and control returns immediately.  The subsequent cleanup()
+         * calls hipblasLtDestroy(fp64_handle), which calls hipModuleUnload()
+         * for all GPU kernel modules loaded by that handle.  If the DGEMM
+         * kernel is still executing when its module is unloaded, the in-flight
+         * kernel reads from freed GPU memory, producing an illegal memory
+         * access (700) GPU fault and causing every subsequent hipModuleUnload()
+         * in the cleanup lambda to fail with the same error.                   */
+        const hipError_t sync_err = hipStreamSynchronize(stream);
+        (void)hipGetLastError();
         cleanup();
-        return (st == HIPBLAS_STATUS_SUCCESS) ? rocblaslt_status_success
-                                              : rocblaslt_status_internal_error;
+        return (st == HIPBLAS_STATUS_SUCCESS && sync_err == hipSuccess)
+                   ? rocblaslt_status_success
+                   : rocblaslt_status_internal_error;
     }
 
     /* =========================================================================
@@ -2579,6 +2593,12 @@ namespace FP64Emulation
         {
             _pstart();
             (void)hipMemsetAsync(adp_buf, 0, 2 * sizeof(float), stream);
+            /* Resolve ADP target precision: settings sentinel 0 → env var default (52). */
+            const float adp_bits = static_cast<float>(
+                (settings.adp_mantissa_bits > 0)
+                    ? settings.adp_mantissa_bits
+                    : fp64EmulationAdpMantissaBits());
+
             /* A-side: reads row_max[] and sftA[] before apply_kernel modifies sftA. */
             hipLaunchKernelGGL(adp_reduce_A_kernel,
                                dim3(sftA_m_blks),
@@ -2588,7 +2608,8 @@ namespace FP64Emulation
                                row_max,
                                sftA,
                                m,
-                               adp_buf + 0);
+                               adp_buf + 0,
+                               adp_bits);
             /* B-side: reads precomputed col_max[] (not C32i) before refine_sftB_kernel modifies sftB. */
             hipLaunchKernelGGL(adp_reduce_B_kernel,
                                dim3((static_cast<unsigned>(n) + 255u) / 256u),
@@ -2598,7 +2619,8 @@ namespace FP64Emulation
                                col_max,
                                n,
                                sftB,
-                               adp_buf + 1);
+                               adp_buf + 1,
+                               adp_bits);
 
             /* Sync, copy 2 floats, compute effective_s on host.
              * hipGetLastError() clears any sticky thread-level error that may have
@@ -3030,7 +3052,11 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
     /* ADP (dynamic) mode: handle is at sentinel (-1) AND env var is not set.
      * Use the cached fp64EmulationNumModuliIsFixed() — avoids raw getenv(). */
     /* ADP: handle sentinel (-1) AND env var absent (fp64EmulationNumModuli() == 0). */
-    result.dynamic_mode = (h->emulation.num_moduli < 2) && (fp64EmulationNumModuli() == 0u);
+    result.dynamic_mode      = (h->emulation.num_moduli < 2) && (fp64EmulationNumModuli() == 0u);
+    /* ADP target precision: handle setter (>0) > env var > built-in default (52 bits). */
+    result.adp_mantissa_bits = (h->emulation.adp_mantissa_bits > 0)
+                                   ? h->emulation.adp_mantissa_bits
+                                   : fp64EmulationAdpMantissaBits();
 
     /* Strategy (eager vs performant). */
     const bool eager
@@ -3139,6 +3165,39 @@ unsigned fp64EmulationNumModuli()
         const auto parsed = fp64EmulationParseNumModuliEnv(
             std::getenv("HIPBLASLT_EMULATION_NUM_MODULI"));
         return (parsed.state == FP64_EMULATION_ENV_VALID) ? parsed.value : 0u;
+    }();
+    return v;
+}
+
+Fp64EmulationEnvValue fp64EmulationParseToleranceEnv(const char* value)
+{
+    /* Converts a positive tolerance string to a mantissa-bit count.
+     * bits = clamp(floor(-log2(tol)), 1, 52).
+     * Examples: "1e-16" → 53 (1e-16 < eps, slightly conservative)
+     *           "1e-8"  → 26
+     *           "1e-4"  → 13                                             */
+    if(value == nullptr)
+        return {FP64_EMULATION_ENV_UNSET, 52u};
+    char*        endp = nullptr;
+    const double tol  = std::strtod(value, &endp);
+    if(endp == value || *endp != '\0' || tol <= 0.0 || tol > 1.0)
+        return {FP64_EMULATION_ENV_INVALID, 0u};
+    const int bits = static_cast<int>(std::floor(-std::log2(tol)));
+    const unsigned clamped = static_cast<unsigned>(std::max(1, std::min(bits, 52)));
+    return {FP64_EMULATION_ENV_VALID, clamped};
+}
+
+int fp64EmulationAdpMantissaBits()
+{
+    /* Returns the ADP target precision in mantissa bits [1..52].
+     * Reads HIPBLASLT_EMULATION_TOLERANCE once and caches the result.
+     * Default (absent or invalid): 52 (full IEEE 754 FP64 precision).      */
+    static const int v = []() -> int {
+        const auto parsed = fp64EmulationParseToleranceEnv(
+            std::getenv("HIPBLASLT_EMULATION_TOLERANCE"));
+        return (parsed.state == FP64_EMULATION_ENV_VALID)
+                   ? static_cast<int>(parsed.value)
+                   : 52;
     }();
     return v;
 }

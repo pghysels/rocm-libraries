@@ -22,6 +22,13 @@
  *   HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK=<hex>
  *     bitmask controlling NaN/Inf detection: bit 0 = Inf, bit 1 = NaN.  Default 0x3.
  *     Set to 0 to skip special-value detection entirely.
+ *   HIPBLASLT_EMULATION_TOLERANCE=<value>
+ *     target relative accuracy for ADP (dynamic) mode, expressed as a positive
+ *     floating-point value (e.g. 1e-8, 1e-16).  ADP selects the minimum number
+ *     of CRT moduli needed to achieve this accuracy; fewer moduli means faster
+ *     GEMMs at the cost of lower precision.
+ *     Default (absent): full IEEE 754 double precision (~1.11e-16, 52 mantissa bits).
+ *     Only affects dynamic (ADP) mode; has no effect in fixed-s mode.
  *   HIPBLASLT_EMULATION_PROFILE=<path>
  *     append per-call profiling CSV rows to the given file path.
  *
@@ -55,11 +62,8 @@ struct Fp64EmulationEnvValue
 Fp64EmulationEnvValue fp64EmulationParseEnabledEnv(const char* value);
 Fp64EmulationEnvValue fp64EmulationParseStrategyEnv(const char* value);
 Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value);
-/* Parses HIPBLASLT_EMULATION_NUM_MODULI value string.
- * Returns UNSET when value is nullptr, VALID with the parsed count [2..S_MAX]
- * when the string is a valid integer in range, INVALID otherwise.
- * A return of UNSET or INVALID means ADP (dynamic) mode.                    */
 Fp64EmulationEnvValue fp64EmulationParseNumModuliEnv(const char* value);
+Fp64EmulationEnvValue fp64EmulationParseToleranceEnv(const char* value);
 
 /* Returns true when HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 is set.
  * The environment variable is read once and cached.
@@ -107,6 +111,12 @@ uint32_t fp64EmulationSpecialValuesMask();
  * Maximum supported: 20 moduli (~155 bits of CRT capacity). */
 unsigned fp64EmulationNumModuli();
 
+/* Returns the ADP target mantissa-bit count from
+ * HIPBLASLT_EMULATION_TOLERANCE, or 52 if the env var is absent or
+ * invalid (= full FP64 precision).  Cached on first call.
+ * Value in [1..52].                                                         */
+int fp64EmulationAdpMantissaBits();
+
 /* =========================================================================
  * Decision struct and gate function — status-propagating
  * ========================================================================= */
@@ -118,6 +128,11 @@ struct Fp64EmulationDecision
     unsigned int     sv_mask; /* resolved special-values mask               */
     bool             dynamic_mode; /* true when DYNAMIC (ADP) mode selected      */
     size_t           workspace_cap; /* caller workspace limit; ~size_t{0} = none */
+    /* ADP target precision in mantissa bits.  52 = full IEEE 754 FP64.
+     * Derived from HIPBLASLT_EMULATION_TOLERANCE via floor(-log2(tol)).
+     * A lower value allows ADP to choose fewer moduli, trading accuracy for speed.
+     * Only consulted when dynamic_mode = true.                              */
+    int              adp_mantissa_bits; /* [1..52]; 52 = full FP64 precision */
 };
 
 /* Status-returning FP64 emulation gate. Invalid env-var values return
@@ -173,6 +188,10 @@ struct Fp64EmulationSettings
     bool         dynamic_mode; /* true when ADP (Adaptive Precision) mode */
     void*        workspace; /* caller workspace; nullptr = no workspace */
     size_t       workspace_bytes; /* size of caller workspace                */
+    /* ADP target precision in mantissa bits [1..52]; 52 = full FP64.
+     * 0 = sentinel: derive from HIPBLASLT_EMULATION_TOLERANCE (or 52).
+     * Only consulted when dynamic_mode = true.                              */
+    int          adp_mantissa_bits; /* 0 = env var default                 */
 };
 
 /* Run an emulated FP64 GEMM using Ozaki Scheme II (accurate mode).

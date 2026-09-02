@@ -928,6 +928,30 @@ catch(...)
     return exception_to_hipblas_status();
 }
 
+
+hipblasStatus_t hipblasLtSetEmulationTolerance(hipblasLtHandle_t handle, double tolerance)
+try
+{
+    if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
+    auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
+    /* tolerance <= 0 or > 1 resets to the process-wide env var default (sentinel 0). */
+    if(tolerance <= 0.0 || tolerance > 1.0)
+    {
+        h->emulation.adp_mantissa_bits = 0;
+    }
+    else
+    {
+        const int bits = static_cast<int>(std::floor(-std::log2(tolerance)));
+        /* Clamp to [1, 52]: 52 = full FP64 precision. */
+        h->emulation.adp_mantissa_bits = std::max(1, std::min(bits, 52));
+    }
+    return HIPBLAS_STATUS_SUCCESS;
+}
+catch(...)
+{
+    return exception_to_hipblas_status();
+}
+
 size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t  handle,
                                            hipblasOperation_t opA,
                                            hipblasOperation_t opB,

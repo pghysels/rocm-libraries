@@ -160,12 +160,13 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
         if(emulDecision.apply)
         {
             /* Build per-call settings from handle overrides + env var fallbacks. */
-            Fp64EmulationSettings emulSettings;
+            Fp64EmulationSettings emulSettings{};
             emulSettings.num_moduli = emulDecision.num_moduli;
 
             /* special_values_mask: env var overrides handle API when set. */
-            emulSettings.sv_mask = emulDecision.sv_mask;
-            emulSettings.dynamic_mode = emulDecision.dynamic_mode;
+            emulSettings.sv_mask          = emulDecision.sv_mask;
+            emulSettings.dynamic_mode     = emulDecision.dynamic_mode;
+            emulSettings.adp_mantissa_bits = emulDecision.adp_mantissa_bits;
 
             /* caller workspace: pass through from the hipblasLtMatmul call */
             emulSettings.workspace       = workspace;

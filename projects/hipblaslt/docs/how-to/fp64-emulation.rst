@@ -179,29 +179,8 @@ Or via the API:
 Subnormal inputs (flush-to-zero semantics)
 -------------------------------------------
 
-The emulation applies **flush-to-zero (FTZ) semantics to subnormal inputs**.
-Subnormal FP64 values (magnitudes between roughly ``5×10⁻³²⁴`` and ``2.2×10⁻³⁰⁸``) are not
-detected by the special-values mask and are **silently treated as zero** during the INT8
-extraction step.
+TODO
 
-Specifically:
-
-*  During the preliminary per-row shift computation, any row whose maximum absolute value is
-   below ``10⁻³⁰⁰`` is treated as a unit-magnitude row (the subnormal or zero guard prevents
-   ``log2(0)``).
-*  During the final extraction, each element is scaled by ``2^sft`` and then truncated to the
-   nearest integer.
-   For subnormal values, this product is still subnormal (less than ``2⁻¹⁰¹⁶``), so the integer
-   truncation returns **zero**.
-
-**Consequence**: if the true result of a dot product is a subnormal FP64 value, the emulated
-result may be returned as **0.0** instead of the correct subnormal.
-The absolute error is at most ``2.2×10⁻³⁰⁸`` (the minimum normal double).
-Native FP64 DGEMM handles gradual underflow correctly and will return the true subnormal value.
-
-If subnormal correctness is required, disable emulation for the affected GEMMs
-(``hipblasLtSetEmulationEnabled(handle, false)``) or use the eager strategy only for the
-computationally intensive part of your workload where subnormal outputs are unlikely.
 
 Extreme dynamic range — ADP overflow fallback
 ----------------------------------------------
@@ -243,6 +222,7 @@ per-handle API settings to match the cuBLAS environment-variable contract.
    "``HIPBLASLT_EMULATION_STRATEGY``", "``performant``", "Controls when emulation is applied: ``performant`` (arithmetic-intensity heuristic) or ``eager`` (always)."
    "``HIPBLASLT_EMULATION_NUM_MODULI``", "*(unset → ADP)*", "Fixed number of CRT moduli to use [2..20]. When unset, ADP mode is active and the library selects the moduli count adaptively per call. Warning: fixed mode does not guarantee accuracy for all inputs."
    "``HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK``", "``3``", "Bitmask controlling Inf/NaN detection. Bit 0 = Inf detection; bit 1 = NaN detection. Default ``3`` enables both; set to ``0`` to disable both and avoid the associated device-to-host synchronization."
+   "``HIPBLASLT_EMULATION_TOLERANCE``", "*(unset → 52 bits)*", "Target relative accuracy for ADP (dynamic) mode expressed as a positive floating-point value (e.g. ``1e-8``, ``1e-16``). ADP selects the minimum number of CRT moduli needed to achieve this accuracy; fewer moduli means faster GEMMs at lower precision. Default (unset): full FP64 precision (~52 mantissa bits, ~2.22e-16). Only affects ADP mode; has no effect in fixed-s mode."
 
 API reference
 ===============
@@ -321,6 +301,29 @@ Sets the bitmask that controls Inf/NaN detection for a handle.
 *  Bit 1 — detect NaN values.
 *  Default mask: ``3`` (``0b11``) — both bits set, enabling both Inf and NaN detection.
 *  Set to ``0`` to disable detection and avoid the associated device-to-host synchronization.
+
+hipblasLtSetEmulationTolerance
+-----------------------------------
+
+.. code-block:: c
+
+   hipblasStatus_t hipblasLtSetEmulationTolerance(hipblasLtHandle_t handle,
+                                                     double            tolerance);
+
+Sets the target relative accuracy for ADP (dynamic) mode on a per-handle basis.
+ADP selects the fewest CRT moduli needed to achieve this accuracy; a looser tolerance
+allows fewer moduli and therefore faster GEMMs at reduced precision.
+
+The tolerance is converted internally to a mantissa-bit count via
+``floor(-log2(tolerance))``, clamped to [1, 52]:
+
+*  ``tolerance ≈ 2.22e-16`` (ε_machine) → 52 bits — full FP64 precision (default)
+*  ``tolerance = 1e-8`` → 26 bits — approximately single-precision accuracy
+*  ``tolerance <= 0`` or ``tolerance > 1`` — reset to the process-wide default
+   (``HIPBLASLT_EMULATION_TOLERANCE`` env var, or 52 bits if unset)
+
+Only affects ADP (dynamic) mode.  Has no effect when
+``hipblasLtSetEmulationNumModuli`` is called with a fixed count.
 
 hipblasLtEmulationWorkspaceSize
 ---------------------------------

@@ -128,7 +128,8 @@ struct _rocblaslt_handle
         int          strategy;              /* 0=DEFAULT, 1=PERFORMANT, 2=EAGER; -1=env var */
         int          num_moduli;            /* 2..18=FIXED; -1=ADP/sentinel (env var or default) */
         unsigned int special_values_mask;   /* Inf/NaN mask; ~0u=env var */
-    } emulation = {-1, -1, -1, ~0u};
+        int          adp_mantissa_bits;     /* ADP target precision: [1..52]; 0=env var */
+    } emulation = {-1, -1, -1, ~0u, 0};
 
     // HIPBLASLT_CHECK_NUMERICS state. Read once in the ctor; opt-in via env.
     // See check_numerics_matrix.hpp for the scanner protocol.
