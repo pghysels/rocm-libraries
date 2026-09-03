@@ -1209,14 +1209,14 @@ hipblasStatus_t hipblasLtGetEmulationStrategy(hipblasLtHandle_t             hand
  *  Controls the number of INT8 GEMMs (CRT moduli) used per emulation call.
  *  - ``numModuli = -1``  : ADP mode (default; adaptively selects the minimum
  *                         moduli count needed for FP64 accuracy).
- *  - ``numModuli in [2,18]``: FIXED mode with exactly that many moduli.
+ *  - ``numModuli in [2,20]``: FIXED mode with exactly that many moduli.
  *
  *  A one-time per-process warning is printed when FIXED mode is selected
  *  because FIXED mode does not guarantee accuracy (CRT sign flips can occur).
  *
  *  \retval HIPBLAS_STATUS_SUCCESS         Setting applied successfully.
  *  \retval HIPBLAS_STATUS_INVALID_VALUE   handle is NULL, or numModuli
- *                                         is not -1 and not in [2, 18].
+ *                                         is not -1 and not in [2, 20].
  */
 HIPBLASLT_EXPORT
 hipblasStatus_t hipblasLtSetEmulationNumModuli(hipblasLtHandle_t handle, int numModuli);

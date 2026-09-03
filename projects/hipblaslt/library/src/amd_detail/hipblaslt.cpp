@@ -890,8 +890,8 @@ hipblasStatus_t hipblasLtSetEmulationNumModuli(hipblasLtHandle_t handle, int num
 try
 {
     if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    /* -1 = reset to ADP (default); [2..18] = FIXED with exactly numModuli moduli. */
-    if(numModuli != -1 && (numModuli < 2 || numModuli > 18))
+    /* -1 = reset to ADP (default); [2..20] = FIXED with exactly numModuli moduli. */
+    if(numModuli != -1 && (numModuli < 2 || numModuli > 20))
         return HIPBLAS_STATUS_INVALID_VALUE;
     auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
     h->emulation.num_moduli = numModuli;

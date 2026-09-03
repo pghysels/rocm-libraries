@@ -888,9 +888,17 @@ namespace FP64Emulation
         float local_val = 0.0f; /* 0.0f = biased −200 = needs no precision */
         if(row < m && row_max[row] > 0)
         {
-            const int32_t rm     = row_max[row];
-            const float   sftA_f = static_cast<float>(sftA_init[row]);
-            local_val            = (adp_bits - sftA_f) + 0.5f * log2f(static_cast<float>(rm)) + 200.0f;
+            const int32_t rm      = row_max[row];
+            const float   sftA_f  = static_cast<float>(sftA_init[row]);
+            const float   log2_rm = 0.5f * log2f(static_cast<float>(rm));
+            /* CRT accuracy: ensures |X_true| < M_s/2.
+             * Truncation accuracy: ensures the per-element truncation error
+             *   |ΔA · B_int| · 2^{-sftA-sftB} is within the target relative tolerance.
+             *   Bound: n · 2^{6-sftB_init} / 2^{sftA_refined} ≤ 2^{-adp_bits} · D_true,
+             *   which translates to log2P ≥ adp_bits + 6 - 2·sftA_init + 0.5·log2(C32i). */
+            const float   crt_val   = (adp_bits - sftA_f) + log2_rm + 200.0f;
+            const float   trunc_val = (adp_bits + 6.0f - 2.0f * sftA_f) + log2_rm + 200.0f;
+            local_val = fmaxf(crt_val, trunc_val);
         }
 
         /* Warp-level max reduction. */
@@ -959,9 +967,12 @@ namespace FP64Emulation
          * column are zero, so no CRT precision is needed for it.                 */
         if(local_max > 0)
         {
-            const float sftB_f = static_cast<float>(sftB_init[col]);
-            const float req_biased
-                = (adp_bits - sftB_f) + 0.5f * log2f(static_cast<float>(local_max)) + 200.0f;
+            const float sftB_f     = static_cast<float>(sftB_init[col]);
+            const float log2_cm    = 0.5f * log2f(static_cast<float>(local_max));
+            /* CRT accuracy (B-side) + truncation accuracy (A truncation affects B-side). */
+            const float crt_req    = (adp_bits - sftB_f) + log2_cm + 200.0f;
+            const float trunc_req  = (adp_bits + 6.0f - 2.0f * sftB_f) + log2_cm + 200.0f;
+            const float req_biased = fmaxf(crt_req, trunc_req);
             adp_atomicMaxF(adp_B_out, req_biased);
         }
     }

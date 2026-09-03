@@ -122,11 +122,11 @@ struct _rocblaslt_handle
      * the env-var fallback for that setting on this handle.
      *
      * num_moduli: -1  = sentinel/ADP (env var or built-in default = ADP mode)
-     *             2..18 = FIXED with exactly that many moduli               */
+     *             2..20 = FIXED with exactly that many moduli               */
     struct {
         int          enabled;               /* 1=force on, 0=force off, -1=env var (default) */
         int          strategy;              /* 0=DEFAULT, 1=PERFORMANT, 2=EAGER; -1=env var */
-        int          num_moduli;            /* 2..18=FIXED; -1=ADP/sentinel (env var or default) */
+        int          num_moduli;            /* 2..20=FIXED; -1=ADP/sentinel (env var or default) */
         unsigned int special_values_mask;   /* Inf/NaN mask; ~0u=env var */
         int          adp_mantissa_bits;     /* ADP target precision: [1..52]; 0=env var */
     } emulation = {-1, -1, -1, ~0u, 0};
