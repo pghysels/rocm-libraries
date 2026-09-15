@@ -14,10 +14,10 @@ target_sources(hipblaslt-test
         ${CMAKE_CURRENT_SOURCE_DIR}/hipblaslt_gtest_ext_op.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/streamk5_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/ulp_gtest.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/fixed_point_emulation_gtest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/fp_emulation_gtest.cpp
 )
 
-# fixed_point_emulation_gtest.cpp needs the rocblaslt-private fixed_point_emulation.hpp
+# fp_emulation_gtest.cpp needs the rocblaslt-private emulation.hpp
 # (and its rocblaslt.h dependency).  Scope those include dirs to this one source:
 # rocblaslt/src/include also contains a utility.hpp that would otherwise shadow
 # clients/common/include/utility.hpp for every other test source.
@@ -26,10 +26,10 @@ target_sources(hipblaslt-test
 # property must be set in that target's directory scope - hence TARGET_DIRECTORY
 # (a plain set_source_files_properties here would be silently ignored).
 set_source_files_properties(
-    ${CMAKE_CURRENT_SOURCE_DIR}/fixed_point_emulation_gtest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp_emulation_gtest.cpp
     TARGET_DIRECTORY hipblaslt-test
     PROPERTIES INCLUDE_DIRECTORIES
-        "${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/include;${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/include;${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/fixed_point_emulation/include"
+        "${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/include;${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/include;${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/fp_emulation/include"
 )
 
 # NOTE: secure_env_gtest.cpp (ROCM-26729) intentionally includes the header-only

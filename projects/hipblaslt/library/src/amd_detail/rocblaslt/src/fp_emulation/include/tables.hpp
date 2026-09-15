@@ -4,7 +4,7 @@
 #pragma once
 
 /*
- * fixed_point_emulation_tables.hpp
+ * tables.hpp
  *
  * Constexpr device functions returning the CRT constant data used by the
  * fixed-point emulation kernels (FP32 and FP64).  Embedding the data here
@@ -15,7 +15,7 @@
  *   s_idx = num_moduli - 2  (0-based index into the per-s tables)
  *
  * This file may be included by any HIP translation unit; it is intentionally
- * separate from fixed_point_emulation.hpp (which must stay free of __device__
+ * separate from emulation.hpp (which must stay free of __device__
  * code so it can be included from plain C++ units).
  *
  * Constants (tables) are taken verbatim from the open-source GEMMul8 implementation

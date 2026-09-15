@@ -2,7 +2,7 @@
 // SPDX-License-Identifier:  MIT
 
 /*
- * fixed_point_emulation.cpp
+ * emulation.cpp
  *
  * FP32/FP64 GEMM emulation via Ozaki Scheme II (accurate mode) using INT8 Tensor Cores.
  *
@@ -34,8 +34,8 @@
  * Inner INT8 GEMMs use hipblasLtMatmul (INT8 tensor cores, INT32 accumulate).
  */
 
-#include "fixed_point_emulation.hpp"
-#include "fixed_point_emulation_tables.hpp"
+#include "emulation.hpp"
+#include "tables.hpp"
 #include "handle.h" /* _rocblaslt_handle */
 #include "hipblaslt_ostream.hpp" /* hipblaslt_cerr */
 
@@ -231,7 +231,7 @@ namespace FixedPointEmulation
      * Performance-model predicted times
      * Returns all sub-times in milliseconds.  Used both for the profiling CSV
      * and (via comparison of t_total_ms vs t_native_ms) for the performance
-     * heuristic in fixedPointEmulationPerformanceCheck_fp64.
+     * heuristic in fixedPointEmulationPerformanceCheck.
      * ========================================================================= */
     struct PerfModelTimes
     {
@@ -244,7 +244,7 @@ namespace FixedPointEmulation
         double t_accum_ms; /* CRT accumulation / finalize kernels */
         double t_host_ms; /* per-call host overhead              */
         double t_total_ms; /* total predicted emulation time      */
-        double t_native_ms; /* predicted native FP64 DGEMM time    */
+        double t_native_ms; /* predicted native DGEMM/SGEMM time    */
     };
 
     static PerfModelTimes perf_model_times(bool        tA,

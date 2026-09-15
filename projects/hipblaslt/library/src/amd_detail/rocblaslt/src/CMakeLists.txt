@@ -21,10 +21,10 @@ target_sources(hipblaslt
 )
 target_include_directories(hipblaslt PRIVATE "${PROJECT_SOURCE_DIR}/device-library")
 target_include_directories(hipblaslt PRIVATE
-    "${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/fixed_point_emulation/include"
+    "${PROJECT_SOURCE_DIR}/library/src/amd_detail/rocblaslt/src/fp_emulation/include"
 )
 
-add_subdirectory(fixed_point_emulation)
+add_subdirectory(fp_emulation)
 if(HIPBLASLT_ENABLE_ROCROLLER)
     add_subdirectory(rocroller)
 endif()

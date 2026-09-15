@@ -28,7 +28,7 @@
 #include "UserDrivenTuningParser.hpp"
 #include "check_numerics_matrix.hpp"
 #include "exceptions.hpp"
-#include "fixed_point_emulation.hpp"
+#include "emulation.hpp"
 #include "handle.h"
 #include "hipblaslt/hipblaslt-ext-op.h"
 #include "hipblaslt_internal.hpp"

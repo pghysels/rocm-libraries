@@ -26,7 +26,7 @@
 
 #include "check_numerics_matrix.hpp"
 #include "definitions.h"
-#include "fixed_point_emulation.hpp"
+#include "emulation.hpp"
 #include "handle.h"
 #include "rocblaslt_mat_utils.hpp"
 #include "tensile_host.hpp"

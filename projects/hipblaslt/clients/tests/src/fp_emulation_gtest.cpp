@@ -34,13 +34,13 @@
 //   * FixedPointEmulationHostTest - pure host helpers, no GPU/handle required.
 //   * FixedPointEmulationTest      - owns a hipblasLtHandle_t for API-driven tests.
 //
-// The internal entry points (declared in the rocblaslt-private fixed_point_emulation.hpp)
+// The internal entry points (declared in the rocblaslt-private emulation.hpp)
 // are linkable here because hipblaslt-test privately links the
 // hipblaslt-fixed-point-emulation OBJECT library - the same object files the hipblaslt
 // shared library is built from - so no symbols are exported from the release ABI.
 //
 
-#include "fixed_point_emulation.hpp" // internal: functions under test
+#include "emulation.hpp" // internal: functions under test
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h> // public API + emulation setters
 
@@ -54,10 +54,27 @@
 
 namespace
 {
-    bool has_device()
+    // Returns true only when a HIP device exists AND it is in the emulation
+    // hardware support table.  Uses EAGER to bypass the cost model so the probe
+    // GEMM size (16³) never influences the result — only the device table check
+    // matters.  Note: fixedPointEmulationDecision checks get_perf_model_params()
+    // unconditionally before the eager short-circuit, so EAGER only skips the
+    // performance-model comparison, not the device support lookup.
+    bool has_supported_device()
     {
         int count = 0;
-        return hipGetDeviceCount(&count) == hipSuccess && count > 0;
+        if(hipGetDeviceCount(&count) != hipSuccess || count == 0)
+            return false;
+        hipblasLtHandle_t h = nullptr;
+        if(hipblasLtCreate(&h) != HIPBLAS_STATUS_SUCCESS)
+            return false;
+        hipblasLtSetEmulationEnabled(h, true);
+        hipblasLtSetEmulationStrategy(h, HIPBLASLT_EMULATION_STRATEGY_EAGER);
+        const FixedPointEmulationDecision d = fixedPointEmulationDecision(
+            reinterpret_cast<const _rocblaslt_handle*>(h),
+            HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 16, 16, 16, 1, ~size_t{0});
+        hipblasLtDestroy(h);
+        return d.apply;
     }
 
     // -----------------------------------------------------------------------
@@ -133,8 +150,8 @@ namespace
     protected:
         void SetUp() override
         {
-            if(!has_device())
-                GTEST_SKIP() << "No HIP device available";
+            if(!has_supported_device())
+                GTEST_SKIP() << "No HIP device or device not supported by emulation";
             ASSERT_EQ(hipblasLtCreate(&m_handle), HIPBLAS_STATUS_SUCCESS);
             m_roc = reinterpret_cast<const _rocblaslt_handle*>(m_handle);
         }
@@ -217,31 +234,32 @@ namespace
         EXPECT_FALSE(would_apply(HIP_R_64F, 4096, 4096, 4096, 1));
     }
 
-    // Enabled + EAGER intercepts small DGEMMs.
-    TEST_F(FixedPointEmulationTest, WouldApply_EnabledEagerSmallF64)
+    // Verifies that EAGER strategy bypasses the cost model for both FP64 and FP32.
+    //
+    // Design: use a small GEMM (16³) with EAGER to establish device support — a
+    // size the cost model would reject — then confirm PERFORMANT *does* reject it
+    // (proving the cost model is active) while EAGER accepts it (proving bypass).
+    // This avoids the vacuous skip-or-trivially-pass problem of standalone
+    // EAGER-asserts-true / PERFORMANT-asserts-false tests.
+    TEST_F(FixedPointEmulationTest, WouldApply_EagerBypassesCostModel)
     {
         set_enabled(true);
+
+        // ── FP64 ──────────────────────────────────────────────────────────────
+        // Cost model must reject a small FP64 GEMM under PERFORMANT.
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT);
+        EXPECT_FALSE(would_apply(HIP_R_64F, 16, 16, 16, 1));
+        // EAGER must accept it — proving it bypasses the cost model.
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
         EXPECT_TRUE(would_apply(HIP_R_64F, 16, 16, 16, 1));
-    }
 
-    // Enabled + EAGER bypasses the cost model, so a large FP64 GEMM is intercepted.
-    TEST_F(FixedPointEmulationTest, WouldApply_EnabledEagerLargeF64)
-    {
-        set_enabled(true);
+        // ── FP32 ──────────────────────────────────────────────────────────────
+        // The same strategy logic applies: PERFORMANT rejects small FP32 GEMMs
+        // via its cost model, while EAGER bypasses it.
+        set_strategy(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT);
+        EXPECT_FALSE(would_apply(HIP_R_32F, 16, 16, 16, 1));
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
-        EXPECT_TRUE(would_apply(HIP_R_64F, 4096, 4096, 4096, 1));
-    }
-
-    // FP32 inputs are also eligible for emulation (follows NVIDIA's single-setting model).
-    TEST_F(FixedPointEmulationTest, WouldApply_EnabledEagerFp32)
-    {
-        set_enabled(true);
-        set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
-        // Skip on devices not in the perf-model table.
-        if(!would_apply(HIP_R_64F, 4096, 4096, 4096, 1))
-            GTEST_SKIP() << "Device not supported by emulation";
-        EXPECT_TRUE(would_apply(HIP_R_32F, 4096, 4096, 4096, 1));
+        EXPECT_TRUE(would_apply(HIP_R_32F, 16, 16, 16, 1));
     }
 
     // Batched GEMM is not supported by the emulation path.
@@ -422,8 +440,8 @@ namespace
     protected:
         void SetUp() override
         {
-            if(!has_device())
-                GTEST_SKIP() << "No HIP device available";
+            if(!has_supported_device())
+                GTEST_SKIP() << "No HIP device or device not supported by emulation";
         }
     };
 
@@ -573,24 +591,6 @@ namespace
         ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
                   HIPBLAS_STATUS_SUCCESS);
-
-        /* Skip if the device is not supported by the emulation. */
-        {
-            const FixedPointEmulationDecision gate
-                = fixedPointEmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
-                                        HIP_R_64F,
-                                        p.opA,
-                                        p.opB,
-                                        p.m,
-                                        p.n,
-                                        p.k,
-                                        1, ~size_t{0});
-            if(!gate.apply)
-            {
-                cleanup(hem, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                GTEST_SKIP() << "Device not supported by emulation";
-            }
-        }
 
         /* ── Native DGEMM reference handle + layouts ─────────────────────── */
         hipblasLtHandle_t                hnat = nullptr;
@@ -1099,14 +1099,6 @@ namespace
         ASSERT_EQ(hipblasLtSetEmulationNumModuli(m_handle, -1) /* ADP mode */,
                   HIPBLAS_STATUS_SUCCESS);
 
-        // Skip unsupported devices
-        {
-            const FixedPointEmulationDecision gate = fixedPointEmulationDecision(
-                m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 128, 128, 128, 1, ~size_t{0});
-            if(!gate.apply)
-                GTEST_SKIP() << "Device not supported by emulation";
-        }
-
         constexpr int    n = 128, b = 32;
         constexpr size_t N2    = static_cast<size_t>(n) * n;
         const size_t     bytes = N2 * sizeof(double);
@@ -1206,8 +1198,8 @@ namespace
     protected:
         void SetUp() override
         {
-            if(!has_device())
-                GTEST_SKIP() << "No HIP device available";
+            if(!has_supported_device())
+                GTEST_SKIP() << "No HIP device or device not supported by emulation";
         }
     };
 
@@ -1259,25 +1251,6 @@ namespace
         ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
         ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
                   HIPBLAS_STATUS_SUCCESS);
-
-        // Skip unsupported devices
-        {
-            const FixedPointEmulationDecision gate
-                = fixedPointEmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
-                                        HIP_R_64F,
-                                        HIPBLAS_OP_N,
-                                        HIPBLAS_OP_N,
-                                        N,
-                                        N,
-                                        N,
-                                        1, ~size_t{0});
-            if(!gate.apply)
-            {
-                (void)hipblasLtDestroy(hem);
-                cleanup();
-                GTEST_SKIP() << "Device not supported by emulation";
-            }
-        }
 
         FixedPointEmulationSettings emu_settings{};
         emu_settings.num_moduli      = p.s;
@@ -1451,8 +1424,8 @@ namespace
     protected:
         void SetUp() override
         {
-            if(!has_device())
-                GTEST_SKIP() << "No HIP device available";
+            if(!has_supported_device())
+                GTEST_SKIP() << "No HIP device or device not supported by emulation";
         }
     };
 
@@ -1687,8 +1660,8 @@ namespace
     protected:
         void SetUp() override
         {
-            if(!has_device())
-                GTEST_SKIP() << "No HIP device available";
+            if(!has_supported_device())
+                GTEST_SKIP() << "No HIP device or device not supported by emulation";
         }
     };
 
@@ -1895,22 +1868,6 @@ namespace
         /* ADP: let the algorithm choose the number of moduli from the data */
         ASSERT_EQ(hipblasLtSetEmulationNumModuli(hem, -1) /* ADP mode */,
                   HIPBLAS_STATUS_SUCCESS);
-        {
-            const FixedPointEmulationDecision gate
-                = fixedPointEmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
-                                        HIP_R_64F,
-                                        HIPBLAS_OP_N,
-                                        HIPBLAS_OP_N,
-                                        N,
-                                        N,
-                                        N,
-                                        1, ~size_t{0});
-            if(!gate.apply)
-            {
-                cleanup(hem, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-                GTEST_SKIP() << "Device not supported by emulation";
-            }
-        }
 
         hipblasLtHandle_t                hnat = nullptr;
         hipblasLtMatmulDesc_t            desc = nullptr;
@@ -2084,12 +2041,6 @@ namespace
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
         ASSERT_EQ(hipblasLtSetEmulationNumModuli(m_handle, -1) /* ADP mode */,
                   HIPBLAS_STATUS_SUCCESS);
-        {
-            const FixedPointEmulationDecision gate = fixedPointEmulationDecision(
-                m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, 64, 1, ~size_t{0});
-            if(!gate.apply)
-                GTEST_SKIP() << "Device not supported by emulation";
-        }
 
         constexpr int    N     = 64;
         constexpr size_t N2    = static_cast<size_t>(N) * N;
@@ -2409,17 +2360,6 @@ namespace
             (void)hipFree(dA);
         };
 
-        /* Skip on unsupported devices. */
-        {
-            const FixedPointEmulationDecision gate
-                = fixedPointEmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1, ~size_t{0});
-            if(!gate.apply)
-            {
-                cleanup();
-                GTEST_SKIP() << "Device not supported";
-            }
-        }
-
         FixedPointEmulationSettings settings{};
         settings.num_moduli      = 16u;
         settings.sv_mask         = 0u; /* inputs are finite — no Inf/NaN flag needed */
@@ -2664,16 +2604,6 @@ namespace
             (void)hipFree(dA);
         };
 
-        {
-            const FixedPointEmulationDecision gate
-                = fixedPointEmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1, ~size_t{0});
-            if(!gate.apply)
-            {
-                free_all();
-                GTEST_SKIP() << "Device not supported";
-            }
-        }
-
         /* Native reference via hipblasLtMatmul */
         hipblasLtHandle_t                hnat = nullptr;
         hipblasLtMatmulDesc_t            desc = nullptr;
@@ -2819,16 +2749,6 @@ namespace
             (void)hipFree(dA);
         };
 
-        {
-            const FixedPointEmulationDecision gate
-                = fixedPointEmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1, ~size_t{0});
-            if(!gate.apply)
-            {
-                cleanup();
-                GTEST_SKIP() << "Device not supported";
-            }
-        }
-
         FixedPointEmulationSettings settings{};
         settings.num_moduli = 16u;
         settings.sv_mask    = 0x1u; /* enable Inf detection */
@@ -2901,16 +2821,6 @@ namespace
             (void)hipFree(dB);
             (void)hipFree(dA);
         };
-
-        {
-            const FixedPointEmulationDecision gate
-                = fixedPointEmulationDecision(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1, ~size_t{0});
-            if(!gate.apply)
-            {
-                free_all();
-                GTEST_SKIP() << "Device not supported";
-            }
-        }
 
         /* Native reference */
         hipblasLtHandle_t                hnat = nullptr;
@@ -3083,6 +2993,8 @@ protected:
 
     void SetUp() override
     {
+        if(!has_supported_device())
+            GTEST_SKIP() << "No HIP device or device not supported by emulation";
         if(hipblasLtCreate(&m_handle) != HIPBLAS_STATUS_SUCCESS)
             GTEST_SKIP() << "hipblasLtCreate failed";
         /* Force eager strategy so the perf gate never blocks emulation in tests. */

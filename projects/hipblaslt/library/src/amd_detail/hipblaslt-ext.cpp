@@ -26,7 +26,7 @@
 
 #include "hipblaslt/hipblaslt-ext.hpp"
 #include "exceptions.hpp"
-#include "fixed_point_emulation.hpp"
+#include "emulation.hpp"
 #include "handle.h"
 #include "hipblaslt_internal.hpp"
 #include <Debug.hpp>

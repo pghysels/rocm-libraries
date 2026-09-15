@@ -9,7 +9,7 @@
 # hipblaslt-test harness (which needs to call the internal entry points
 # directly).  This avoids exporting internal symbols from the release .so.
 add_library(hipblaslt-fixed-point-emulation OBJECT
-    "${CMAKE_CURRENT_SOURCE_DIR}/fixed_point_emulation.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/emulation.cpp"
 )
 set_target_properties(hipblaslt-fixed-point-emulation PROPERTIES
     POSITION_INDEPENDENT_CODE ON
