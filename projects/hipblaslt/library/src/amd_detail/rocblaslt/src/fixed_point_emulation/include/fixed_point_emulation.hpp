@@ -1,0 +1,283 @@
+// Copyright Advanced Micro Devices, Inc., or its affiliates.
+// SPDX-License-Identifier:  MIT
+
+#pragma once
+
+/*
+ * FP32/FP64 GEMM emulation via Ozaki Scheme II (Fixed-Point Emulation).
+ *
+ * This header declares the host-side interface used by the library and tests.
+ * It is intentionally free of any HIP device types so it can be included
+ * from plain C++ translation units.
+ *
+ * Environment variables:
+ *   HIPBLASLT_EMULATE_DOUBLE_PRECISION=0|1  enables FP64 emulation.
+ *   HIPBLASLT_EMULATE_SINGLE_PRECISION=0|1  enables FP32 emulation.
+ *   HIPBLASLT_EMULATION_NUM_MODULI=N        force fixed moduli count [2..20].
+ *     WARNING: bypasses the adaptive (ADP) precision check; accuracy is not
+ *     guaranteed for all inputs.  The recommended usage is NOT to set this
+ *     variable and rely on the default ADP mode instead.
+ *   HIPBLASLT_EMULATION_STRATEGY=performant|eager
+ *     performant (default): use emulation only when predicted to outperform native GEMM.
+ *     eager: always emulate regardless of problem size or arithmetic intensity.
+ *   HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK=<hex>
+ *     bitmask controlling NaN/Inf detection: bit 0 = Inf, bit 1 = NaN.  Default 0x3.
+ *     Set to 0 to skip special-value detection entirely.
+ *   HIPBLASLT_EMULATION_FP64_MANTISSA_BIT_COUNT=N
+ *     ADP precision target for FP64 inputs in mantissa bits [1..52].
+ *     Default 52 (full IEEE 754 FP64 precision).  Lower values → fewer moduli → faster.
+ *     Takes precedence over HIPBLASLT_EMULATION_TOLERANCE for FP64.
+ *   HIPBLASLT_EMULATION_FP32_MANTISSA_BIT_COUNT=N
+ *     ADP precision target for FP32 inputs in mantissa bits [1..23].
+ *     Default 23 (full IEEE 754 FP32 precision).  Lower values → fewer moduli → faster.
+ *   HIPBLASLT_EMULATION_TOLERANCE=<value>
+ *     target relative accuracy for ADP (dynamic) mode for FP64, expressed as a positive
+ *     floating-point value (e.g. 1e-8, 1e-16).  ADP selects the minimum number
+ *     of CRT moduli needed to achieve this accuracy; fewer moduli means faster
+ *     GEMMs at the cost of lower precision.
+ *     Default (absent): full IEEE 754 double precision (~1.11e-16, 52 mantissa bits).
+ *     Only affects dynamic (ADP) mode; has no effect in fixed-s mode.
+ *     If HIPBLASLT_EMULATION_FP64_MANTISSA_BIT_COUNT is also set, that takes precedence.
+ *   HIPBLASLT_EMULATION_PROFILE=<path>
+ *     append per-call profiling CSV rows to the given file path.
+ *
+ * Setting precedence: handle setters > env vars > built-in defaults.
+ * Handle setters (hipblasLtSet* functions) permanently override env vars
+ * for the lifetime of that handle. See fixedPointEmulationDecision() for details.
+ *
+ * See docs/how-to/fp-emulation.rst
+ */
+
+#include "rocblaslt.h"
+#include <hip/hip_runtime_api.h>
+
+/* =========================================================================
+ * Environment variable parsing infrastructure
+ * ========================================================================= */
+enum FixedPointEmulationEnvState
+{
+    FIXED_POINT_EMULATION_ENV_UNSET   = 0,
+    FIXED_POINT_EMULATION_ENV_VALID   = 1,
+    FIXED_POINT_EMULATION_ENV_INVALID = 2,
+};
+
+struct FixedPointEmulationEnvValue
+{
+    FixedPointEmulationEnvState state;
+    unsigned int                value;
+};
+
+/* Pure parsers — used by tests and by the cached runtime readers below.
+ * All are stateless; the caller supplies the raw env-var string value.    */
+FixedPointEmulationEnvValue fixedPointEmulationParseEnabledEnv(const char* value);
+FixedPointEmulationEnvValue fixedPointEmulationParseStrategyEnv(const char* value);
+FixedPointEmulationEnvValue fixedPointEmulationParseSpecialValuesMaskEnv(const char* value);
+FixedPointEmulationEnvValue fixedPointEmulationParseNumModuliEnv(const char* value);
+FixedPointEmulationEnvValue fixedPointEmulationParseToleranceEnv(const char* value);
+/* Parser for HIPBLASLT_EMULATION_FP{32,64}_MANTISSA_BIT_COUNT.
+ * Accepts decimal integers in [1..52]; returns INVALID for out-of-range.  */
+FixedPointEmulationEnvValue fixedPointEmulationParseMantissaBitCountEnv(const char* value);
+
+/* Forward declaration — callers already include handle.h which provides the full
+ * definition.  Declared here so the functions below can use the type.       */
+struct _rocblaslt_handle;
+
+/* Returns true when emulation is enabled for the given type.
+ *   type_a == HIP_R_64F: reads HIPBLASLT_EMULATE_DOUBLE_PRECISION
+ *   type_a == HIP_R_32F: reads HIPBLASLT_EMULATE_SINGLE_PRECISION
+ * Env var is read once and cached per type.
+ * Any value other than "1" (including absent) returns false.              */
+bool fixedPointEmulationIsEnabled(hipDataType type_a);
+
+/* Returns true when the emulation is estimated to be at least as fast as
+ * native GEMM for the given problem size and input type.
+ * Uses a Roofline performance model calibrated for the target hardware.
+ * workspace_bytes — caller workspace size; ~size_t{0} (SIZE_MAX) means no
+ *   budget constraint (optimal, single-pass performance model).            */
+bool fixedPointEmulationPerformanceCheck(const _rocblaslt_handle* h,
+                                         hipDataType              type_a,
+                                         hipblasOperation_t       opA,
+                                         hipblasOperation_t       opB,
+                                         int64_t                  m,
+                                         int64_t                  n,
+                                         int64_t                  k,
+                                         size_t                   workspace_bytes);
+
+/* Returns true when HIPBLASLT_EMULATION_STRATEGY=eager is set.
+ * In eager mode emulation is always used regardless of arithmetic intensity.
+ * Shared for both FP32 and FP64.  Cached on first call.                   */
+bool fixedPointEmulationIsEager();
+
+/* Returns the special-values support mask from
+ * HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK (default: 0x3).
+ *   bit 0 = Inf detection enabled
+ *   bit 1 = NaN detection enabled
+ * A return value of 0 means no Inf/NaN checking is performed.
+ * Shared for both FP32 and FP64.                                           */
+uint32_t fixedPointEmulationSpecialValuesMask();
+
+/* Returns the fixed moduli count from HIPBLASLT_EMULATION_NUM_MODULI [2..20],
+ * or 0 if the env var is absent or invalid (= ADP/dynamic mode).
+ * Cached on first call.  Use fixedPointEmulationEffectiveNumModuli(h) to
+ * get the fully-resolved count (handle override → env var → S_MAX for ADP).
+ * Maximum supported: 20 moduli (~155 bits of CRT capacity).               */
+unsigned fixedPointEmulationNumModuli();
+
+/* Returns the ADP target mantissa-bit count for the given input type.
+ *   type_a == HIP_R_64F:
+ *     1. Reads HIPBLASLT_EMULATION_FP64_MANTISSA_BIT_COUNT (new).
+ *     2. Falls back to HIPBLASLT_EMULATION_TOLERANCE (legacy, kept for compat).
+ *     3. Default: 52 (full IEEE 754 FP64 precision).
+ *   type_a == HIP_R_32F:
+ *     1. Reads HIPBLASLT_EMULATION_FP32_MANTISSA_BIT_COUNT (new).
+ *     2. Default: 23 (full IEEE 754 FP32 precision).
+ * Value range: [1..52] for FP64, [1..23] for FP32.
+ * Cached on first call per type.  Only consulted in ADP (dynamic) mode.   */
+int fixedPointEmulationAdpMantissaBits(hipDataType type_a);
+
+/* =========================================================================
+ * Decision struct and gate function — status-propagating
+ * ========================================================================= */
+struct FixedPointEmulationDecision
+{
+    rocblaslt_status status; /* rocblaslt_status_invalid_value on bad env   */
+    bool             apply; /* true → use emulation; false → native path  */
+    unsigned int     num_moduli; /* resolved moduli count to pass to settings  */
+    unsigned int     sv_mask; /* resolved special-values mask               */
+    bool             dynamic_mode; /* true when DYNAMIC (ADP) mode selected      */
+    size_t           workspace_cap; /* caller workspace limit; ~size_t{0} = none */
+    /* ADP target precision in mantissa bits.
+     * 52 = full IEEE 754 FP64 precision; 23 = full IEEE 754 FP32 precision.
+     * Derived from the type-specific env var (FP64/FP32_MANTISSA_BIT_COUNT)
+     * or from HIPBLASLT_EMULATION_TOLERANCE for FP64 (legacy fallback).
+     * Only consulted when dynamic_mode = true.                              */
+    int              adp_mantissa_bits; /* [1..52]; type default = full precision */
+};
+
+/* Status-returning emulation gate.  Invalid env-var values return
+ * rocblaslt_status_invalid_value so callers do not silently fall back to
+ * native GEMM.  On success, apply=false means the native path should be
+ * used without error.  Dispatches on type_a (HIP_R_64F or HIP_R_32F).    */
+FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle* h,
+                                                         hipDataType              type_a,
+                                                         hipblasOperation_t       opA,
+                                                         hipblasOperation_t       opB,
+                                                         int64_t                  m,
+                                                         int64_t                  n,
+                                                         int64_t                  k,
+                                                         int32_t                  batch_count,
+                                                         size_t                   workspace_bytes);
+
+/* Convenience wrapper: returns true when fixedPointEmulationDecision(...).apply
+ * is true for this type and problem. Cheaper than the full decision when only
+ * the apply/reject outcome is needed.                                       */
+bool fixedPointEmulationWouldApply(const _rocblaslt_handle* h,
+                                   hipDataType              type_a,
+                                   hipblasOperation_t       opA,
+                                   hipblasOperation_t       opB,
+                                   int64_t                  m,
+                                   int64_t                  n,
+                                   int64_t                  k,
+                                   int32_t                  batch_count);
+
+/* Returns the upper bound on CRT moduli (2..20) for the given handle.
+ * Used as the workspace layout count and the ADP upper bound.
+ *   FIXED (num_moduli ∈ [2..20]): returns that count directly.
+ *   ADP  (sentinel/unset, env var absent): returns S_MAX (= 20), the upper
+ *     bound used for workspace pre-allocation.  ADP selects the actual per-call
+ *     s from the input data at run time.                                    */
+unsigned fixedPointEmulationEffectiveNumModuli(const _rocblaslt_handle* h);
+
+/* Returns the workspace size in bytes for the given problem and input type.
+ * The decision selects the layout moduli (S_MAX=20 in ADP mode,
+ * decision.num_moduli in FIXED mode).
+ * When decision.workspace_cap != ~size_t{0}, the returned size is capped at
+ * min(optimal, decision.workspace_cap).  This ensures the library never
+ * reports a workspace larger than the user's allocation.                   */
+size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
+                                         hipDataType                        type_a,
+                                         hipblasOperation_t                 opA,
+                                         hipblasOperation_t                 opB,
+                                         int64_t                            m,
+                                         int64_t                            n,
+                                         int64_t                            k,
+                                         const FixedPointEmulationDecision& decision);
+
+/* Per-call emulation settings.
+ * Fields with sentinel values (0 for num_moduli, ~0u for sv_mask) cause the
+ * function to fall back to the process-wide env var defaults.              */
+struct FixedPointEmulationSettings
+{
+    unsigned int num_moduli; /* 2..20; 0 = derive from env var          */
+    unsigned int sv_mask; /* special-values mask; ~0u = env var      */
+    bool         dynamic_mode; /* true when ADP (Adaptive Precision) mode */
+    void*        workspace; /* caller workspace; nullptr = no workspace */
+    size_t       workspace_bytes; /* size of caller workspace                */
+    /* ADP target precision in mantissa bits.
+     * For FP64: [1..52]; 52 = full FP64 precision.
+     * For FP32: [1..23]; 23 = full FP32 precision.
+     * 0 = sentinel: derive from env var (FP64/FP32_MANTISSA_BIT_COUNT,
+     *   or TOLERANCE for FP64 legacy) or type default.
+     * Only consulted when dynamic_mode = true.                              */
+    int          adp_mantissa_bits; /* 0 = env var default                 */
+};
+
+/* Run an emulated FP64 GEMM using Ozaki Scheme II (accurate mode).
+ *
+ * Computes D = alpha * op(A) * op(B) + beta * C  where A, B, C, D are
+ * device pointers to double arrays.  C and D may be the same pointer.
+ * Only non-batched (batch count == 1) FP64 GEMM is supported.
+ *
+ * Returns rocblaslt_status_success on success,
+ *         rocblaslt_status_memory_error if no workspace is provided or too small,
+ *         rocblaslt_status_invalid_value if Inf/NaN is detected (sv_mask) or
+ *             if ADP determines s=20 is insufficient for the input's range.
+ * In invalid_value cases the caller should fall back to native FP64.       */
+rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t                  handle,
+                                   hipblasOperation_t                 opA,
+                                   hipblasOperation_t                 opB,
+                                   int64_t                            m,
+                                   int64_t                            n,
+                                   int64_t                            k,
+                                   const double*                      alpha,
+                                   const double*                      A,
+                                   int64_t                            lda,
+                                   const double*                      B,
+                                   int64_t                            ldb,
+                                   const double*                      beta,
+                                   const double*                      C,
+                                   int64_t                            ldc,
+                                   double*                            D,
+                                   int64_t                            ldd,
+                                   hipStream_t                        stream,
+                                   const FixedPointEmulationSettings& settings);
+
+/* Run an emulated FP32 GEMM using Ozaki Scheme II (accurate mode).
+ *
+ * Computes D = alpha * op(A) * op(B) + beta * C  where A, B, C, D are
+ * device pointers to float arrays.  C and D may be the same pointer.
+ * Only non-batched (batch count == 1) FP32 GEMM is supported.
+ *
+ * Returns rocblaslt_status_success on success,
+ *         rocblaslt_status_memory_error if no workspace is provided or too small,
+ *         rocblaslt_status_invalid_value if Inf/NaN is detected (sv_mask) or
+ *             if ADP determines s=20 is insufficient for the input's range.
+ * In invalid_value cases the caller should fall back to native FP32.       */
+rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
+                                   hipblasOperation_t                 opA,
+                                   hipblasOperation_t                 opB,
+                                   int64_t                            m,
+                                   int64_t                            n,
+                                   int64_t                            k,
+                                   const float*                       alpha,
+                                   const float*                       A,
+                                   int64_t                            lda,
+                                   const float*                       B,
+                                   int64_t                            ldb,
+                                   const float*                       beta,
+                                   const float*                       C,
+                                   int64_t                            ldc,
+                                   float*                             D,
+                                   int64_t                            ldd,
+                                   hipStream_t                        stream,
+                                   const FixedPointEmulationSettings& settings);

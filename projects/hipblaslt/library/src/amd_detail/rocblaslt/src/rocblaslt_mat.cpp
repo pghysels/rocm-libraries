@@ -26,7 +26,7 @@
 
 #include "check_numerics_matrix.hpp"
 #include "definitions.h"
-#include "fp64_emulation.hpp"
+#include "fixed_point_emulation.hpp"
 #include "handle.h"
 #include "rocblaslt_mat_utils.hpp"
 #include "tensile_host.hpp"
@@ -132,20 +132,20 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
     hipDataType        scale_type    = matmul_descr->scale_type;
 
     // -----------------------------------------------------------------------
-    // FP64 emulation intercept via Ozaki Scheme II
+    // Emulation intercept via Ozaki Scheme II (fixed-point emulation)
     //
     // Conditions for emulation:
-    //   • Data type is FP64 (HIP_R_64F)
+    //   • Data type is FP64 (HIP_R_64F) or FP32 (HIP_R_32F)
     //   • Non-batched (batch_count == 1)
     //   • Plain GEMM epilogue (no activation, no bias, no auxiliary outputs)
     //   • alpha/beta are host (non-device-pointer) scalars
     //   • Emulation is enabled: handle override (1=on, 0=off) or env var
     //   • Arithmetic intensity exceeds the threshold (compute-bound region)
-    // Invalid FP64 emulation env-var values return invalid_value instead of
-    // silently falling back to native FP64.
+    // Invalid emulation env-var values return invalid_value instead of
+    // silently falling back to the native path.
     //
     // On success the emulated result is returned directly; the native path
-    // is used as fall-back when fp64EmulatedGemm returns non-success.
+    // is used as fall-back when emulation returns non-success.
     // -----------------------------------------------------------------------
     if(bias          == nullptr
        && scaleAlphaVec == nullptr
@@ -153,34 +153,45 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
        && !matmul_descr->pointermode
        && epilogue      == ROCBLASLT_EPILOGUE_DEFAULT)
     {
-        const Fp64EmulationDecision emulDecision =
-            fp64EmulationDecision(handle, type_a, opA, opB, m, n, k, num_batches_a, workspaceSizeInBytes);
+        const FixedPointEmulationDecision emulDecision =
+            fixedPointEmulationDecision(handle, type_a, opA, opB, m, n, k, num_batches_a, workspaceSizeInBytes);
         if(emulDecision.status != rocblaslt_status_success)
             return emulDecision.status;
         if(emulDecision.apply)
         {
             /* Build per-call settings from handle overrides + env var fallbacks. */
-            Fp64EmulationSettings emulSettings{};
-            emulSettings.num_moduli = emulDecision.num_moduli;
-
-            /* special_values_mask: env var overrides handle API when set. */
-            emulSettings.sv_mask          = emulDecision.sv_mask;
-            emulSettings.dynamic_mode     = emulDecision.dynamic_mode;
+            FixedPointEmulationSettings emulSettings{};
+            emulSettings.num_moduli        = emulDecision.num_moduli;
+            emulSettings.sv_mask           = emulDecision.sv_mask;
+            emulSettings.dynamic_mode      = emulDecision.dynamic_mode;
             emulSettings.adp_mantissa_bits = emulDecision.adp_mantissa_bits;
+            emulSettings.workspace         = workspace;
+            emulSettings.workspace_bytes   = workspaceSizeInBytes;
 
-            /* caller workspace: pass through from the hipblasLtMatmul call */
-            emulSettings.workspace       = workspace;
-            emulSettings.workspace_bytes = workspaceSizeInBytes;
-
-            const rocblaslt_status emulSt =
-                fp64EmulatedGemm(handle, opA, opB, m, n, k,
-                                 static_cast<const double*>(alpha),
-                                 static_cast<const double*>(A), lda,
-                                 static_cast<const double*>(B), ldb,
-                                 static_cast<const double*>(beta),
-                                 static_cast<const double*>(C), ldc,
-                                 static_cast<double*>(D), ldd,
-                                 stream, emulSettings);
+            /* Dispatch to the type-appropriate emulation entry point. */
+            rocblaslt_status emulSt;
+            if(type_a == HIP_R_32F)
+            {
+                emulSt = fp32EmulatedGemm(handle, opA, opB, m, n, k,
+                                          static_cast<const float*>(alpha),
+                                          static_cast<const float*>(A), lda,
+                                          static_cast<const float*>(B), ldb,
+                                          static_cast<const float*>(beta),
+                                          static_cast<const float*>(C), ldc,
+                                          static_cast<float*>(D), ldd,
+                                          stream, emulSettings);
+            }
+            else /* HIP_R_64F */
+            {
+                emulSt = fp64EmulatedGemm(handle, opA, opB, m, n, k,
+                                          static_cast<const double*>(alpha),
+                                          static_cast<const double*>(A), lda,
+                                          static_cast<const double*>(B), ldb,
+                                          static_cast<const double*>(beta),
+                                          static_cast<const double*>(C), ldc,
+                                          static_cast<double*>(D), ldd,
+                                          stream, emulSettings);
+            }
             if(emulSt == rocblaslt_status_success)
                 return rocblaslt_status_success;
             /* Non-success: fall through to native DGEMM.
@@ -196,7 +207,7 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
                             "NaN/Inf detected in inputs or ADP precision overflow" :
                             "INT8 GEMM failed (hipblasLtMatmul returned error)";
                     std::fprintf(stderr,
-                        "[hipBLASLt FP64 emulation] INFO: falling back to native DGEMM "
+                        "[hipBLASLt emulation] INFO: falling back to native GEMM "
                         "(m=%lld, n=%lld, k=%lld, reason: %s).\n",
                         (long long)m, (long long)n, (long long)k, reason);
                 }

@@ -4,19 +4,19 @@
 #pragma once
 
 /*
- * fp64_emulation_tables.hpp
+ * fixed_point_emulation_tables.hpp
  *
  * Constexpr device functions returning the CRT constant data used by the
- * FP64 emulation kernels.  Embedding the data here (rather than in
- * __constant__ globals) avoids all cross-translation-unit device-symbol
- * issues and requires no initialization step.
+ * fixed-point emulation kernels (FP32 and FP64).  Embedding the data here
+ * (rather than in __constant__ globals) avoids all cross-translation-unit
+ * device-symbol issues and requires no initialization step.
  *
  * Naming convention for the s-dependent functions:
  *   s_idx = num_moduli - 2  (0-based index into the per-s tables)
  *
  * This file may be included by any HIP translation unit; it is intentionally
- * separate from fp64_emulation.hpp (which must stay free of __device__ code
- * so it can be included from plain C++ units).
+ * separate from fixed_point_emulation.hpp (which must stay free of __device__
+ * code so it can be included from plain C++ units).
  *
  * Constants (tables) are taken verbatim from the open-source GEMMul8 implementation
  * (Y. Uchino, RIKEN R-CCS, https://github.com/RIKEN-RCCS/GEMMul8).
@@ -24,7 +24,7 @@
 
 #include <hip/hip_runtime.h>
 
-namespace FP64Emulation
+namespace FixedPointEmulation
 {
     /* =========================================================================
      * Fundamental emulation constants
@@ -712,4 +712,4 @@ namespace FP64Emulation
         7.61856700e+01F, /* s=20 */
     };
 
-} // namespace FP64Emulation
+} // namespace FixedPointEmulation

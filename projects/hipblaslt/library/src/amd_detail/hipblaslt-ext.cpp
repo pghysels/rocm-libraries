@@ -26,7 +26,7 @@
 
 #include "hipblaslt/hipblaslt-ext.hpp"
 #include "exceptions.hpp"
-#include "fp64_emulation.hpp"
+#include "fixed_point_emulation.hpp"
 #include "handle.h"
 #include "hipblaslt_internal.hpp"
 #include <Debug.hpp>
@@ -1109,12 +1109,13 @@ namespace hipblaslt_ext
              * Used by algoGetHeuristic / isAlgoSupported to report the true
              * total workspace so callers can pre-allocate it.                */
             const auto* h = reinterpret_cast<const _rocblaslt_handle*>(m_handle);
-            const Fp64EmulationDecision emulDecision =
-                fp64EmulationDecision(h, problemtype.getTypeA(),
+            const FixedPointEmulationDecision emulDecision =
+                fixedPointEmulationDecision(h, problemtype.getTypeA(),
                                       problemtype.getOpA(), problemtype.getOpB(),
                                       m, n, k, batch_count, ~size_t{0});
             m_emul_workspace_bytes = emulDecision.apply
-                ? fp64EmulationWorkspaceSize(h, problemtype.getOpA(), problemtype.getOpB(),
+                ? fixedPointEmulationWorkspaceSize(h, problemtype.getTypeA(),
+                                             problemtype.getOpA(), problemtype.getOpB(),
                                              m, n, k, emulDecision)
                 : 0u;
         }
@@ -1166,12 +1167,13 @@ namespace hipblaslt_ext
                                      ? static_cast<int64_t>(A_layout->n)
                                      : static_cast<int64_t>(A_layout->m);
             const int32_t batch = A_layout->batch_count;
-            const Fp64EmulationDecision emulDecision =
-                fp64EmulationDecision(h, A_layout->type,
+            const FixedPointEmulationDecision emulDecision =
+                fixedPointEmulationDecision(h, A_layout->type,
                                       desc_ptr->op_A, desc_ptr->op_B,
                                       m_sz, n_sz, k_sz, batch, ~size_t{0});
             m_emul_workspace_bytes = emulDecision.apply
-                ? fp64EmulationWorkspaceSize(h, desc_ptr->op_A, desc_ptr->op_B,
+                ? fixedPointEmulationWorkspaceSize(h, A_layout->type,
+                                             desc_ptr->op_A, desc_ptr->op_B,
                                              m_sz, n_sz, k_sz, emulDecision)
                 : 0u;
         }

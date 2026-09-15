@@ -109,27 +109,33 @@ struct _rocblaslt_handle
     int   useRocRoller     = -1;
 #endif
 
-    /* FP64 emulation (Ozaki Scheme II) — per-handle overrides for env vars.
+    /* FP64/FP32 emulation (Ozaki Scheme II / Fixed-Point Emulation) — per-handle overrides.
      *
      * Setting precedence (highest to lowest):
      *   1. Handle setter (hipblasLtSet* functions) — permanently overrides env var
      *      for the lifetime of this handle.
      *   2. Environment variable — read once at first use, process-wide default.
-     *   3. Built-in default (ADP mode, 16 moduli, special-values mask = 0x3).
+     *   3. Built-in default (ADP mode, S_MAX moduli, special-values mask = 0x3).
      *
      * Sentinel values (-1 / ~0u) mean "use the process-wide env var default".
      * Calling any hipblasLtSet* function writes a non-sentinel value, disabling
      * the env-var fallback for that setting on this handle.
      *
-     * num_moduli: -1  = sentinel/ADP (env var or built-in default = ADP mode)
-     *             2..20 = FIXED with exactly that many moduli               */
-    struct {
+     * num_moduli: -1    = sentinel/ADP (env var or built-in default = ADP mode)
+     *             2..20 = FIXED with exactly that many moduli
+     * adp_mantissa_bits: FP64 default=52, FP32 default=23; 0=env var     */
+    struct EmulationSettings {
         int          enabled;               /* 1=force on, 0=force off, -1=env var (default) */
         int          strategy;              /* 0=DEFAULT, 1=PERFORMANT, 2=EAGER; -1=env var */
         int          num_moduli;            /* 2..20=FIXED; -1=ADP/sentinel (env var or default) */
         unsigned int special_values_mask;   /* Inf/NaN mask; ~0u=env var */
-        int          adp_mantissa_bits;     /* ADP target precision: [1..52]; 0=env var */
-    } emulation = {-1, -1, -1, ~0u, 0};
+        int          adp_mantissa_bits;     /* ADP target precision in mantissa bits; 0=env var */
+    };
+    /* FP64 emulation settings (reads HIPBLASLT_EMULATE_DOUBLE_PRECISION etc.). */
+    EmulationSettings emulation    = {-1, -1, -1, ~0u, 0};
+    /* FP32 emulation settings (reads HIPBLASLT_EMULATE_SINGLE_PRECISION etc.).
+     * adp_mantissa_bits default: 23 (full IEEE 754 FP32 precision).       */
+    EmulationSettings emulation_fp32 = {-1, -1, -1, ~0u, 0};
 
     // HIPBLASLT_CHECK_NUMERICS state. Read once in the ctor; opt-in via env.
     // See check_numerics_matrix.hpp for the scanner protocol.

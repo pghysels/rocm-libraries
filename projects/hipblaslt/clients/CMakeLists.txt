@@ -171,11 +171,12 @@ if(BUILD_TESTING OR HIPBLASLT_BUILD_TESTING)
         endif()
     endif()
 
-    # Pull in the FP64 emulation object files directly (same objects the
-    # hipblaslt shared library is built from) so the test can call the internal
-    # entry points without them being exported from the release ABI.
+    # Pull in the fixed-point emulation (FP32/FP64) object files directly
+    # (same objects the hipblaslt shared library is built from) so the test
+    # can call the internal entry points without them being exported from the
+    # release ABI.
     if(HIPBLASLT_ENABLE_HOST)
-        target_link_libraries(hipblaslt-test PRIVATE hipblaslt-fp64-emulation)
+        target_link_libraries(hipblaslt-test PRIVATE hipblaslt-fixed-point-emulation)
     endif()
 
     add_subdirectory(tests)

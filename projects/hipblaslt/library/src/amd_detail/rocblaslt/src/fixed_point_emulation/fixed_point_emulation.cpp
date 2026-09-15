@@ -2,13 +2,13 @@
 // SPDX-License-Identifier:  MIT
 
 /*
- * fp64_emulation.cpp
+ * fixed_point_emulation.cpp
  *
- * FP64 GEMM emulation via Ozaki Scheme II (accurate mode) using INT8 Tensor Cores.
+ * FP32/FP64 GEMM emulation via Ozaki Scheme II (accurate mode) using INT8 Tensor Cores.
  *
  * Algorithm (paper: Ozaki, Uchino, Imamura, arXiv:2504.08009)
  * -----------------------------------------------------------
- * Given  D = alpha * op(A) * op(B) + beta * C   (A,B,C,D in FP64)
+ * Given  D = alpha * op(A) * op(B) + beta * C   (A,B,C,D in FP64 or FP32)
  *
  * Part 1 – Accurate scaling (OS II-accu):
  *   1a. Per-row 6-bit extraction of op(A) → A8i_high, with per-row shifts sftA[i].
@@ -34,8 +34,8 @@
  * Inner INT8 GEMMs use hipblasLtMatmul (INT8 tensor cores, INT32 accumulate).
  */
 
-#include "fp64_emulation.hpp"
-#include "fp64_emulation_tables.hpp"
+#include "fixed_point_emulation.hpp"
+#include "fixed_point_emulation_tables.hpp"
 #include "handle.h" /* _rocblaslt_handle */
 #include "hipblaslt_ostream.hpp" /* hipblaslt_cerr */
 
@@ -55,7 +55,7 @@
 #include <unordered_map> // std::unordered_map
 #include <utility> // std::index_sequence, std::make_index_sequence
 
-namespace FP64Emulation
+namespace FixedPointEmulation
 {
     /* =========================================================================
      * Tuning constants
@@ -139,25 +139,42 @@ namespace FP64Emulation
 
     struct PerfModelDeviceParams
     {
-        double ai;
-        double ratio;
-        double latency;
+        double hbm_bw;    /* effective HBM bandwidth in bytes/s (calibrated)       */
+        double peak_int8; /* effective INT8 GEMM throughput in ops/s (calibrated)   */
+        double peak_fp64; /* effective FP64 GEMM throughput in FLOP/s (calibrated)  */
+        double peak_fp32; /* effective FP32 GEMM throughput in FLOP/s (calibrated)  */
+        /* Note: these are calibrated effective throughputs at large N,
+         * not theoretical hardware spec peaks.  A single peak_int8 is used for
+         * both FP32 and FP64 emulation contexts (same INT8 tensor core hardware).  */
     };
 
     /* Returns the perf-model parameters for the given HIP device, or nullopt if
      * the device is not in the table (in which case emulation should not run). */
     static std::optional<PerfModelDeviceParams> get_perf_model_params(int device)
     {
+        /* Order: hbm_bw (bytes/s), peak_int8 (ops/s), peak_fp64 (FLOP/s), peak_fp32 (FLOP/s)
+         *
+         * Values derived from calibration benchmarks on each device.
+         * For devices without empirical FP32 data, peak_fp32 is estimated from
+         * theoretical FP32/FP64 throughput ratios (marked with "est.").
+         *
+         * MI300X:  hbm_bw=3.93 TB/s  → peak_fp64= 10.4 TFlops, peak_int8=1746 TOPS
+         *                               peak_fp32= 48.7 TFlops (est., r≈4.7)
+         * MI350X:  hbm_bw=6.08 TB/s  → peak_fp64= 68.2 TFlops, peak_int8=3172 TOPS
+         *                               peak_fp32=134   TFlops (calibrated on 0x75a0)
+         * MI350:   hbm_bw=6.82 TB/s  → peak_fp64= 77.3 TFlops, peak_int8=3301 TOPS
+         *                               peak_fp32=309   TFlops (est., r≈4.0)              */
         static const std::unordered_map<uint32_t, PerfModelDeviceParams> hw_params_by_pci_id = {
-            {0x74a0u, {2.63868, 168.411, 3.93e7}},
-            {0x74a1u, {2.63868, 168.411, 3.93e7}},
-            {0x74a9u, {2.63868, 168.411, 3.93e7}},
-
-            {0x75a0u, {11.2237, 46.4678, 6.08e7}},
-            {0x75b0u, {11.2237, 46.4678, 6.08e7}},
-
-            {0x75a3u, {11.3284, 42.7280, 6.82e7}},
-            {0x75b3u, {11.3284, 42.7280, 6.82e7}},
+            /* MI300X */
+            {0x74a0u, {3.93e12, 1.746e15, 1.037e13, 4.874e13}},
+            {0x74a1u, {3.93e12, 1.746e15, 1.037e13, 4.874e13}},
+            {0x74a9u, {3.93e12, 1.746e15, 1.037e13, 4.874e13}},
+            /* MI350X: peak_fp32 calibrated from measured SGEMM at N=8192–65536 */
+            {0x75a0u, {6.08e12, 3.172e15, 6.824e13, 1.34e14}},
+            {0x75b0u, {6.08e12, 3.172e15, 6.824e13, 1.34e14}},
+            /* MI350: peak_fp32 estimated (empirical calibration pending) */
+            {0x75a3u, {6.82e12, 3.301e15, 7.726e13, 3.090e14}},
+            {0x75b3u, {6.82e12, 3.301e15, 7.726e13, 3.090e14}},
         };
         static std::optional<std::optional<PerfModelDeviceParams>> device_params_cache[64];
 
@@ -178,11 +195,43 @@ namespace FP64Emulation
         return *entry;
     }
 
+    /* Returns the minimum number of moduli s ∈ [2, S_MAX] such that
+     * log2P[s-2] >= (adp_bits + 2), i.e. the smallest s that can satisfy the
+     * ADP precision target for a typical well-conditioned input.
+     * The +2 safety bits account for the truncation-error term in the ADP
+     * formula (which adds ~4 bits of overhead for large k) partially offset by
+     * the 2-bit safety margin already baked into the log2P table values.
+     * Falls back to S_MAX when adp_bits <= 0 (sentinel) or when all moduli
+     * are needed to reach the target.                                        */
+    static unsigned adp_expected_num_moduli(int adp_bits) noexcept
+    {
+        if(adp_bits <= 0)
+            return S_MAX;
+        const int target = adp_bits + 2;
+        for(unsigned s = 2u; s <= S_MAX; ++s)
+            if(log2P[s - 2u] >= static_cast<float>(target))
+                return s;
+        return S_MAX;
+    }
+
+    /* Returns the effective moduli count to use in the performance model.
+     * Fixed mode: use num_moduli directly.
+     * Dynamic (ADP) mode: use adp_expected_num_moduli(adp_bits) — a realistic
+     * lower bound on the ADP runtime selection — instead of S_MAX, which would
+     * grossly overestimate scale and INT8 GEMM time for well-conditioned inputs.
+     * Examples with +2 safety bits:
+     *   FP64 adp_bits=52 → target=54 → min s where log2P[s-2]≥54 → s=15
+     *   FP32 adp_bits=23 → target=25 → min s where log2P[s-2]≥25 → s=7      */
+    static unsigned perf_model_s(unsigned num_moduli, bool dynamic_mode, int adp_bits) noexcept
+    {
+        return dynamic_mode ? adp_expected_num_moduli(adp_bits) : num_moduli;
+    }
+
     /* =========================================================================
      * Performance-model predicted times
      * Returns all sub-times in milliseconds.  Used both for the profiling CSV
      * and (via comparison of t_total_ms vs t_native_ms) for the performance
-     * heuristic in fp64EmulationPerformanceCheck.
+     * heuristic in fixedPointEmulationPerformanceCheck_fp64.
      * ========================================================================= */
     struct PerfModelTimes
     {
@@ -198,15 +247,16 @@ namespace FP64Emulation
         double t_native_ms; /* predicted native FP64 DGEMM time    */
     };
 
-    static PerfModelTimes perf_model_times(bool     tA,
-                                           bool     tB,
-                                           int64_t  m,
-                                           int64_t  n,
-                                           int64_t  k,
-                                           unsigned num_moduli,
-                                           int      device,
-                                           bool     dynamic_mode,
-                                           size_t   budget)
+    static PerfModelTimes perf_model_times(bool        tA,
+                                           bool        tB,
+                                           int64_t     m,
+                                           int64_t     n,
+                                           int64_t     k,
+                                           unsigned    num_moduli,
+                                           int         device,
+                                           bool        dynamic_mode,
+                                           size_t      budget,
+                                           hipDataType type_a)
     {
         using K           = PerfModelKernelEffs;
         const auto hw_opt = get_perf_model_params(device);
@@ -214,9 +264,16 @@ namespace FP64Emulation
                && "perf_model_times called for a device not in hw_params_by_pci_id");
         const PerfModelDeviceParams& hw = *hw_opt;
 
-        const double c0  = hw.latency / K::latency_matmul_s;
-        const double c1  = c0 * hw.ai;
-        const double c2  = c1 * hw.ratio;
+        /* Select throughput ceiling and memory bandwidth based on input type.
+         * c0 = HBM bandwidth (bytes/s)
+         * c1 = native GEMM throughput (FLOP/s), type-specific
+         * c2 = INT8 GEMM throughput (ops/s), same hardware for both types    */
+        const bool   is_fp32       = (type_a == HIP_R_32F);
+        const double c0            = hw.hbm_bw;
+        const double c1            = is_fp32 ? hw.peak_fp32 : hw.peak_fp64;
+        const double c2            = hw.peak_int8;
+        /* Memory bytes per element: 4 for float, 8 for double.              */
+        const double bytes_per_elem = is_fp32 ? 4.0 : 8.0;
         const double s   = static_cast<double>(num_moduli);
         const double mn  = static_cast<double>(m) * static_cast<double>(n);
         const double mk  = static_cast<double>(m) * static_cast<double>(k);
@@ -259,7 +316,8 @@ namespace FP64Emulation
         const double t_total = t_prelim_kern + t_prelim_gemm + t_refine_kern + t_scale_kern
                                + t_gemm_accum + t_host + t_adp;
         const double t_native
-            = std::max(2.0 * mnk / c1, 8.0 * (mk + kn + mn) / c0) + K::latency_matmul_s;
+            = std::max(2.0 * mnk / c1, bytes_per_elem * (mk + kn + mn) / c0)
+              + K::latency_matmul_s;
 
         constexpr double s2ms = 1000.0;
         return {t_prelim_kern * s2ms,
@@ -292,27 +350,28 @@ namespace FP64Emulation
      * level recomputes its own budget from the current sub-problem dimensions —
      * mirroring the behaviour of emulated_gemm_impl, where smaller sub-problems
      * have smaller Zhi/Zlo requirements and thus a larger effective budget.    */
-    static double effective_time_ms(bool     tA,
-                                    bool     tB,
-                                    int64_t  m,
-                                    int64_t  n,
-                                    int64_t  k,
-                                    unsigned s,
-                                    int      device,
-                                    bool     dynamic_mode,
-                                    size_t   workspace_bytes)
+    static double effective_time_ms(bool        tA,
+                                    bool        tB,
+                                    int64_t     m,
+                                    int64_t     n,
+                                    int64_t     k,
+                                    unsigned    s,
+                                    int         device,
+                                    bool        dynamic_mode,
+                                    size_t      workspace_bytes,
+                                    hipDataType type_a)
     {
         if(m < FP64_EMUL_MIN_MN || n < FP64_EMUL_MIN_MN)
         {
             /* For sub-threshold shapes (m or n < 16) emulated_gemm_impl falls back to
-             * native DGEMM immediately, so emulation has strictly more overhead than
+             * native GEMM immediately, so emulation has strictly more overhead than
              * native.  Return t_native * (1 + ε) so the performance gate always prefers
              * native for these shapes.                                                  */
-            const double t_nat = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, ~size_t{0}).t_native_ms;
+            const double t_nat = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, ~size_t{0}, type_a).t_native_ms;
             return t_nat * (1.0 + 1e-6);
         }
         const size_t budget  = compute_budget_from_ws(m, n, k, s, dynamic_mode, workspace_bytes);
-        const double t_mono  = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget).t_total_ms;
+        const double t_mono  = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget, type_a).t_total_ms;
 
         const unsigned chunk_sz = compute_chunk_size(m, n, k, s, budget);
         const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -326,7 +385,7 @@ namespace FP64Emulation
              * its own budget from its own (half_m, half_n) dimensions.          */
             const double t_split
                 = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode,
-                                         workspace_bytes);
+                                         workspace_bytes, type_a);
             if(t_split < t_mono)
                 return t_split;
         }
@@ -335,20 +394,21 @@ namespace FP64Emulation
 
     /* Returns per-component predicted times summed across ALL leaf sub-GEMMs,
      * mirroring the recursive binary-halving of effective_time_ms.
-     * t_native_ms is always set to the top-level (m,n,k) native DGEMM time
-     * because native DGEMM does not split.                                    */
-    static PerfModelTimes effective_perf_model_times(bool     tA,
-                                                     bool     tB,
-                                                     int64_t  m,
-                                                     int64_t  n,
-                                                     int64_t  k,
-                                                     unsigned s,
-                                                     int      device,
-                                                     bool     dynamic_mode,
-                                                     size_t   workspace_bytes)
+     * t_native_ms is always set to the top-level (m,n,k) native GEMM time
+     * because native GEMM does not split.                                    */
+    static PerfModelTimes effective_perf_model_times(bool        tA,
+                                                     bool        tB,
+                                                     int64_t     m,
+                                                     int64_t     n,
+                                                     int64_t     k,
+                                                     unsigned    s,
+                                                     int         device,
+                                                     bool        dynamic_mode,
+                                                     size_t      workspace_bytes,
+                                                     hipDataType type_a)
     {
         const size_t   budget = compute_budget_from_ws(m, n, k, s, dynamic_mode, workspace_bytes);
-        PerfModelTimes mono   = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget);
+        PerfModelTimes mono   = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget, type_a);
 
         const unsigned chunk_sz = compute_chunk_size(m, n, k, s, budget);
         const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -360,11 +420,11 @@ namespace FP64Emulation
 
             const double t_split
                 = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode,
-                                         workspace_bytes);
+                                         workspace_bytes, type_a);
             if(t_split < mono.t_total_ms)
             {
                 PerfModelTimes half = effective_perf_model_times(
-                    tA, tB, half_m, half_n, k, s, device, dynamic_mode, workspace_bytes);
+                    tA, tB, half_m, half_n, k, s, device, dynamic_mode, workspace_bytes, type_a);
                 half.t_prelim_ms *= 2.0;
                 half.t_prelim_gemm_ms *= 2.0;
                 half.t_refine_ms *= 2.0;
@@ -380,74 +440,6 @@ namespace FP64Emulation
             }
         }
         return mono;
-    }
-
-    /* =========================================================================
-     * Device helper: warp-level reductions
-     * ========================================================================= */
-    static __device__ __forceinline__ double warp_reduce_max_abs_d(double val)
-    {
-        val = fabs(val);
-        unsigned long long bits;
-        __builtin_memcpy(&bits, &val, 8);
-        for(int off = warpSize >> 1; off > 0; off >>= 1)
-        {
-            unsigned long long other = __shfl_down(bits, off);
-            if(other > bits)
-                bits = other;
-        }
-        double res;
-        __builtin_memcpy(&res, &bits, 8);
-        return res;
-    }
-
-    static __device__ __forceinline__ int32_t warp_reduce_max_abs_i32(int32_t val)
-    {
-        if(val < 0)
-            val = -val;
-        for(int off = warpSize >> 1; off > 0; off >>= 1)
-        {
-            int32_t other = __shfl_down(val, off);
-            if(other > val)
-                val = other;
-        }
-        return val;
-    }
-
-    static __device__ __forceinline__ double block_reduce_max_d(double warp_max,
-                                                                double* __restrict__ s_wmax)
-    {
-        if(threadIdx.x % warpSize == 0)
-            s_wmax[threadIdx.x / warpSize] = warp_max;
-        __syncthreads();
-        double result = 0.0;
-        if(threadIdx.x == 0)
-        {
-            const int nw = (blockDim.x + warpSize - 1) / warpSize;
-            result       = s_wmax[0];
-            for(int w = 1; w < nw; ++w)
-                if(s_wmax[w] > result)
-                    result = s_wmax[w];
-        }
-        return result;
-    }
-
-    static __device__ __forceinline__ int32_t block_reduce_max_i32(int32_t warp_max,
-                                                                   int32_t* __restrict__ s_wmax)
-    {
-        if(threadIdx.x % warpSize == 0)
-            s_wmax[threadIdx.x / warpSize] = warp_max;
-        __syncthreads();
-        int32_t result = 0;
-        if(threadIdx.x == 0)
-        {
-            const int nw = (blockDim.x + warpSize - 1) / warpSize;
-            result       = s_wmax[0];
-            for(int w = 1; w < nw; ++w)
-                if(s_wmax[w] > result)
-                    result = s_wmax[w];
-        }
-        return result;
     }
 
     /* =========================================================================
@@ -470,27 +462,85 @@ namespace FP64Emulation
     static constexpr int OZ2_PRELIM_COALESC_THRS = 256; /* threads for coalesced paths */
     static constexpr int OZ2_MIN_WARP_SIZE = 32; /* minimum warpSize across supported devices */
 
-    /* Returns floor(log2(x)) for a positive normalized FP64 value x by extracting
-     * the IEEE 754 biased exponent field (bits 52-62) via integer bit ops.
-     * Replaces the quarter-rate transcendental log2() + floor() sequence (~50-100
-     * cycles on CDNA) with 2-3 full-rate integer instructions (~4-5 cycles).
-     * Precondition: x > 0 and x is a normalized FP64 (guaranteed by the
-     * < DBL_MIN guard that replaces zero/subnormal row/col maxima with DBL_MIN). */
-    static __device__ __forceinline__ int floor_log2_d(double x)
+    static __device__ __forceinline__ int floor_log2(double x)
     {
         unsigned long long bits;
         __builtin_memcpy(&bits, &x, 8);
         return static_cast<int>((bits >> 52) & 0x7FFull) - 1023;
     }
 
-    /* ── A_T: TRANS_A=true, k-fast double2 coalesced, blockDim=256, one block per row ──
-     * Both passes use double2 loads (128-bit) to process two k-positions per iteration,
-     * halving the number of memory transactions versus scalar 64-bit loads.
-     * Alignment: j = 2*threadIdx.x is always even; the base A+row*lda is assumed even
-     * in double-units (lda is even for any aligned allocation), so double2 is safe.
-     * Odd-k tail (at most one element) is handled by thread 0 with a scalar load.  */
-    template <bool CHECK_NAN>
-    __global__ static void accu_prelim_A_T_kernel(const double* __restrict__ A,
+    static __device__ __forceinline__ int floor_log2(float x)
+    {
+        unsigned bits;
+        __builtin_memcpy(&bits, &x, 4);
+        return static_cast<int>((bits >> 23) & 0xFFu) - 127;
+    }
+
+    static __device__ __forceinline__ double warp_reduce_max_abs(double val)
+    {
+        val = fabs(val);
+        unsigned long long bits;
+        __builtin_memcpy(&bits, &val, 8);
+        for(int off = warpSize >> 1; off > 0; off >>= 1)
+        {
+            unsigned long long other = __shfl_down(bits, off);
+            if(other > bits)
+                bits = other;
+        }
+        double res;
+        __builtin_memcpy(&res, &bits, 8);
+        return res;
+    }
+
+    static __device__ __forceinline__ float warp_reduce_max_abs(float val)
+    {
+        val      = fabsf(val);
+        int bits = __float_as_int(val);
+        for(int off = warpSize >> 1; off > 0; off >>= 1)
+        {
+            int other = __shfl_down(bits, off);
+            if(other > bits)
+                bits = other;
+        }
+        return __int_as_float(bits);
+    }
+
+    static __device__ __forceinline__ int32_t warp_reduce_max_abs(int32_t val)
+    {
+        if(val < 0)
+            val = -val;
+        for(int off = warpSize >> 1; off > 0; off >>= 1)
+        {
+            int32_t other = __shfl_down(val, off);
+            if(other > val)
+                val = other;
+        }
+        return val;
+    }
+
+    template <typename T>
+    static __device__ __forceinline__ T block_reduce_max(T warp_max,
+                                                         T* __restrict__ s_wmax)
+    {
+        if(threadIdx.x % warpSize == 0)
+            s_wmax[threadIdx.x / warpSize] = warp_max;
+        __syncthreads();
+        T result = T{0};
+        if(threadIdx.x == 0)
+        {
+            const int nw = (blockDim.x + warpSize - 1) / warpSize;
+            result       = s_wmax[0];
+            for(int w = 1; w < nw; ++w)
+                if(s_wmax[w] > result)
+                    result = s_wmax[w];
+        }
+        return result;
+    }
+
+    /* ── A_T: TRANS_A=true, k-fast 128-bit coalesced, blockDim=256, one block per row ──
+     * FP64: double2 (2 doubles = 128 bits).  FP32: float4 (4 floats = 128 bits). */
+    template <bool CHECK_NAN, typename T>
+    __global__ static void accu_prelim_A_T_kernel(const T* __restrict__ A,
                                                   int64_t m,
                                                   int64_t k,
                                                   int64_t lda,
@@ -499,77 +549,122 @@ namespace FP64Emulation
                                                   int16_t* __restrict__ sftA,
                                                   uint32_t* __restrict__ nan_flag)
     {
-        __shared__ double  s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
+        __shared__ T       s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE];
         __shared__ int16_t s_sft[1];
 
-        const int64_t       row      = static_cast<int64_t>(blockIdx.x);
-        const int64_t       k_even   = k & ~int64_t{1}; /* floor(k/2)*2 — double2 main range */
-        const double* const row_base = A + static_cast<size_t>(row) * static_cast<size_t>(lda);
+        const int64_t    row      = static_cast<int64_t>(blockIdx.x);
+        const T* const row_base = A + static_cast<size_t>(row) * static_cast<size_t>(lda);
 
-        /* Pass 1: reduce per-row max using double2 loads (2 elements per memory txn). */
-        double local_max = 0.0;
-        for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
+        /* Pass 1: reduce per-row max via 128-bit vector loads. */
+        T local_max = T{0};
+        if constexpr(std::is_same_v<T, double>)
         {
-            const double2 vv = *reinterpret_cast<const double2*>(row_base + j); /* COALESCED */
-            if constexpr(CHECK_NAN)
+            const int64_t k_even = k & ~int64_t{1};
+            for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
             {
-                if(!isfinite(vv.x))
-                    (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
-                if(!isfinite(vv.y))
-                    (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+                const double2 vv = *reinterpret_cast<const double2*>(row_base + j);
+                if constexpr(CHECK_NAN)
+                {
+                    if(!isfinite(vv.x)) (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
+                    if(!isfinite(vv.y)) (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+                }
+                if(fabs(vv.x) > local_max) local_max = fabs(vv.x);
+                if(fabs(vv.y) > local_max) local_max = fabs(vv.y);
             }
-            const double av0 = fabs(vv.x), av1 = fabs(vv.y);
-            if(av0 > local_max)
-                local_max = av0;
-            if(av1 > local_max)
-                local_max = av1;
+            if((k & 1) && threadIdx.x == 0)
+            {
+                const double val = row_base[k - 1];
+                if constexpr(CHECK_NAN)
+                    if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+                if(fabs(val) > local_max) local_max = fabs(val);
+            }
         }
-        /* Scalar tail: last element when k is odd (thread 0 only). */
-        if((k & 1) && threadIdx.x == 0)
+        else /* float */
         {
-            const double val = row_base[k - 1];
-            if constexpr(CHECK_NAN)
-                if(!isfinite(val))
-                    (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
-            const double av = fabs(val);
-            if(av > local_max)
-                local_max = av;
+            const int64_t k_align4 = k & ~int64_t{3};
+            for(int64_t j = 4LL * threadIdx.x; j < k_align4; j += 4LL * blockDim.x)
+            {
+                const float4 vv = *reinterpret_cast<const float4*>(row_base + j);
+                if constexpr(CHECK_NAN)
+                {
+                    if(!isfinite(vv.x)) (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
+                    if(!isfinite(vv.y)) (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+                    if(!isfinite(vv.z)) (void)atomicOr(nan_flag, isinf(vv.z) ? 1u : 2u);
+                    if(!isfinite(vv.w)) (void)atomicOr(nan_flag, isinf(vv.w) ? 1u : 2u);
+                }
+                local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(vv.x), fabsf(vv.y)),
+                                                    fmaxf(fabsf(vv.z), fabsf(vv.w))));
+            }
+            /* scalar tail for k % 4 != 0 */
+            for(int64_t j = (k & ~int64_t{3}) + threadIdx.x; j < k; j += blockDim.x)
+            {
+                const float val = row_base[j];
+                if constexpr(CHECK_NAN)
+                    if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+                if(fabsf(val) > local_max) local_max = fabsf(val);
+            }
         }
 
-        local_max = warp_reduce_max_abs_d(local_max);
-        local_max = block_reduce_max_d(local_max, s_wmax);
+        local_max = warp_reduce_max_abs(local_max);
+        local_max = block_reduce_max(local_max, s_wmax);
         if(threadIdx.x == 0)
         {
-            if(local_max < std::numeric_limits<double>::min())
-                local_max = std::numeric_limits<double>::min();
-            s_sft[0]  = static_cast<int16_t>(6 - floor_log2_d(local_max));
+            if(local_max < std::numeric_limits<T>::min())
+                local_max = std::numeric_limits<T>::min();
+            s_sft[0]  = static_cast<int16_t>(6 - floor_log2(local_max));
             sftA[row] = s_sft[0];
         }
         __syncthreads();
         const int sft = static_cast<int>(s_sft[0]);
 
-        /* Pass 2: scale and extract INT8 using double2 loads. */
+        /* Pass 2: scale and extract INT8.  Same vector-load pattern as Pass 1. */
         const size_t row_out = static_cast<size_t>(row) * lda8i;
-        for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
+        if constexpr(std::is_same_v<T, double>)
         {
-            const double2 vv = *reinterpret_cast<const double2*>(row_base + j); /* COALESCED */
-            A8i_high[row_out + static_cast<size_t>(j)]
-                = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
-            A8i_high[row_out + static_cast<size_t>(j) + 1]
-                = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
+            const int64_t k_even = k & ~int64_t{1};
+            for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
+            {
+                const double2 vv = *reinterpret_cast<const double2*>(row_base + j);
+                A8i_high[row_out + static_cast<size_t>(j)]
+                    = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
+                A8i_high[row_out + static_cast<size_t>(j) + 1]
+                    = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
+            }
+            if((k & 1) && threadIdx.x == 0)
+            {
+                const double scaled = ceil(ldexp(fabs(row_base[k - 1]), sft));
+                A8i_high[row_out + static_cast<size_t>(k - 1)]
+                    = static_cast<int8_t>(static_cast<int32_t>(scaled));
+            }
         }
-        /* Scalar tail. */
-        if((k & 1) && threadIdx.x == 0)
+        else /* float */
         {
-            const double scaled = ceil(ldexp(fabs(row_base[k - 1]), sft));
-            A8i_high[row_out + static_cast<size_t>(k - 1)]
-                = static_cast<int8_t>(static_cast<int32_t>(scaled));
+            const int64_t k_align4 = k & ~int64_t{3};
+            for(int64_t j = 4LL * threadIdx.x; j < k_align4; j += 4LL * blockDim.x)
+            {
+                const float4 vv = *reinterpret_cast<const float4*>(row_base + j);
+                A8i_high[row_out + j + 0] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(vv.x)), sft)))));
+                A8i_high[row_out + j + 1] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(vv.y)), sft)))));
+                A8i_high[row_out + j + 2] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(vv.z)), sft)))));
+                A8i_high[row_out + j + 3] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(vv.w)), sft)))));
+            }
+            for(int64_t j = (k & ~int64_t{3}) + threadIdx.x; j < k; j += blockDim.x)
+            {
+                A8i_high[row_out + j] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(row_base[j])), sft)))));
+            }
         }
     }
 
-    /* ── A_N: TRANS_A=false, SHMEM transposition, blockDim=1024, TILE_M=16 rows/block ── */
-    template <bool CHECK_NAN>
-    __global__ static void accu_prelim_A_N_kernel(const double* __restrict__ A,
+    /* ── A_N: TRANS_A=false, SHMEM transposition, blockDim=1024, TILE_M=16 rows/block ──
+     * SHMEM always uses double regardless of T — values are widened at load time.
+     * This keeps the residue shift arithmetic in double for both FP32 and FP64.  */
+    template <bool CHECK_NAN, typename T>
+    __global__ static void accu_prelim_A_N_kernel(const T* __restrict__ A,
                                                   int64_t m,
                                                   int64_t k,
                                                   int64_t lda,
@@ -580,29 +675,27 @@ namespace FP64Emulation
     {
         static constexpr int TILE_K = OZ2_PRELIM_TILE_K;
         static constexpr int TILE_M = OZ2_PRELIM_SHMEM_TILE_M;
-        __shared__ double    shmem[TILE_K][TILE_M + 1]; /* +1 avoids bank conflicts */
+        __shared__ double    shmem[TILE_K][TILE_M + 1]; /* always double for arithmetic */
         __shared__ int16_t   s_sft[TILE_M];
 
         const int64_t m_base  = static_cast<int64_t>(blockIdx.x) * TILE_M;
         const int     t       = static_cast<int>(threadIdx.x);
-        const int     k_local = t / TILE_M; /* 0..TILE_K-1 */
-        const int     m_local = t % TILE_M; /* 0..TILE_M-1 */
+        const int     k_local = t / TILE_M;
+        const int     m_local = t % TILE_M;
         const int64_t i       = m_base + m_local;
 
-        /* Pass 1: each thread accumulates its partial per-row max over all k-tiles */
+        /* Pass 1: accumulate per-row max (widen T→double at load). */
         double thr_max = 0.0;
         for(int64_t k_base = 0; k_base < k; k_base += TILE_K)
         {
             const int64_t j = k_base + k_local;
             if(i < m && j < k)
             {
-                double val = A[i + j * lda]; /* COALESCED */
+                const double val = static_cast<double>(A[i + j * lda]);
                 if constexpr(CHECK_NAN)
-                    if(!isfinite(val))
-                        (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
-                double av = fabs(val);
-                if(av > thr_max)
-                    thr_max = av;
+                    if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+                const double av = fabs(val);
+                if(av > thr_max) thr_max = av;
             }
         }
         shmem[k_local][m_local] = thr_max;
@@ -611,24 +704,22 @@ namespace FP64Emulation
         {
             double row_max = 0.0;
             for(int kl = 0; kl < TILE_K; ++kl)
-                if(shmem[kl][m_local] > row_max)
-                    row_max = shmem[kl][m_local];
+                if(shmem[kl][m_local] > row_max) row_max = shmem[kl][m_local];
             if(row_max < std::numeric_limits<double>::min())
                 row_max = std::numeric_limits<double>::min();
-            s_sft[m_local] = static_cast<int16_t>(6 - floor_log2_d(row_max));
-            if(i < m)
-                sftA[i] = s_sft[m_local];
+            s_sft[m_local] = static_cast<int16_t>(6 - floor_log2(row_max));
+            if(i < m) sftA[i] = s_sft[m_local];
         }
         __syncthreads();
         const int sft = static_cast<int>(s_sft[m_local]);
 
-        /* Pass 2: coalesced loads (m-fast) → SHMEM → coalesced writes (k-fast) */
+        /* Pass 2: scale → SHMEM → write INT8. */
         for(int64_t k_base = 0; k_base < k; k_base += TILE_K)
         {
             const int64_t j      = k_base + k_local;
             double        scaled = 0.0;
             if(i < m && j < k)
-                scaled = ceil(ldexp(fabs(A[i + j * lda]), sft)); /* COALESCED */
+                scaled = ceil(ldexp(fabs(static_cast<double>(A[i + j * lda])), sft));
             shmem[k_local][m_local] = scaled;
             __syncthreads();
             const int     k_write = t % TILE_K;
@@ -642,12 +733,9 @@ namespace FP64Emulation
         }
     }
 
-    /* ── B_N: TRANS_B=false, j-fast double2 coalesced, blockDim=256, one block per col ──
-     * Mirrors accu_prelim_A_T_kernel: double2 loads halve memory transactions in both
-     * passes.  Alignment: j = 2*threadIdx.x is always even; the base B+col*ldb is
-     * assumed even in double-units (ldb even for aligned allocations).              */
-    template <bool CHECK_NAN>
-    __global__ static void accu_prelim_B_N_kernel(const double* __restrict__ B,
+    /* ── B_N: TRANS_B=false, k-fast 128-bit coalesced, blockDim=256, one block per col ── */
+    template <bool CHECK_NAN, typename T>
+    __global__ static void accu_prelim_B_N_kernel(const T* __restrict__ B,
                                                   int64_t n,
                                                   int64_t k,
                                                   int64_t ldb,
@@ -656,77 +744,116 @@ namespace FP64Emulation
                                                   int16_t* __restrict__ sftB,
                                                   uint32_t* __restrict__ nan_flag)
     {
-        __shared__ double  s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE]; /* 8 slots */
+        __shared__ T       s_wmax[OZ2_PRELIM_COALESC_THRS / OZ2_MIN_WARP_SIZE];
         __shared__ int16_t s_sft[1];
 
-        const int64_t       col      = static_cast<int64_t>(blockIdx.x);
-        const int64_t       k_even   = k & ~int64_t{1};
-        const double* const col_base = B + static_cast<size_t>(col) * static_cast<size_t>(ldb);
+        const int64_t    col      = static_cast<int64_t>(blockIdx.x);
+        const T* const col_base = B + static_cast<size_t>(col) * static_cast<size_t>(ldb);
 
-        /* Pass 1: reduce per-col max using double2 loads. */
-        double local_max = 0.0;
-        for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
+        T local_max = T{0};
+        if constexpr(std::is_same_v<T, double>)
         {
-            const double2 vv = *reinterpret_cast<const double2*>(col_base + j); /* COALESCED */
-            if constexpr(CHECK_NAN)
+            const int64_t k_even = k & ~int64_t{1};
+            for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
             {
-                if(!isfinite(vv.x))
-                    (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
-                if(!isfinite(vv.y))
-                    (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+                const double2 vv = *reinterpret_cast<const double2*>(col_base + j);
+                if constexpr(CHECK_NAN)
+                {
+                    if(!isfinite(vv.x)) (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
+                    if(!isfinite(vv.y)) (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+                }
+                if(fabs(vv.x) > local_max) local_max = fabs(vv.x);
+                if(fabs(vv.y) > local_max) local_max = fabs(vv.y);
             }
-            const double av0 = fabs(vv.x), av1 = fabs(vv.y);
-            if(av0 > local_max)
-                local_max = av0;
-            if(av1 > local_max)
-                local_max = av1;
+            if((k & 1) && threadIdx.x == 0)
+            {
+                const double val = col_base[k - 1];
+                if constexpr(CHECK_NAN)
+                    if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+                if(fabs(val) > local_max) local_max = fabs(val);
+            }
         }
-        /* Scalar tail when k is odd (thread 0 only). */
-        if((k & 1) && threadIdx.x == 0)
+        else /* float */
         {
-            const double val = col_base[k - 1];
-            if constexpr(CHECK_NAN)
-                if(!isfinite(val))
-                    (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
-            const double av = fabs(val);
-            if(av > local_max)
-                local_max = av;
+            const int64_t k_align4 = k & ~int64_t{3};
+            for(int64_t j = 4LL * threadIdx.x; j < k_align4; j += 4LL * blockDim.x)
+            {
+                const float4 vv = *reinterpret_cast<const float4*>(col_base + j);
+                if constexpr(CHECK_NAN)
+                {
+                    if(!isfinite(vv.x)) (void)atomicOr(nan_flag, isinf(vv.x) ? 1u : 2u);
+                    if(!isfinite(vv.y)) (void)atomicOr(nan_flag, isinf(vv.y) ? 1u : 2u);
+                    if(!isfinite(vv.z)) (void)atomicOr(nan_flag, isinf(vv.z) ? 1u : 2u);
+                    if(!isfinite(vv.w)) (void)atomicOr(nan_flag, isinf(vv.w) ? 1u : 2u);
+                }
+                local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(vv.x), fabsf(vv.y)),
+                                                    fmaxf(fabsf(vv.z), fabsf(vv.w))));
+            }
+            for(int64_t j = (k & ~int64_t{3}) + threadIdx.x; j < k; j += blockDim.x)
+            {
+                const float val = col_base[j];
+                if constexpr(CHECK_NAN)
+                    if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+                if(fabsf(val) > local_max) local_max = fabsf(val);
+            }
         }
 
-        local_max = warp_reduce_max_abs_d(local_max);
-        local_max = block_reduce_max_d(local_max, s_wmax);
+        local_max = warp_reduce_max_abs(local_max);
+        local_max = block_reduce_max(local_max, s_wmax);
         if(threadIdx.x == 0)
         {
-            if(local_max < std::numeric_limits<double>::min())
-                local_max = std::numeric_limits<double>::min();
-            s_sft[0]  = static_cast<int16_t>(6 - floor_log2_d(local_max));
+            if(local_max < std::numeric_limits<T>::min())
+                local_max = std::numeric_limits<T>::min();
+            s_sft[0]  = static_cast<int16_t>(6 - floor_log2(local_max));
             sftB[col] = s_sft[0];
         }
         __syncthreads();
         const int sft = static_cast<int>(s_sft[0]);
 
-        /* Pass 2: scale and extract INT8 using double2 loads. */
         const size_t col_out = static_cast<size_t>(col) * ldb8i;
-        for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
+        if constexpr(std::is_same_v<T, double>)
         {
-            const double2 vv = *reinterpret_cast<const double2*>(col_base + j); /* COALESCED */
-            B8i_high[col_out + static_cast<size_t>(j)]
-                = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
-            B8i_high[col_out + static_cast<size_t>(j) + 1]
-                = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
+            const int64_t k_even = k & ~int64_t{1};
+            for(int64_t j = 2LL * threadIdx.x; j < k_even; j += 2LL * blockDim.x)
+            {
+                const double2 vv = *reinterpret_cast<const double2*>(col_base + j);
+                B8i_high[col_out + j]
+                    = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.x), sft))));
+                B8i_high[col_out + j + 1]
+                    = static_cast<int8_t>(static_cast<int32_t>(ceil(ldexp(fabs(vv.y), sft))));
+            }
+            if((k & 1) && threadIdx.x == 0)
+            {
+                const double scaled = ceil(ldexp(fabs(col_base[k - 1]), sft));
+                B8i_high[col_out + k - 1] = static_cast<int8_t>(static_cast<int32_t>(scaled));
+            }
         }
-        /* Scalar tail. */
-        if((k & 1) && threadIdx.x == 0)
+        else /* float */
         {
-            const double scaled = ceil(ldexp(fabs(col_base[k - 1]), sft));
-            B8i_high[col_out + static_cast<size_t>(k - 1)]
-                = static_cast<int8_t>(static_cast<int32_t>(scaled));
+            const int64_t k_align4 = k & ~int64_t{3};
+            for(int64_t j = 4LL * threadIdx.x; j < k_align4; j += 4LL * blockDim.x)
+            {
+                const float4 vv = *reinterpret_cast<const float4*>(col_base + j);
+                B8i_high[col_out + j + 0] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(vv.x)), sft)))));
+                B8i_high[col_out + j + 1] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(vv.y)), sft)))));
+                B8i_high[col_out + j + 2] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(vv.z)), sft)))));
+                B8i_high[col_out + j + 3] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(vv.w)), sft)))));
+            }
+            for(int64_t j = (k & ~int64_t{3}) + threadIdx.x; j < k; j += blockDim.x)
+            {
+                B8i_high[col_out + j] = static_cast<int8_t>(static_cast<int32_t>(
+                    ceilf(static_cast<float>(ldexp(static_cast<double>(fabsf(col_base[j])), sft)))));
+            }
         }
     }
 
     /* ── B_T: TRANS_B=true, SHMEM transposition, blockDim=1024, TILE_M=16 cols/block ── */
-    template <bool CHECK_NAN>
-    __global__ static void accu_prelim_B_T_kernel(const double* __restrict__ B,
+    template <bool CHECK_NAN, typename T>
+    __global__ static void accu_prelim_B_T_kernel(const T* __restrict__ B,
                                                   int64_t n,
                                                   int64_t k,
                                                   int64_t ldb,
@@ -746,20 +873,17 @@ namespace FP64Emulation
         const int     l_local = t % TILE_M;
         const int64_t col     = n_base + l_local;
 
-        /* Pass 1: accumulate per-col max */
         double thr_max = 0.0;
         for(int64_t k_base = 0; k_base < k; k_base += TILE_K)
         {
             const int64_t j = k_base + k_local;
             if(col < n && j < k)
             {
-                double val = B[col + j * ldb]; /* COALESCED */
+                const double val = static_cast<double>(B[col + j * ldb]);
                 if constexpr(CHECK_NAN)
-                    if(!isfinite(val))
-                        (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
-                double av = fabs(val);
-                if(av > thr_max)
-                    thr_max = av;
+                    if(!isfinite(val)) (void)atomicOr(nan_flag, isinf(val) ? 1u : 2u);
+                const double av = fabs(val);
+                if(av > thr_max) thr_max = av;
             }
         }
         shmem[k_local][l_local] = thr_max;
@@ -768,24 +892,21 @@ namespace FP64Emulation
         {
             double col_max = 0.0;
             for(int kl = 0; kl < TILE_K; ++kl)
-                if(shmem[kl][l_local] > col_max)
-                    col_max = shmem[kl][l_local];
+                if(shmem[kl][l_local] > col_max) col_max = shmem[kl][l_local];
             if(col_max < std::numeric_limits<double>::min())
                 col_max = std::numeric_limits<double>::min();
-            s_sft[l_local] = static_cast<int16_t>(6 - floor_log2_d(col_max));
-            if(col < n)
-                sftB[col] = s_sft[l_local];
+            s_sft[l_local] = static_cast<int16_t>(6 - floor_log2(col_max));
+            if(col < n) sftB[col] = s_sft[l_local];
         }
         __syncthreads();
         const int sft = static_cast<int>(s_sft[l_local]);
 
-        /* Pass 2: coalesced loads (col-fast) → SHMEM → coalesced writes (k-fast) */
         for(int64_t k_base = 0; k_base < k; k_base += TILE_K)
         {
             const int64_t j      = k_base + k_local;
             double        scaled = 0.0;
             if(col < n && j < k)
-                scaled = ceil(ldexp(fabs(B[col + j * ldb]), sft)); /* COALESCED */
+                scaled = ceil(ldexp(fabs(static_cast<double>(B[col + j * ldb])), sft));
             shmem[k_local][l_local] = scaled;
             __syncthreads();
             const int     k_write = t % TILE_K;
@@ -848,8 +969,8 @@ namespace FP64Emulation
             if(av > local_max)
                 local_max = av;
         }
-        local_max = warp_reduce_max_abs_i32(local_max);
-        local_max = block_reduce_max_i32(local_max, s_wmax);
+        local_max = warp_reduce_max_abs(local_max);
+        local_max = block_reduce_max(local_max, s_wmax);
         if(threadIdx.x == 0)
             col_max[col] = local_max; /* direct write, no atomicMax needed */
     }
@@ -1029,8 +1150,8 @@ namespace FP64Emulation
      * Stores: one uint32_t NT store per modulus (packs INT8[j0..j0+3]) = 128 bytes/warp.
      * Moduli loop is OUTER so nm/im/imf are loaded once per modulus, and only
      * TILE_M=8 NT write-combine buffers are needed simultaneously.               */
-    template <unsigned T_COUNT>
-    __global__ static void scale_A_T_kernel(const double* __restrict__ A,
+    template <unsigned T_COUNT, typename T>
+    __global__ static void scale_A_T_kernel(const T* __restrict__ A,
                                             int64_t m,
                                             int64_t lda,
                                             int8_t* __restrict__ A8i,
@@ -1044,31 +1165,57 @@ namespace FP64Emulation
         static constexpr int TILE_M = OZ2_SCALE_COALESC_TILE_M; /* 8 */
         const int            t      = static_cast<int>(threadIdx.x);
         const int64_t        m_base = static_cast<int64_t>(blockIdx.y) * TILE_M;
-        /* j0 is always 4-aligned → both double2 loads and the uint32_t store are aligned. */
+        /* j0 is always 4-aligned → both vector loads and the uint32_t store are aligned. */
         const int64_t j0 = static_cast<int64_t>(blockIdx.x) * (TILE_K * 4)
                            + static_cast<int64_t>(t % TILE_K) * 4;
         const int64_t i = m_base + (t / TILE_K);
         if(i >= m || j0 >= k)
             return;
         const int sft = static_cast<int>(sftA[i]);
-        /* Load j0/j0+1 as double2 (j0 is 4-aligned → even → 16-byte aligned). */
+        /* Load and widen to double immediately — all residue arithmetic stays in double.
+         * FP64: double2 (2 × 8 bytes = 128-bit).  FP32: float2 (2 × 4 bytes = 64-bit). */
         double ival[4];
+        if constexpr(std::is_same_v<T, double>)
         {
-            const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0);
-            ival[0]          = trunc(ldexp(vv.x, sft));
-            ival[1]          = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            /* Load j0/j0+1 as double2 (j0 is 4-aligned → even → 16-byte aligned). */
+            {
+                const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0);
+                ival[0]          = trunc(ldexp(vv.x, sft));
+                ival[1]          = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            }
+            /* Load j0+2/j0+3 as double2 (j0+2 is even → aligned) only when valid. */
+            if(j0 + 2 < k)
+            {
+                const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0 + 2);
+                ival[2]          = trunc(ldexp(vv.x, sft));
+                ival[3]          = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            }
+            else
+            {
+                ival[2] = 0.0;
+                ival[3] = 0.0;
+            }
         }
-        /* Load j0+2/j0+3 as double2 (j0+2 is even → aligned) only when valid. */
-        if(j0 + 2 < k)
+        else /* float: float2 (2 × 4 bytes = 64-bit), still coalesced */
         {
-            const double2 vv = *reinterpret_cast<const double2*>(A + i * lda + j0 + 2);
-            ival[2]          = trunc(ldexp(vv.x, sft));
-            ival[3]          = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
-        }
-        else
-        {
-            ival[2] = 0.0;
-            ival[3] = 0.0;
+            /* Load j0/j0+1 as float2 (j0 is 4-aligned → 8-byte aligned). */
+            {
+                const float2 vv = *reinterpret_cast<const float2*>(A + i * lda + j0);
+                ival[0]         = trunc(ldexp(static_cast<double>(vv.x), sft));
+                ival[1]         = (j0 + 1 < k) ? trunc(ldexp(static_cast<double>(vv.y), sft)) : 0.0;
+            }
+            /* Load j0+2/j0+3 as float2 (j0+2 is even → 8-byte aligned) only when valid. */
+            if(j0 + 2 < k)
+            {
+                const float2 vv = *reinterpret_cast<const float2*>(A + i * lda + j0 + 2);
+                ival[2]         = trunc(ldexp(static_cast<double>(vv.x), sft));
+                ival[3]         = (j0 + 3 < k) ? trunc(ldexp(static_cast<double>(vv.y), sft)) : 0.0;
+            }
+            else
+            {
+                ival[2] = 0.0;
+                ival[3] = 0.0;
+            }
         }
         const size_t stride   = lda8i * cola8i;
         const size_t off_base = static_cast<size_t>(i) * lda8i;
@@ -1118,8 +1265,8 @@ namespace FP64Emulation
      *   j_out = blockIdx.x*TILE_K + k_wb is always 4-aligned → uint32_t aligned.
      *   Out-of-bounds shmem entries are pre-zeroed in the load phase (stored 0.0 for j≥k),
      *   so the extra bytes in the padding region [k, lda8i) are harmlessly zero. */
-    template <unsigned T_COUNT>
-    __global__ static void scale_A_N_kernel(const double* __restrict__ A,
+    template <unsigned T_COUNT, typename T>
+    __global__ static void scale_A_N_kernel(const T* __restrict__ A,
                                             int64_t m,
                                             int64_t lda,
                                             int8_t* __restrict__ A8i,
@@ -1133,7 +1280,7 @@ namespace FP64Emulation
         static constexpr int TILE_M   = OZ2_SCALE_SHMEM_TILE_M; /* 16 */
         static constexpr int K_UNROLL = 4;
         /* blockDim = OZ2_SCALE_SHMEM_BLOCK_DIM = (TILE_K/K_UNROLL)*TILE_M = 256 */
-        __shared__ double  shmem[TILE_K][TILE_M + 1];
+        __shared__ double  shmem[TILE_K][TILE_M + 1]; /* always double — values widened at load */
         __shared__ int16_t s_sft[TILE_M];
 
         const int     t      = static_cast<int>(threadIdx.x);
@@ -1142,14 +1289,14 @@ namespace FP64Emulation
         const int     m_loc  = t % TILE_M; /* 0..TILE_M-1 = 0..15           */
         const int64_t i      = m_base + m_loc;
 
-        /* Load phase: each thread fills K_UNROLL consecutive SHMEM entries.
+        /* Load phase: widen T→double immediately at load; SHMEM stays double.
          * Access A[i + j*lda] (m-fast across m_loc) is coalesced within each
          * group of TILE_M threads sharing the same k_grp.                   */
 #pragma unroll
         for(int p = 0; p < K_UNROLL; p++)
         {
             const int64_t j = static_cast<int64_t>(blockIdx.x) * TILE_K + k_grp * K_UNROLL + p;
-            shmem[k_grp * K_UNROLL + p][m_loc] = (i < m && j < k) ? A[i + j * lda] : 0.0;
+            shmem[k_grp * K_UNROLL + p][m_loc] = (i < m && j < k) ? static_cast<double>(A[i + j * lda]) : 0.0;
         }
         if(k_grp == 0 && i < m)
             s_sft[m_loc] = sftA[i];
@@ -1205,9 +1352,10 @@ namespace FP64Emulation
     }
 
     /* ── B_N: TRANS_B=false, j-fast coalesced, blockDim=512, TILE_M=8, K_UNROLL=4 ──
-     * Mirrors scale_A_T_kernel: two double2 loads (j0..j0+1 and j0+2..j0+3) + uint32_t packed store. */
-    template <unsigned T_COUNT>
-    __global__ static void scale_B_N_kernel(const double* __restrict__ B,
+     * Mirrors scale_A_T_kernel: two vector loads (j0..j0+1 and j0+2..j0+3) + uint32_t packed store.
+     * FP64: double2 (128-bit).  FP32: float2 (64-bit), widened to double before arithmetic. */
+    template <unsigned T_COUNT, typename T>
+    __global__ static void scale_B_N_kernel(const T* __restrict__ B,
                                             int64_t n,
                                             int64_t ldb,
                                             int8_t* __restrict__ B8i,
@@ -1226,22 +1374,45 @@ namespace FP64Emulation
         if(col >= n || j0 >= k)
             return;
         const int sft = static_cast<int>(sftB[col]);
-        double    ival[4];
+        /* Load and widen to double immediately — all residue arithmetic stays in double. */
+        double ival[4];
+        if constexpr(std::is_same_v<T, double>)
         {
-            const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0);
-            ival[0]          = trunc(ldexp(vv.x, sft));
-            ival[1]          = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            {
+                const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0);
+                ival[0]          = trunc(ldexp(vv.x, sft));
+                ival[1]          = (j0 + 1 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            }
+            if(j0 + 2 < k)
+            {
+                const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0 + 2);
+                ival[2]          = trunc(ldexp(vv.x, sft));
+                ival[3]          = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
+            }
+            else
+            {
+                ival[2] = 0.0;
+                ival[3] = 0.0;
+            }
         }
-        if(j0 + 2 < k)
+        else /* float: float2 (2 × 4 bytes = 64-bit), still coalesced */
         {
-            const double2 vv = *reinterpret_cast<const double2*>(B + col * ldb + j0 + 2);
-            ival[2]          = trunc(ldexp(vv.x, sft));
-            ival[3]          = (j0 + 3 < k) ? trunc(ldexp(vv.y, sft)) : 0.0;
-        }
-        else
-        {
-            ival[2] = 0.0;
-            ival[3] = 0.0;
+            {
+                const float2 vv = *reinterpret_cast<const float2*>(B + col * ldb + j0);
+                ival[0]         = trunc(ldexp(static_cast<double>(vv.x), sft));
+                ival[1]         = (j0 + 1 < k) ? trunc(ldexp(static_cast<double>(vv.y), sft)) : 0.0;
+            }
+            if(j0 + 2 < k)
+            {
+                const float2 vv = *reinterpret_cast<const float2*>(B + col * ldb + j0 + 2);
+                ival[2]         = trunc(ldexp(static_cast<double>(vv.x), sft));
+                ival[3]         = (j0 + 3 < k) ? trunc(ldexp(static_cast<double>(vv.y), sft)) : 0.0;
+            }
+            else
+            {
+                ival[2] = 0.0;
+                ival[3] = 0.0;
+            }
         }
         const size_t stride   = ldb8i * static_cast<size_t>(n);
         const size_t off_base = static_cast<size_t>(col) * ldb8i;
@@ -1288,8 +1459,8 @@ namespace FP64Emulation
      *   j_out = blockIdx.x*TILE_K + k_wb is always 4-aligned → uint32_t aligned.
      *   Out-of-bounds shmem entries are pre-zeroed in the load phase (stored 0.0 for j≥k),
      *   so extra bytes in the padding region [k, ldb8i) are harmlessly zero.           */
-    template <unsigned T_COUNT>
-    __global__ static void scale_B_T_kernel(const double* __restrict__ B,
+    template <unsigned T_COUNT, typename T>
+    __global__ static void scale_B_T_kernel(const T* __restrict__ B,
                                             int64_t n,
                                             int64_t ldb,
                                             int8_t* __restrict__ B8i,
@@ -1302,7 +1473,7 @@ namespace FP64Emulation
         static constexpr int TILE_M   = OZ2_SCALE_SHMEM_TILE_M; /* 16 */
         static constexpr int K_UNROLL = 4;
         /* blockDim = OZ2_SCALE_SHMEM_BLOCK_DIM = (TILE_K/K_UNROLL)*TILE_M = 256 */
-        __shared__ double  shmem[TILE_K][TILE_M + 1];
+        __shared__ double  shmem[TILE_K][TILE_M + 1]; /* always double — values widened at load */
         __shared__ int16_t s_sft[TILE_M];
 
         const int     t      = static_cast<int>(threadIdx.x);
@@ -1311,14 +1482,14 @@ namespace FP64Emulation
         const int     l_loc  = t % TILE_M; /* 0..TILE_M-1 = 0..15           */
         const int64_t col    = n_base + l_loc;
 
-        /* Load phase: each thread fills K_UNROLL consecutive SHMEM entries.
+        /* Load phase: widen T→double immediately at load; SHMEM stays double.
          * Access B[col + j*ldb] (col-fast across l_loc) is coalesced within each
          * group of TILE_M threads sharing the same k_grp.                   */
 #pragma unroll
         for(int p = 0; p < K_UNROLL; p++)
         {
             const int64_t j = static_cast<int64_t>(blockIdx.x) * TILE_K + k_grp * K_UNROLL + p;
-            shmem[k_grp * K_UNROLL + p][l_loc] = (col < n && j < k) ? B[col + j * ldb] : 0.0;
+            shmem[k_grp * K_UNROLL + p][l_loc] = (col < n && j < k) ? static_cast<double>(B[col + j * ldb]) : 0.0;
         }
         if(k_grp == 0 && col < n)
             s_sft[l_loc] = sftB[col];
@@ -1437,12 +1608,12 @@ namespace FP64Emulation
         }
     }
 
-    template <bool HAS_LO, unsigned CHUNK_SIZE, bool IS_FIRST_CHUNK>
+    template <bool HAS_LO, unsigned CHUNK_SIZE, bool IS_FIRST_CHUNK, typename T_out = double>
     __global__ static void accum_finalize_kernel(const int32_t* __restrict__ C32i_batch,
                                                  const double* __restrict__ Zhi_in,
                                                  const double* __restrict__ Zlo_in,
-                                                 const double* __restrict__ C,
-                                                 double* __restrict__ D,
+                                                 const T_out* __restrict__ C,
+                                                 T_out* __restrict__ D,
                                                  int64_t m,
                                                  int64_t n,
                                                  size_t  ldc32i,
@@ -1504,9 +1675,9 @@ namespace FP64Emulation
         {
             const size_t c_idx
                 = static_cast<size_t>(i) + static_cast<size_t>(l) * static_cast<size_t>(ldc);
-            d_val += beta * C[c_idx];
+            d_val += beta * static_cast<double>(C[c_idx]);
         }
-        __builtin_nontemporal_store(d_val, D + d_idx);
+        __builtin_nontemporal_store(static_cast<T_out>(d_val), D + d_idx);
     }
 
     static const char* profile_file()
@@ -1516,40 +1687,51 @@ namespace FP64Emulation
     }
 
     /* =========================================================================
-     * native_dgemm_fallback — run a plain FP64 hipblasLtMatmul for a
-     * sub-block.  Used by the split path in emulated_gemm_impl when the
+     * native_gemm_fallback<T> — run a plain hipblasLtMatmul (DGEMM or SGEMM)
+     * for a sub-block.  Used by the split path in emulated_gemm_impl when the
      * second half's emulation fails after the first half has already written D,
      * so that D is fully correct without corrupting the first half's output.
      *
+     * T = double → DGEMM (HIP_R_64F, HIPBLAS_COMPUTE_64F)
+     * T = float  → SGEMM (HIP_R_32F, HIPBLAS_COMPUTE_32F)
+     *
      * A fresh hipblasLtHandle is created with emulation explicitly disabled
-     * (emulation.enabled=0) so that HIPBLASLT_EMULATE_DOUBLE_PRECISION=1 in
-     * the environment does not cause this call to re-enter emulation recursively.
-     * The default enabled=-1 means "check env var", which would re-trigger it.
+     * on BOTH sub-structs so that env-var triggers do not cause recursive
+     * re-entry regardless of which type triggered the original fallback.
      * ========================================================================= */
-    static rocblaslt_status native_dgemm_fallback(const _rocblaslt_handle* h,
-                                                  hipblasOperation_t       opA,
-                                                  hipblasOperation_t       opB,
-                                                  int64_t                  m,
-                                                  int64_t                  n,
-                                                  int64_t                  k,
-                                                  const double*            alpha,
-                                                  const double*            A,
-                                                  int64_t                  lda,
-                                                  const double*            B,
-                                                  int64_t                  ldb,
-                                                  const double*            beta,
-                                                  const double*            C,
-                                                  int64_t                  ldc,
-                                                  double*                  D,
-                                                  int64_t                  ldd,
-                                                  hipStream_t              stream)
+    template <typename T>
+    static rocblaslt_status native_gemm_fallback(const _rocblaslt_handle* h,
+                                                 hipblasOperation_t       opA,
+                                                 hipblasOperation_t       opB,
+                                                 int64_t                  m,
+                                                 int64_t                  n,
+                                                 int64_t                  k,
+                                                 const T*                 alpha,
+                                                 const T*                 A,
+                                                 int64_t                  lda,
+                                                 const T*                 B,
+                                                 int64_t                  ldb,
+                                                 const T*                 beta,
+                                                 const T*                 C,
+                                                 int64_t                  ldc,
+                                                 T*                       D,
+                                                 int64_t                  ldd,
+                                                 hipStream_t              stream)
     {
-        hipblasLtHandle_t       fp64_handle = nullptr;
-        hipblasLtMatrixLayout_t layoutA     = nullptr;
-        hipblasLtMatrixLayout_t layoutB     = nullptr;
-        hipblasLtMatrixLayout_t layoutC     = nullptr;
-        hipblasLtMatrixLayout_t layoutD     = nullptr;
-        hipblasLtMatmulDesc_t   desc        = nullptr;
+        /* Resolve hip data type and compute type from T at compile time. */
+        constexpr hipDataType          hip_type = std::is_same_v<T, double>
+                                                      ? HIP_R_64F
+                                                      : HIP_R_32F;
+        constexpr hipblasComputeType_t ctype    = std::is_same_v<T, double>
+                                                      ? HIPBLAS_COMPUTE_64F
+                                                      : HIPBLAS_COMPUTE_32F;
+
+        hipblasLtHandle_t       native_handle = nullptr;
+        hipblasLtMatrixLayout_t layoutA       = nullptr;
+        hipblasLtMatrixLayout_t layoutB       = nullptr;
+        hipblasLtMatrixLayout_t layoutC       = nullptr;
+        hipblasLtMatrixLayout_t layoutD       = nullptr;
+        hipblasLtMatmulDesc_t   desc          = nullptr;
 
         auto cleanup = [&]() noexcept {
             if(desc)
@@ -1562,17 +1744,22 @@ namespace FP64Emulation
                 (void)hipblasLtMatrixLayoutDestroy(layoutB);
             if(layoutA)
                 (void)hipblasLtMatrixLayoutDestroy(layoutA);
-            if(fp64_handle)
-                (void)hipblasLtDestroy(fp64_handle);
+            if(native_handle)
+                (void)hipblasLtDestroy(native_handle);
         };
 
-        if(hipblasLtCreate(&fp64_handle) != HIPBLAS_STATUS_SUCCESS)
+        if(hipblasLtCreate(&native_handle) != HIPBLAS_STATUS_SUCCESS)
             return rocblaslt_status_internal_error;
 
-        /* Explicitly disable emulation on this fresh handle.  The default
-         * enabled=-1 means "check env var"; 0 means "force off" regardless of
-         * HIPBLASLT_EMULATE_DOUBLE_PRECISION, preventing recursive re-entry. */
-        reinterpret_cast<_rocblaslt_handle*>(fp64_handle)->emulation.enabled = 0;
+        /* Explicitly disable emulation on this fresh handle for BOTH types.
+         * The default enabled=-1 means "check env var"; 0 means "force off"
+         * regardless of the HIPBLASLT_EMULATE_* env vars, preventing
+         * recursive re-entry no matter which type triggered the fallback. */
+        {
+            auto* nh = reinterpret_cast<_rocblaslt_handle*>(native_handle);
+            nh->emulation.enabled      = 0;  /* FP64 */
+            nh->emulation_fp32.enabled = 0;  /* FP32 */
+        }
 
         /* Physical (stored) matrix dimensions for column-major layout:
          *   opA=N → A is m×k; opA=T → A is k×m (transposed in matmulDesc).
@@ -1586,17 +1773,17 @@ namespace FP64Emulation
         const uint64_t cols_B
             = (opB == HIPBLAS_OP_N) ? static_cast<uint64_t>(n) : static_cast<uint64_t>(k);
 
-        hipblasLtMatrixLayoutCreate(&layoutA, HIP_R_64F, rows_A, cols_A, lda);
-        hipblasLtMatrixLayoutCreate(&layoutB, HIP_R_64F, rows_B, cols_B, ldb);
+        hipblasLtMatrixLayoutCreate(&layoutA, hip_type, rows_A, cols_A, lda);
+        hipblasLtMatrixLayoutCreate(&layoutB, hip_type, rows_B, cols_B, ldb);
         hipblasLtMatrixLayoutCreate(
-            &layoutC, HIP_R_64F, static_cast<uint64_t>(m), static_cast<uint64_t>(n), ldc);
+            &layoutC, hip_type, static_cast<uint64_t>(m), static_cast<uint64_t>(n), ldc);
         hipblasLtMatrixLayoutCreate(
-            &layoutD, HIP_R_64F, static_cast<uint64_t>(m), static_cast<uint64_t>(n), ldd);
-        hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_64F, HIP_R_64F);
+            &layoutD, hip_type, static_cast<uint64_t>(m), static_cast<uint64_t>(n), ldd);
+        hipblasLtMatmulDescCreate(&desc, ctype, hip_type);
         hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
         hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
 
-        const hipblasStatus_t st = hipblasLtMatmul(fp64_handle,
+        const hipblasStatus_t st = hipblasLtMatmul(native_handle,
                                                    desc,
                                                    alpha,
                                                    A,
@@ -1613,14 +1800,12 @@ namespace FP64Emulation
                                                    0,
                                                    stream);
         /* Synchronize the stream before destroying the handle.
-         * hipblasLtMatmul() is asynchronous: the DGEMM kernel is enqueued on
-         * the stream and control returns immediately.  The subsequent cleanup()
-         * calls hipblasLtDestroy(fp64_handle), which calls hipModuleUnload()
-         * for all GPU kernel modules loaded by that handle.  If the DGEMM
-         * kernel is still executing when its module is unloaded, the in-flight
-         * kernel reads from freed GPU memory, producing an illegal memory
-         * access (700) GPU fault and causing every subsequent hipModuleUnload()
-         * in the cleanup lambda to fail with the same error.                   */
+         * hipblasLtMatmul() is asynchronous: the kernel is enqueued on the
+         * stream and control returns immediately.  The subsequent cleanup()
+         * calls hipblasLtDestroy(native_handle), which calls hipModuleUnload()
+         * for all GPU kernel modules.  If the kernel is still executing when
+         * its module is unloaded, the in-flight kernel reads from freed GPU
+         * memory → GPU fault → all subsequent hipModuleUnload() calls fail.  */
         const hipError_t sync_err = hipStreamSynchronize(stream);
         (void)hipGetLastError();
         cleanup();
@@ -1672,26 +1857,27 @@ namespace FP64Emulation
     }
 
     /* ── Preliminary shift+extraction kernel launch helper ────────────────────── */
-    /* Launches the four accu_prelim kernels for A and B (transpose-aware).  The  */
-    /* CHECK_NAN template parameter is true when NaN/Inf detection is active.      */
-    template <bool CHECK_NAN>
-    static void launch_prelim_kernels(bool          tA,
-                                      bool          tB,
-                                      const double* A,
-                                      int64_t       m,
-                                      int64_t       k,
-                                      int64_t       lda,
-                                      int8_t*       A8i_high,
-                                      size_t        lda8i,
-                                      int16_t*      sftA,
-                                      uint32_t*     nan_flag,
-                                      const double* B,
-                                      int64_t       n,
-                                      int64_t       ldb,
-                                      int8_t*       B8i_high,
-                                      size_t        ldb8i,
-                                      int16_t*      sftB,
-                                      hipStream_t   stream)
+    /* Launches the four accu_prelim kernels for A and B (transpose-aware).
+     * CHECK_NAN: true when NaN/Inf detection is active.
+     * T: element type of the input matrices (double or float).                    */
+    template <bool CHECK_NAN, typename T>
+    static void launch_prelim_kernels(bool       tA,
+                                      bool       tB,
+                                      const T*   A,
+                                      int64_t    m,
+                                      int64_t    k,
+                                      int64_t    lda,
+                                      int8_t*    A8i_high,
+                                      size_t     lda8i,
+                                      int16_t*   sftA,
+                                      uint32_t*  nan_flag,
+                                      const T*   B,
+                                      int64_t    n,
+                                      int64_t    ldb,
+                                      int8_t*    B8i_high,
+                                      size_t     ldb8i,
+                                      int16_t*   sftB,
+                                      hipStream_t stream)
     {
         const unsigned m_blks_A_T = static_cast<unsigned>(m);
         const unsigned m_blks_A_N
@@ -1700,172 +1886,113 @@ namespace FP64Emulation
         const unsigned n_blks_B_T
             = static_cast<unsigned>((n + OZ2_PRELIM_SHMEM_TILE_M - 1) / OZ2_PRELIM_SHMEM_TILE_M);
         if(tA)
-            hipLaunchKernelGGL((accu_prelim_A_T_kernel<CHECK_NAN>),
+            hipLaunchKernelGGL((accu_prelim_A_T_kernel<CHECK_NAN, T>),
                                dim3(m_blks_A_T),
                                dim3(OZ2_PRELIM_COALESC_THRS),
                                0,
                                stream,
-                               A,
-                               m,
-                               k,
-                               lda,
-                               A8i_high,
-                               lda8i,
-                               sftA,
-                               nan_flag);
+                               A, m, k, lda, A8i_high, lda8i, sftA, nan_flag);
         else
-            hipLaunchKernelGGL((accu_prelim_A_N_kernel<CHECK_NAN>),
+            hipLaunchKernelGGL((accu_prelim_A_N_kernel<CHECK_NAN, T>),
                                dim3(m_blks_A_N),
                                dim3(OZ2_PRELIM_TILE_K * OZ2_PRELIM_SHMEM_TILE_M),
                                0,
                                stream,
-                               A,
-                               m,
-                               k,
-                               lda,
-                               A8i_high,
-                               lda8i,
-                               sftA,
-                               nan_flag);
+                               A, m, k, lda, A8i_high, lda8i, sftA, nan_flag);
         if(!tB)
-            hipLaunchKernelGGL((accu_prelim_B_N_kernel<CHECK_NAN>),
+            hipLaunchKernelGGL((accu_prelim_B_N_kernel<CHECK_NAN, T>),
                                dim3(n_blks_B_N),
                                dim3(OZ2_PRELIM_COALESC_THRS),
                                0,
                                stream,
-                               B,
-                               n,
-                               k,
-                               ldb,
-                               B8i_high,
-                               ldb8i,
-                               sftB,
-                               nan_flag);
+                               B, n, k, ldb, B8i_high, ldb8i, sftB, nan_flag);
         else
-            hipLaunchKernelGGL((accu_prelim_B_T_kernel<CHECK_NAN>),
+            hipLaunchKernelGGL((accu_prelim_B_T_kernel<CHECK_NAN, T>),
                                dim3(n_blks_B_T),
                                dim3(OZ2_PRELIM_TILE_K * OZ2_PRELIM_SHMEM_TILE_M),
                                0,
                                stream,
-                               B,
-                               n,
-                               k,
-                               ldb,
-                               B8i_high,
-                               ldb8i,
-                               sftB,
-                               nan_flag);
+                               B, n, k, ldb, B8i_high, ldb8i, sftB, nan_flag);
     }
 
     /* ── Scale kernel launch helpers ──────────────────────────────────────────── */
-    /* Encapsulate the A-matrix and B-matrix scale kernel launches.  The grid    */
-    /* is computed from the problem shape and compile-time tile constants; it is  */
-    /* not pre-computed in the caller.                                            */
-    template <unsigned TC>
-    static void launch_scale_A(bool          tA,
-                               const double* A,
-                               int64_t       m,
-                               int64_t       lda,
-                               int8_t*       A8i,
-                               size_t        lda8i,
-                               size_t        cola8i,
-                               int16_t*      sftA,
-                               int64_t       k,
-                               unsigned      sc_start,
-                               hipStream_t   stream)
+    /* T: input element type (double or float).  The scale kernels load T values
+     * and widen to double immediately — all residue arithmetic stays in double.  */
+    template <unsigned TC, typename T>
+    static void launch_scale_A(bool       tA,
+                               const T*   A,
+                               int64_t    m,
+                               int64_t    lda,
+                               int8_t*    A8i,
+                               size_t     lda8i,
+                               size_t     cola8i,
+                               int16_t*   sftA,
+                               int64_t    k,
+                               unsigned   sc_start,
+                               hipStream_t stream)
     {
         const unsigned k_c
             = static_cast<unsigned>((k + 4u * OZ2_SCALE_TILE_K - 1u) / (4u * OZ2_SCALE_TILE_K));
         const unsigned k_x = static_cast<unsigned>((k + OZ2_SCALE_TILE_K - 1) / OZ2_SCALE_TILE_K);
         if(tA)
-            hipLaunchKernelGGL((scale_A_T_kernel<TC>),
+            hipLaunchKernelGGL((scale_A_T_kernel<TC, T>),
                                dim3(k_c,
                                     static_cast<unsigned>((m + OZ2_SCALE_COALESC_TILE_M - 1)
                                                           / OZ2_SCALE_COALESC_TILE_M)),
                                dim3(OZ2_SCALE_TILE_K * OZ2_SCALE_COALESC_TILE_M),
                                0,
                                stream,
-                               A,
-                               m,
-                               lda,
-                               A8i,
-                               lda8i,
-                               cola8i,
-                               sftA,
-                               k,
-                               sc_start);
+                               A, m, lda, A8i, lda8i, cola8i, sftA, k, sc_start);
         else
-            hipLaunchKernelGGL((scale_A_N_kernel<TC>),
+            hipLaunchKernelGGL((scale_A_N_kernel<TC, T>),
                                dim3(k_x,
                                     static_cast<unsigned>((m + OZ2_SCALE_SHMEM_TILE_M - 1)
                                                           / OZ2_SCALE_SHMEM_TILE_M)),
                                dim3(OZ2_SCALE_SHMEM_BLOCK_DIM),
                                0,
                                stream,
-                               A,
-                               m,
-                               lda,
-                               A8i,
-                               lda8i,
-                               cola8i,
-                               sftA,
-                               k,
-                               sc_start);
+                               A, m, lda, A8i, lda8i, cola8i, sftA, k, sc_start);
     }
 
-    template <unsigned TC>
-    static void launch_scale_B(bool          tB,
-                               const double* B,
-                               int64_t       n,
-                               int64_t       ldb,
-                               int8_t*       B8i,
-                               size_t        ldb8i,
-                               int16_t*      sftB,
-                               int64_t       k,
-                               unsigned      sc_start,
-                               hipStream_t   stream)
+    template <unsigned TC, typename T>
+    static void launch_scale_B(bool       tB,
+                               const T*   B,
+                               int64_t    n,
+                               int64_t    ldb,
+                               int8_t*    B8i,
+                               size_t     ldb8i,
+                               int16_t*   sftB,
+                               int64_t    k,
+                               unsigned   sc_start,
+                               hipStream_t stream)
     {
         const unsigned k_c
             = static_cast<unsigned>((k + 4u * OZ2_SCALE_TILE_K - 1u) / (4u * OZ2_SCALE_TILE_K));
         const unsigned k_x = static_cast<unsigned>((k + OZ2_SCALE_TILE_K - 1) / OZ2_SCALE_TILE_K);
         if(!tB)
-            hipLaunchKernelGGL((scale_B_N_kernel<TC>),
+            hipLaunchKernelGGL((scale_B_N_kernel<TC, T>),
                                dim3(k_c,
                                     static_cast<unsigned>((n + OZ2_SCALE_COALESC_TILE_M - 1)
                                                           / OZ2_SCALE_COALESC_TILE_M)),
                                dim3(OZ2_SCALE_TILE_K * OZ2_SCALE_COALESC_TILE_M),
                                0,
                                stream,
-                               B,
-                               n,
-                               ldb,
-                               B8i,
-                               ldb8i,
-                               sftB,
-                               k,
-                               sc_start);
+                               B, n, ldb, B8i, ldb8i, sftB, k, sc_start);
         else
-            hipLaunchKernelGGL((scale_B_T_kernel<TC>),
+            hipLaunchKernelGGL((scale_B_T_kernel<TC, T>),
                                dim3(k_x,
                                     static_cast<unsigned>((n + OZ2_SCALE_SHMEM_TILE_M - 1)
                                                           / OZ2_SCALE_SHMEM_TILE_M)),
                                dim3(OZ2_SCALE_SHMEM_BLOCK_DIM),
                                0,
                                stream,
-                               B,
-                               n,
-                               ldb,
-                               B8i,
-                               ldb8i,
-                               sftB,
-                               k,
-                               sc_start);
+                               B, n, ldb, B8i, ldb8i, sftB, k, sc_start);
     }
 
     /* ── Accumulate/finalize dispatch helper ─────────────────────────────────── */
     /* Encapsulates the CRT accumulation and finalization kernel dispatch.  The   */
     /* grid is computed from m and n; CS is the compile-time chunk size (1..18). */
-    template <unsigned CS>
+    template <unsigned CS, typename T_out = double>
     static void dispatch_accum_chunk(bool           is_first,
                                      bool           is_last,
                                      bool           has_lo,
@@ -1877,8 +2004,8 @@ namespace FP64Emulation
                                      size_t         ldc32i,
                                      unsigned       chunk_start,
                                      unsigned       effective_s,
-                                     const double*  C,
-                                     double*        D,
+                                     const T_out*   C,
+                                     T_out*         D,
                                      int64_t        ldc,
                                      int64_t        ldd,
                                      double         alpha,
@@ -1895,7 +2022,7 @@ namespace FP64Emulation
             if(has_lo)
             {
                 if(is_first)
-                    hipLaunchKernelGGL((accum_finalize_kernel<true, CS, true>),
+                    hipLaunchKernelGGL((accum_finalize_kernel<true, CS, true, T_out>),
                                        grid_acc,
                                        blk_acc,
                                        0,
@@ -1917,7 +2044,7 @@ namespace FP64Emulation
                                        chunk_start,
                                        effective_s);
                 else
-                    hipLaunchKernelGGL((accum_finalize_kernel<true, CS, false>),
+                    hipLaunchKernelGGL((accum_finalize_kernel<true, CS, false, T_out>),
                                        grid_acc,
                                        blk_acc,
                                        0,
@@ -1942,7 +2069,7 @@ namespace FP64Emulation
             else
             {
                 if(is_first)
-                    hipLaunchKernelGGL((accum_finalize_kernel<false, CS, true>),
+                    hipLaunchKernelGGL((accum_finalize_kernel<false, CS, true, T_out>),
                                        grid_acc,
                                        blk_acc,
                                        0,
@@ -1964,7 +2091,7 @@ namespace FP64Emulation
                                        chunk_start,
                                        effective_s);
                 else
-                    hipLaunchKernelGGL((accum_finalize_kernel<false, CS, false>),
+                    hipLaunchKernelGGL((accum_finalize_kernel<false, CS, false, T_out>),
                                        grid_acc,
                                        blk_acc,
                                        0,
@@ -2128,33 +2255,40 @@ namespace FP64Emulation
     };
 
     /* Internal implementation — called recursively during binary-halving.
+     * T = double → FP64 path; T = float → FP32 path.
+     * All GPU kernels (prelim, scale, finalize) are templated on T so no
+     * intermediate copies are needed for either type.
      * prof != nullptr enables per-component accumulation across all leaves.   */
+    template <typename T>
     static rocblaslt_status emulated_gemm_impl(const _rocblaslt_handle*     h,
                                                hipblasOperation_t           opA,
                                                hipblasOperation_t           opB,
                                                int64_t                      m,
                                                int64_t                      n,
                                                int64_t                      k,
-                                               const double*                alpha,
-                                               const double*                A,
+                                               const T*                     alpha,
+                                               const T*                     A,
                                                int64_t                      lda,
-                                               const double*                B,
+                                               const T*                     B,
                                                int64_t                      ldb,
-                                               const double*                beta,
-                                               const double*                C,
+                                               const T*                     beta,
+                                               const T*                     C,
                                                int64_t                      ldc,
-                                               double*                      D,
+                                               T*                           D,
                                                int64_t                      ldd,
                                                hipStream_t                  stream,
-                                               const Fp64EmulationSettings& settings,
+                                               const FixedPointEmulationSettings& settings,
                                                ProfileAccum*                prof)
     {
-        /* settings.num_moduli comes from fp64EmulationEffectiveNumModuli (≥2).
-         * The fp64EmulationNumModuli() fallback would return 0 if env var absent;
-         * fp64EmulationEffectiveNumModuli properly converts that to 16.           */
+        /* Type-specific label strings for warning messages. */
+        constexpr const char* type_name  = std::is_same_v<T, double> ? "FP64" : "FP32";
+        constexpr const char* native_str = std::is_same_v<T, double> ? "DGEMM" : "SGEMM";
+        /* settings.num_moduli comes from fixedPointEmulationEffectiveNumModuli (≥2).
+         * The fixedPointEmulationNumModuli() fallback would return 0 if env var absent;
+         * fixedPointEmulationEffectiveNumModuli properly converts that to 16.           */
         const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
                                         ? settings.num_moduli
-                                        : fp64EmulationEffectiveNumModuli(h);
+                                        : fixedPointEmulationEffectiveNumModuli(h);
         /* Workspace budget: derive from workspace_bytes using two-call approach. */
         const size_t W_wb_i   = settings.workspace_bytes;
         const size_t co_i     = pad(static_cast<size_t>(m));
@@ -2170,6 +2304,7 @@ namespace FP64Emulation
             const size_t zoh_i = 2u * co_i * static_cast<size_t>(n) * sizeof(double);
             ws_budget = (W_wb_i > boh_i + zoh_i) ? W_wb_i - boh_i - zoh_i : 0u;
         } else { ws_budget = W1_i; }
+
         {
             const unsigned chunk_sz = compute_chunk_size(m, n, k, num_moduli, ws_budget);
             const unsigned n_chunks = (num_moduli + chunk_sz - 1u) / chunk_sz;
@@ -2192,26 +2327,38 @@ namespace FP64Emulation
                 const bool   tA     = (opA != HIPBLAS_OP_N);
                 const bool   tB     = (opB != HIPBLAS_OP_N);
 
+                /* Resolve the HIP data type from T for the performance model. */
+                constexpr hipDataType type_a_perf = std::is_same_v<T, double>
+                                                        ? HIP_R_64F : HIP_R_32F;
+
                 /* When ws_budget == 0, the performance model would return degenerate
                  * predictions (chunk_size=1, always-split to tiny sub-GEMMs that look
                  * fast but are not).  Skip the model and force the split immediately. */
                 const bool force_split = (ws_budget == 0u);
+                /* ADP-aware performance model s: use the minimum s that satisfies the
+                 * precision target (adp_bits + 2 safety bits) instead of S_MAX, to
+                 * avoid overestimating emulation cost in dynamic mode.                */
+                const int adp_bits_impl = (settings.adp_mantissa_bits > 0)
+                    ? static_cast<int>(settings.adp_mantissa_bits)
+                    : fixedPointEmulationAdpMantissaBits(type_a_perf);
+                const unsigned pm_s_impl = perf_model_s(num_moduli, settings.dynamic_mode,
+                                                        adp_bits_impl);
                 const double t_mono = force_split ? 0.0
-                    : perf_model_times(tA, tB, m, n, k, num_moduli, device, settings.dynamic_mode,
-                                       ws_budget)
+                    : perf_model_times(tA, tB, m, n, k, pm_s_impl, device, settings.dynamic_mode,
+                                       ws_budget, type_a_perf)
                           .t_total_ms;
                 /* Pass settings.workspace_bytes (not ws_budget) so the sub-call recomputes
                  * its own budget from the smaller (half_m, half_n) dimensions.           */
                 const double t_split = force_split ? 0.0
                     : 2.
                       * effective_time_ms(
-                          tA, tB, half_m, half_n, k, num_moduli, device, settings.dynamic_mode,
-                          settings.workspace_bytes);
+                          tA, tB, half_m, half_n, k, pm_s_impl, device, settings.dynamic_mode,
+                          settings.workspace_bytes, type_a_perf);
 
                 if(force_split || t_split < t_mono)
                 {
                     {
-                        rocblaslt_status st = emulated_gemm_impl(h,
+                        rocblaslt_status st = emulated_gemm_impl<T>(h,
                                                                  opA,
                                                                  opB,
                                                                  half_m,
@@ -2234,11 +2381,11 @@ namespace FP64Emulation
                             return st;
                     }
 
-                    const double* const    A2  = split_m ? (tA ? A + half_m * lda : A + half_m) : A;
-                    const double* const    B2  = split_m ? B : (tB ? B + half_n : B + half_n * ldb);
-                    const double* const    C2  = split_m ? C + half_m : C + half_n * ldc;
-                    double* const          D2  = split_m ? D + half_m : D + half_n * ldd;
-                    const rocblaslt_status st2 = emulated_gemm_impl(h,
+                    const T* const    A2  = split_m ? (tA ? A + half_m * lda : A + half_m) : A;
+                    const T* const    B2  = split_m ? B : (tB ? B + half_n : B + half_n * ldb);
+                    const T* const    C2  = split_m ? C + half_m : C + half_n * ldc;
+                    T* const          D2  = split_m ? D + half_m : D + half_n * ldd;
+                    const rocblaslt_status st2 = emulated_gemm_impl<T>(h,
                                                                     opA,
                                                                     opB,
                                                                     m2,
@@ -2260,28 +2407,28 @@ namespace FP64Emulation
                     if(st2 != rocblaslt_status_success)
                     {
                         hipblaslt_cerr
-                            << "[hipBLASLt FP64 emulation] WARNING: second-half emulation failed "
+                            << "[hipBLASLt " << type_name << " emulation] WARNING: second-half emulation failed "
                             << "(m=" << m2 << ", n=" << n2 << ", k=" << k << ", st=" << (int)st2
                             << "). "
-                            << "Running native DGEMM for second half to preserve first-half output."
+                            << "Running native " << native_str << " for second half to preserve first-half output."
                             << std::endl;
-                        return native_dgemm_fallback(h,
-                                                     opA,
-                                                     opB,
-                                                     m2,
-                                                     n2,
-                                                     k,
-                                                     alpha,
-                                                     A2,
-                                                     lda,
-                                                     B2,
-                                                     ldb,
-                                                     beta,
-                                                     C2,
-                                                     ldc,
-                                                     D2,
-                                                     ldd,
-                                                     stream);
+                        return native_gemm_fallback<T>(h,
+                                                       opA,
+                                                       opB,
+                                                       m2,
+                                                       n2,
+                                                       k,
+                                                       alpha,
+                                                       A2,
+                                                       lda,
+                                                       B2,
+                                                       ldb,
+                                                       beta,
+                                                       C2,
+                                                       ldc,
+                                                       D2,
+                                                       ldd,
+                                                       stream);
                     }
                     return rocblaslt_status_success;
                 }
@@ -2291,8 +2438,8 @@ namespace FP64Emulation
 
         /* Minimum problem size guard — see FP64_EMUL_MIN_MN. */
         if(m < FP64_EMUL_MIN_MN || n < FP64_EMUL_MIN_MN)
-            return native_dgemm_fallback(h, opA, opB, m, n, k, alpha, A, lda, B, ldb,
-                                         beta, C, ldc, D, ldd, stream);
+            return native_gemm_fallback<T>(h, opA, opB, m, n, k, alpha, A, lda, B, ldb,
+                                           beta, C, ldc, D, ldd, stream);
 
         const bool    _prof = (prof != nullptr);
         Ozaki2Context context;
@@ -2367,7 +2514,7 @@ namespace FP64Emulation
         const bool tB = (opB != HIPBLAS_OP_N);
 
         const uint32_t svmask
-            = (settings.sv_mask != ~0u) ? settings.sv_mask : fp64EmulationSpecialValuesMask();
+            = (settings.sv_mask != ~0u) ? settings.sv_mask : fixedPointEmulationSpecialValuesMask();
 
         if(svmask != 0u)
         {
@@ -2548,9 +2695,9 @@ namespace FP64Emulation
             if(prelim_st != HIPBLAS_STATUS_SUCCESS)
             {
                 hipblaslt_cerr
-                    << "[hipBLASLt FP64 emulation] WARNING: preliminary INT8 GEMM failed "
+                    << "[hipBLASLt " << type_name << " emulation] WARNING: preliminary INT8 GEMM failed "
                     << "(m=" << m << ", n=" << n << ", k=" << k << ", status=" << (int)prelim_st
-                    << "). " << "Falling back to native DGEMM." << std::endl;
+                    << "). " << "Falling back to native " << native_str << "." << std::endl;
                 /* Drain the stream before clearing the error so that the stream is in
                  * a clean state for future operations on this stream/context.       */
                 (void)hipStreamSynchronize(stream);
@@ -2608,7 +2755,7 @@ namespace FP64Emulation
             const float adp_bits = static_cast<float>(
                 (settings.adp_mantissa_bits > 0)
                     ? settings.adp_mantissa_bits
-                    : fp64EmulationAdpMantissaBits());
+                    : fixedPointEmulationAdpMantissaBits(std::is_same_v<T, double> ? HIP_R_64F : HIP_R_32F));
 
             /* A-side: reads row_max[] and sftA[] before apply_kernel modifies sftA. */
             hipLaunchKernelGGL(adp_reduce_A_kernel,
@@ -2655,14 +2802,14 @@ namespace FP64Emulation
                  * near-zero for the elements providing cancellation, giving wrong
                  * results regardless of s.  Fall back to native DGEMM.
                  * Rate-limited warning (≤5 per process).                         */
-                hipblaslt_cerr << "[hipBLASLt FP64 emulation] WARNING: ADP overflow for GEMM "
+                hipblaslt_cerr << "[hipBLASLt " << type_name << " emulation] WARNING: ADP overflow for GEMM "
                                << "(m=" << m << ", n=" << n << ", k=" << k
                                << "): " << "A-side log2P_req=" << (h_adp[0] - 200.0f) << " bits, "
                                << "B-side=" << (h_adp[1] - 200.0f) << " bits, "
                                << "max required=" << log2P_needed
                                << " > supported max=" << log2P[S_MAX - 2u] << " (s=" << S_MAX
                                << " moduli, ~" << cum_bits[S_MAX - 2u]
-                               << " cumulative bits). Falling back to native DGEMM." << std::endl;
+                               << " cumulative bits). Falling back to native " << native_str << "." << std::endl;
                 return rocblaslt_status_invalid_value;
             }
 
@@ -2801,11 +2948,11 @@ namespace FP64Emulation
                     if(batch_st != HIPBLAS_STATUS_SUCCESS)
                     {
                         hipblaslt_cerr
-                            << "[hipBLASLt FP64 emulation] WARNING: INT8 batch GEMM failed "
+                            << "[hipBLASLt " << type_name << " emulation] WARNING: INT8 batch GEMM failed "
                             << "(m=" << m << ", n=" << n << ", k=" << k
                             << ", batch_count=" << batch_cur << ", moduli_offset=" << chunk_start
                             << ", status=" << (int)batch_st << "). "
-                            << "Falling back to native DGEMM." << std::endl;
+                            << "Falling back to native " << native_str << "." << std::endl;
                         (void)hipStreamSynchronize(stream);
                         (void)hipGetLastError();
                         return rocblaslt_status_internal_error;
@@ -2864,148 +3011,83 @@ namespace FP64Emulation
         return rocblaslt_status_success;
     }
 
-} // namespace FP64Emulation
+} // namespace FixedPointEmulation
 
-bool fp64EmulationIsEnabled()
+bool fixedPointEmulationIsEager()
 {
     static const bool v = []() -> bool {
-        const auto parsed = fp64EmulationParseEnabledEnv(
-            std::getenv("HIPBLASLT_EMULATE_DOUBLE_PRECISION"));
-        return parsed.state == FP64_EMULATION_ENV_VALID && parsed.value != 0u;
-    }();
-    return v;
-}
-
-bool fp64EmulationPerformanceCheck(const _rocblaslt_handle* h,
-                                   hipblasOperation_t       opA,
-                                   hipblasOperation_t       opB,
-                                   int64_t                  m,
-                                   int64_t                  n,
-                                   int64_t                  k,
-                                   size_t                   workspace_bytes)
-{
-    using namespace FP64Emulation;
-    const int  device = h->device;
-    const bool tA     = (opA != HIPBLAS_OP_N);
-    const bool tB     = (opB != HIPBLAS_OP_N);
-    /* Include ADP overhead when the handle is configured for dynamic (ADP) mode,
-     * so the performance gate correctly accounts for the hipStreamSynchronize cost. */
-    /* ADP (dynamic) mode: handle is at sentinel (-1) AND the env var is not
-     * set to a valid fixed count.  Use the cached helper — same pattern as
-     * fp64EmulationIsEager() — to avoid raw getenv() calls at the call site. */
-    /* ADP: handle sentinel (-1) AND env var absent (returns 0). */
-    const bool     dyn        = (h->emulation.num_moduli < 2) && (fp64EmulationNumModuli() == 0u);
-    const unsigned num_moduli = fp64EmulationEffectiveNumModuli(h);
-    /* effective_time_ms now accepts workspace_bytes directly and recomputes the
-     * budget at each recursive split level, mirroring emulated_gemm_impl.     */
-    const double t_emul  = effective_time_ms(tA, tB, m, n, k, num_moduli, device, dyn,
-                                              workspace_bytes);
-    const double t_native = perf_model_times(tA, tB, m, n, k, num_moduli, device, dyn,
-                                              ~size_t{0}).t_native_ms;
-    return t_emul <= t_native;
-}
-
-bool fp64EmulationIsEager()
-{
-    static const bool v = []() -> bool {
-        const auto parsed = fp64EmulationParseStrategyEnv(
+        const auto parsed = fixedPointEmulationParseStrategyEnv(
             std::getenv("HIPBLASLT_EMULATION_STRATEGY"));
-        return parsed.state == FP64_EMULATION_ENV_VALID &&
+        return parsed.state == FIXED_POINT_EMULATION_ENV_VALID &&
                parsed.value == static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_EAGER);
     }();
     return v;
 }
 
 
-uint32_t fp64EmulationSpecialValuesMask()
+uint32_t fixedPointEmulationSpecialValuesMask()
 {
     static const uint32_t v = []() -> uint32_t {
-        const auto parsed = fp64EmulationParseSpecialValuesMaskEnv(
+        const auto parsed = fixedPointEmulationParseSpecialValuesMaskEnv(
             std::getenv("HIPBLASLT_EMULATION_SPECIAL_VALUES_SUPPORT_MASK"));
-        return (parsed.state == FP64_EMULATION_ENV_VALID) ? parsed.value : 0x3u;
+        return (parsed.state == FIXED_POINT_EMULATION_ENV_VALID) ? parsed.value : 0x3u;
     }();
     return v;
 }
 
-bool fp64EmulationWouldApply(const _rocblaslt_handle* h,
-                             hipDataType              type_a,
-                             hipblasOperation_t       opA,
-                             hipblasOperation_t       opB,
-                             int64_t                  m,
-                             int64_t                  n,
-                             int64_t                  k,
-                             int32_t                  batch_count)
+FixedPointEmulationEnvValue fixedPointEmulationParseEnabledEnv(const char* value)
 {
-    using namespace FP64Emulation;
-    if(type_a != HIP_R_64F || batch_count != 1)
-        return false;
-    const bool emulEnabled
-        = (h->emulation.enabled == 1) || (h->emulation.enabled != 0 && fp64EmulationIsEnabled());
-    if(!emulEnabled)
-        return false;
-    /* Disable emulation on devices not listed in the perf-model table to
-     * avoid running with unvalidated performance predictions.              */
-    const int dev = h->device;
-    if(!get_perf_model_params(dev))
-        return false;
-    const bool eager
-        = (h->emulation.strategy == 2) || (h->emulation.strategy != 1 && fp64EmulationIsEager());
-    return eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, /*workspace_bytes=*/~size_t{0u});
-}
-
-Fp64EmulationEnvValue fp64EmulationParseEnabledEnv(const char* value)
-{
-    using namespace FP64Emulation;
+    using namespace FixedPointEmulation;
     if(value == nullptr)
-        return {FP64_EMULATION_ENV_UNSET, 0u};
+        return {FIXED_POINT_EMULATION_ENV_UNSET, 0u};
     if(std::strcmp(value, "1") == 0)
-        return {FP64_EMULATION_ENV_VALID, 1u};
+        return {FIXED_POINT_EMULATION_ENV_VALID, 1u};
     if(std::strcmp(value, "0") == 0)
-        return {FP64_EMULATION_ENV_VALID, 0u};
-    return {FP64_EMULATION_ENV_INVALID, 0u};
+        return {FIXED_POINT_EMULATION_ENV_VALID, 0u};
+    return {FIXED_POINT_EMULATION_ENV_INVALID, 0u};
 }
 
-Fp64EmulationEnvValue fp64EmulationParseStrategyEnv(const char* value)
+FixedPointEmulationEnvValue fixedPointEmulationParseStrategyEnv(const char* value)
 {
-    using namespace FP64Emulation;
+    using namespace FixedPointEmulation;
     if(value == nullptr)
-        return {FP64_EMULATION_ENV_UNSET, 0u};
+        return {FIXED_POINT_EMULATION_ENV_UNSET, 0u};
     if(std::strcmp(value, "performant") == 0)
-        return {FP64_EMULATION_ENV_VALID,
+        return {FIXED_POINT_EMULATION_ENV_VALID,
                 static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_PERFORMANT)};
     if(std::strcmp(value, "eager") == 0)
-        return {FP64_EMULATION_ENV_VALID,
+        return {FIXED_POINT_EMULATION_ENV_VALID,
                 static_cast<unsigned>(HIPBLASLT_EMULATION_STRATEGY_EAGER)};
-    return {FP64_EMULATION_ENV_INVALID, 0u};
+    return {FIXED_POINT_EMULATION_ENV_INVALID, 0u};
 }
 
-Fp64EmulationEnvValue fp64EmulationParseSpecialValuesMaskEnv(const char* value)
+FixedPointEmulationEnvValue fixedPointEmulationParseSpecialValuesMaskEnv(const char* value)
 {
-    using namespace FP64Emulation;
+    using namespace FixedPointEmulation;
     if(value == nullptr)
-        return {FP64_EMULATION_ENV_UNSET, 0x3u};
+        return {FIXED_POINT_EMULATION_ENV_UNSET, 0x3u};
     char*      endp = nullptr;
     const long v    = std::strtol(value, &endp, 0);
     if(endp == value || *endp != '\0' || v < 0)
-        return {FP64_EMULATION_ENV_INVALID, 0u};
-    return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
+        return {FIXED_POINT_EMULATION_ENV_INVALID, 0u};
+    return {FIXED_POINT_EMULATION_ENV_VALID, static_cast<unsigned>(v)};
 }
 
-Fp64EmulationEnvValue fp64EmulationParseNumModuliEnv(const char* value)
+FixedPointEmulationEnvValue fixedPointEmulationParseNumModuliEnv(const char* value)
 {
-    using namespace FP64Emulation;
+    using namespace FixedPointEmulation;
     if(value == nullptr)
-        return {FP64_EMULATION_ENV_UNSET, 0u};
+        return {FIXED_POINT_EMULATION_ENV_UNSET, 0u};
     char*      endp = nullptr;
     const long n    = std::strtol(value, &endp, 10);
     if(endp == value || *endp != '\0' || n < 2 || n > static_cast<long>(S_MAX))
-        return {FP64_EMULATION_ENV_INVALID, 0u};
-    return {FP64_EMULATION_ENV_VALID, static_cast<unsigned>(n)};
+        return {FIXED_POINT_EMULATION_ENV_INVALID, 0u};
+    return {FIXED_POINT_EMULATION_ENV_VALID, static_cast<unsigned>(n)};
 }
 
 
 
-Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
+FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle* h,
                                             hipDataType              type_a,
                                             hipblasOperation_t       opA,
                                             hipblasOperation_t       opB,
@@ -3025,21 +3107,25 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
      * creation.  A sentinel means "use the env var"; a non-sentinel means "use
      * this value".  Calling any hipblasLtSet* function writes a non-sentinel,
      * disabling the env-var fallback for that setting on this handle.         */
-    using namespace FP64Emulation;
-    Fp64EmulationDecision result{};
+    using namespace FixedPointEmulation;
+    FixedPointEmulationDecision result{};
     result.status       = rocblaslt_status_success;
     result.apply        = false;
-    result.num_moduli   = S_MAX; /* ADP upper-bound; overridden below by fp64EmulationEffectiveNumModuli */
-    result.sv_mask      = fp64EmulationSpecialValuesMask();
+    result.num_moduli   = S_MAX; /* ADP upper-bound; overridden below by fixedPointEmulationEffectiveNumModuli */
+    result.sv_mask      = fixedPointEmulationSpecialValuesMask();
     result.dynamic_mode = false;
 
     /* Type and batch-count pre-checks (no env-var validation needed). */
-    if(type_a != HIP_R_64F || batch_count != 1)
+    const bool is_fp32 = (type_a == HIP_R_32F);
+    if((type_a != HIP_R_64F && type_a != HIP_R_32F) || batch_count != 1)
         return result; /* apply=false, success */
 
-    /* Emulation enabled check. */
-    const bool emulEnabled
-        = (h->emulation.enabled == 1) || (h->emulation.enabled != 0 && fp64EmulationIsEnabled());
+    /* Select the per-handle emulation settings struct for this type. */
+    const _rocblaslt_handle::EmulationSettings& emu = is_fp32 ? h->emulation_fp32 : h->emulation;
+
+    /* Emulation enabled check (dispatch on type). */
+    const bool emulEnabled = (emu.enabled == 1)
+        || (emu.enabled != 0 && fixedPointEmulationIsEnabled(type_a));
     if(!emulEnabled)
         return result;
 
@@ -3048,34 +3134,33 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
     if(!get_perf_model_params(dev))
         return result;
 
-    /* Resolve num_moduli from handle settings. */
-    result.num_moduli = fp64EmulationEffectiveNumModuli(h);
+    /* Resolve num_moduli from handle settings (uses type-appropriate struct). */
+    {
+        using namespace FixedPointEmulation;
+        result.num_moduli = (emu.num_moduli >= 2 && emu.num_moduli <= static_cast<int>(S_MAX))
+            ? static_cast<unsigned>(emu.num_moduli)
+            : (fixedPointEmulationNumModuli() != 0u ? fixedPointEmulationNumModuli() : S_MAX);
+    }
 
     /* Handle special_values_mask override. */
-    if(h->emulation.special_values_mask != ~0u)
-        result.sv_mask = h->emulation.special_values_mask;
+    if(emu.special_values_mask != ~0u)
+        result.sv_mask = emu.special_values_mask;
 
     /* dynamic_mode: DYNAMIC (ADP) mantissa control — adaptively selects
-     * the minimum s needed for FP64 precision on the given input data.   */
-    /* ADP when no fixed count is set on the handle AND env var is not set.
-     * num_moduli ∈ [2..18] on the handle → FIXED; -1 (sentinel) → check env var.
-     * Env var HIPBLASLT_EMULATION_NUM_MODULI set → FIXED; absent → ADP.        */
-    /* ADP (dynamic) mode: handle is at sentinel (-1) AND env var is not set.
-     * Use the cached fp64EmulationNumModuliIsFixed() — avoids raw getenv(). */
-    /* ADP: handle sentinel (-1) AND env var absent (fp64EmulationNumModuli() == 0). */
-    result.dynamic_mode      = (h->emulation.num_moduli < 2) && (fp64EmulationNumModuli() == 0u);
-    /* ADP target precision: handle setter (>0) > env var > built-in default (52 bits). */
-    result.adp_mantissa_bits = (h->emulation.adp_mantissa_bits > 0)
-                                   ? h->emulation.adp_mantissa_bits
-                                   : fp64EmulationAdpMantissaBits();
+     * the minimum s needed for the target precision on the given input data. */
+    result.dynamic_mode      = (emu.num_moduli < 2) && (fixedPointEmulationNumModuli() == 0u);
+    /* ADP target precision: handle setter (>0) > type-specific env var > type default. */
+    result.adp_mantissa_bits = (emu.adp_mantissa_bits > 0)
+                                   ? emu.adp_mantissa_bits
+                                   : fixedPointEmulationAdpMantissaBits(type_a);
 
     /* Strategy (eager vs performant). */
     const bool eager
-        = (h->emulation.strategy == 2) || (h->emulation.strategy != 1 && fp64EmulationIsEager());
-    if(eager || fp64EmulationPerformanceCheck(h, opA, opB, m, n, k, workspace_bytes))
+        = (emu.strategy == 2) || (emu.strategy != 1 && fixedPointEmulationIsEager());
+    if(eager || fixedPointEmulationPerformanceCheck(h, type_a, opA, opB, m, n, k, workspace_bytes))
     {
         result.apply = true;
-        /* Store the caller's workspace preference so fp64EmulationWorkspaceSize
+        /* Store the caller's workspace preference so fixedPointEmulationWorkspaceSize
          * can cap the returned size at min(optimal, workspace_cap).  This
          * ensures the library never reports a workspace larger than the user
          * allocated.                                       */
@@ -3085,38 +3170,39 @@ Fp64EmulationDecision fp64EmulationDecision(const _rocblaslt_handle* h,
     return result;
 }
 
-unsigned fp64EmulationEffectiveNumModuli(const _rocblaslt_handle* h)
+unsigned fixedPointEmulationEffectiveNumModuli(const _rocblaslt_handle* h)
 {
-    using namespace FP64Emulation;
+    using namespace FixedPointEmulation;
     /* Priority: handle setter > env var > built-in default (16 = ADP upper bound).
      * handle ∈ [2..18] → FIXED from handle.
      * handle == -1 (sentinel) → check env var; if absent → default 16 for ADP.  */
     if(h->emulation.num_moduli >= 2 && h->emulation.num_moduli <= static_cast<int>(S_MAX))
         return static_cast<unsigned>(h->emulation.num_moduli);
-    const unsigned env_s = fp64EmulationNumModuli();
+    const unsigned env_s = fixedPointEmulationNumModuli();
     /* 0 = env var absent → ADP mode: return S_MAX as the moduli upper bound.
      * ADP selects the actual per-call s from the data; the workspace always
      * uses S_MAX.  Fixed env var → use that exact count.                    */
     return env_s != 0u ? env_s : S_MAX;
 }
 
-size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
-                                  hipblasOperation_t           opA,
-                                  hipblasOperation_t           opB,
-                                  int64_t                      m,
-                                  int64_t                      n,
-                                  int64_t                      k,
-                                  const Fp64EmulationDecision& decision)
+size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
+                                         hipDataType                        type_a,
+                                         hipblasOperation_t                 opA,
+                                         hipblasOperation_t                 opB,
+                                         int64_t                            m,
+                                         int64_t                            n,
+                                         int64_t                            k,
+                                         const FixedPointEmulationDecision& decision)
 {
-    using namespace FP64Emulation;
-    assert(h != nullptr && "fp64EmulationWorkspaceSize requires a valid handle");
+    using namespace FixedPointEmulation;
+    assert(h != nullptr && "fixedPointEmulationWorkspaceSize requires a valid handle");
     /* In ADP mode the workspace must cover S_MAX=18 moduli so that any
      * adaptive effective_s fits without reallocation.  In fixed mode use
      * the resolved moduli count directly.                                   */
     const unsigned num_moduli = decision.dynamic_mode ? S_MAX : decision.num_moduli;
     /* Optimal workspace: chunk_size = s (all moduli in one pass).
      *
-     * emulated_gemm_impl uses settings.num_moduli (= fp64EmulationEffectiveNumModuli(h))
+     * emulated_gemm_impl uses settings.num_moduli (= fixedPointEmulationEffectiveNumModuli(h))
      * for the chunk-size / n_chunks check that decides whether to split, regardless of
      * whether dynamic mode is active (where num_moduli parameter = S_MAX but
      * settings.num_moduli is the user-configured max, e.g. 16).
@@ -3126,7 +3212,7 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
      * implementation goes to the monolithic path.  The monolithic path needs the full
      * (m, n) workspace, which is larger than max(WS(half), WS(half)), resulting in
      * the workspace being under-allocated and a buffer overflow at runtime.           */
-    const unsigned split_num_moduli = fp64EmulationEffectiveNumModuli(h);
+    const unsigned split_num_moduli = fixedPointEmulationEffectiveNumModuli(h);
     /* When the fused kernel is forced (HIPBLASLT_EMULATION_FUSED=on/force), use the
      * fused chunk formula (excludes C32i from workspace budget).  This eliminates
      * binary-halving for all practical shapes, avoiding per-leaf pipeline overhead.
@@ -3165,22 +3251,22 @@ size_t fp64EmulationWorkspaceSize(const _rocblaslt_handle*     h,
     return std::min(optimal, decision.workspace_cap);
 }
 
-unsigned fp64EmulationNumModuli()
+unsigned fixedPointEmulationNumModuli()
 {
     /* Returns 0 when the env var is absent or invalid, meaning pure ADP mode.
      * Returns [2..S_MAX] when the env var sets a fixed moduli count.
      * Callers that need a concrete upper bound for ADP should substitute S_MAX
-     * for a 0 return value; use fp64EmulationEffectiveNumModuli(h) to get the
+     * for a 0 return value; use fixedPointEmulationEffectiveNumModuli(h) to get the
      * fully resolved count (handle override → env var → S_MAX for ADP).       */
     static const unsigned v = []() -> unsigned {
-        const auto parsed = fp64EmulationParseNumModuliEnv(
+        const auto parsed = fixedPointEmulationParseNumModuliEnv(
             std::getenv("HIPBLASLT_EMULATION_NUM_MODULI"));
-        return (parsed.state == FP64_EMULATION_ENV_VALID) ? parsed.value : 0u;
+        return (parsed.state == FIXED_POINT_EMULATION_ENV_VALID) ? parsed.value : 0u;
     }();
     return v;
 }
 
-Fp64EmulationEnvValue fp64EmulationParseToleranceEnv(const char* value)
+FixedPointEmulationEnvValue fixedPointEmulationParseToleranceEnv(const char* value)
 {
     /* Converts a positive tolerance string to a mantissa-bit count.
      * bits = clamp(floor(-log2(tol)), 1, 52).
@@ -3188,29 +3274,14 @@ Fp64EmulationEnvValue fp64EmulationParseToleranceEnv(const char* value)
      *           "1e-8"  → 26
      *           "1e-4"  → 13                                             */
     if(value == nullptr)
-        return {FP64_EMULATION_ENV_UNSET, 52u};
+        return {FIXED_POINT_EMULATION_ENV_UNSET, 52u};
     char*        endp = nullptr;
     const double tol  = std::strtod(value, &endp);
     if(endp == value || *endp != '\0' || tol <= 0.0 || tol > 1.0)
-        return {FP64_EMULATION_ENV_INVALID, 0u};
+        return {FIXED_POINT_EMULATION_ENV_INVALID, 0u};
     const int bits = static_cast<int>(std::floor(-std::log2(tol)));
     const unsigned clamped = static_cast<unsigned>(std::max(1, std::min(bits, 52)));
-    return {FP64_EMULATION_ENV_VALID, clamped};
-}
-
-int fp64EmulationAdpMantissaBits()
-{
-    /* Returns the ADP target precision in mantissa bits [1..52].
-     * Reads HIPBLASLT_EMULATION_TOLERANCE once and caches the result.
-     * Default (absent or invalid): 52 (full IEEE 754 FP64 precision).      */
-    static const int v = []() -> int {
-        const auto parsed = fp64EmulationParseToleranceEnv(
-            std::getenv("HIPBLASLT_EMULATION_TOLERANCE"));
-        return (parsed.state == FP64_EMULATION_ENV_VALID)
-                   ? static_cast<int>(parsed.value)
-                   : 52;
-    }();
-    return v;
+    return {FIXED_POINT_EMULATION_ENV_VALID, clamped};
 }
 
 /* =========================================================================
@@ -3240,23 +3311,23 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                                   double*                      D,
                                   int64_t                      ldd,
                                   hipStream_t                  stream,
-                                  const Fp64EmulationSettings& settings)
+                                  const FixedPointEmulationSettings& settings)
 {
-    using namespace FP64Emulation;
+    using namespace FixedPointEmulation;
     /* ── Change 4: Workspace Graceful Degradation ────────────────────────────
      * No internal hipMalloc.  The caller must provide workspace via
      * settings.workspace / settings.workspace_bytes.  If none is provided
      * or the budget makes emulation slower than native, fall back to native. */
     const _rocblaslt_handle* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
-    /* Use the effective resolved count; 0 from fp64EmulationNumModuli() means
+    /* Use the effective resolved count; 0 from fixedPointEmulationNumModuli() means
      * env var absent → substitute the ADP default of 16.                      */
     const unsigned num_moduli  = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
                                      ? settings.num_moduli
-                                     : fp64EmulationEffectiveNumModuli(
+                                     : fixedPointEmulationEffectiveNumModuli(
                                            reinterpret_cast<const _rocblaslt_handle*>(handle));
     const int      device      = h->device;
 
-    Fp64EmulationSettings effectiveSettings = settings;
+    FixedPointEmulationSettings effectiveSettings = settings;
 
     {
         const size_t W = settings.workspace_bytes;
@@ -3310,26 +3381,35 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
          * performance model is inaccurate and incorrectly predicts emulation
          * is slower) still proceed with emulation as the user requested.      */
         const bool is_eager_g = (h->emulation.strategy == 2) ||
-                                 (h->emulation.strategy != 1 && fp64EmulationIsEager());
+                                 (h->emulation.strategy != 1 && fixedPointEmulationIsEager());
+
+        /* ADP-aware performance model s: use the minimum s satisfying the precision
+         * target (adp_bits + 2 safety bits) instead of S_MAX in dynamic mode.      */
+        const int adp_bits_g = (settings.adp_mantissa_bits > 0)
+            ? static_cast<int>(settings.adp_mantissa_bits)
+            : fixedPointEmulationAdpMantissaBits(HIP_R_64F);
+        const unsigned pm_s_g = perf_model_s(num_moduli, dyn_g, adp_bits_g);
 
         /* Pass W (workspace_bytes) so effective_time_ms recomputes the budget at each
-         * recursive level — consistent with the fix to fp64EmulationPerformanceCheck. */
+         * recursive level — consistent with the fix to fixedPointEmulationPerformanceCheck_fp64. */
         const double t_emul_W  = is_eager_g ? 0.0
-            : effective_time_ms(tA_g, tB_g, m, n, k, num_moduli, device, dyn_g, W);
+            : effective_time_ms(tA_g, tB_g, m, n, k, pm_s_g, device, dyn_g, W,
+                                HIP_R_64F);
         const double t_native_g = is_eager_g ? 1.0
-            : perf_model_times(tA_g, tB_g, m, n, k, num_moduli,
-                               device, dyn_g, ~size_t{0}).t_native_ms;
+            : perf_model_times(tA_g, tB_g, m, n, k, pm_s_g,
+                               device, dyn_g, ~size_t{0}, HIP_R_64F).t_native_ms;
         if(!is_eager_g && t_emul_W > t_native_g)
         {
             const double t_emul_opt = effective_time_ms(tA_g, tB_g, m, n, k,
-                                                        num_moduli, device, dyn_g, ~size_t{0});
+                                                        pm_s_g, device, dyn_g, ~size_t{0},
+                                                        HIP_R_64F);
             if(t_emul_opt <= t_native_g
                && s_ws_small_warns.fetch_add(1, std::memory_order_relaxed) < 5)
             {
-                Fp64EmulationDecision ws_dec{};
+                FixedPointEmulationDecision ws_dec{};
                 ws_dec.dynamic_mode = dyn_g;
                 ws_dec.num_moduli   = num_moduli;
-                const size_t opt_ws = fp64EmulationWorkspaceSize(h, opA, opB, m, n, k, ws_dec);
+                const size_t opt_ws = fixedPointEmulationWorkspaceSize(h, HIP_R_64F, opA, opB, m, n, k, ws_dec);
                 hipblaslt_cerr
                     << "[hipBLASLt WARNING] FP64 emulation workspace (" << (W >> 20)
                     << " MiB) too small (m=" << m << ",n=" << n << ",k=" << k << ").\n"
@@ -3354,7 +3434,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
         (void)hipEventRecord(ev_start, stream);
     }
 
-    const rocblaslt_status st = emulated_gemm_impl(h,
+    const rocblaslt_status st = emulated_gemm_impl<double>(h,
                                                    opA,
                                                    opB,
                                                    m,
@@ -3390,8 +3470,13 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
         const bool     tB               = (opB != HIPBLAS_OP_N);
         /* Use the split-aware model: each component is the sum across all leaves.
          * t_native_ms remains for the original (m,n,k) problem.           */
+        const int adp_bits_prof_64 = (settings.adp_mantissa_bits > 0)
+            ? static_cast<int>(settings.adp_mantissa_bits)
+            : fixedPointEmulationAdpMantissaBits(HIP_R_64F);
         const PerfModelTimes pm = effective_perf_model_times(
-            tA, tB, m, n, k, num_moduli, device, settings.dynamic_mode, ~size_t{0});
+            tA, tB, m, n, k,
+            perf_model_s(num_moduli, settings.dynamic_mode, adp_bits_prof_64),
+            device, settings.dynamic_mode, ~size_t{0}, HIP_R_64F);
 
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f)
@@ -3408,6 +3493,361 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
                     "pred_prelim_ms,pred_prelim_gemm_ms,pred_refine_ms,pred_adp_ms,"
                     "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
                     "pred_host_ms,pred_total_ms,pred_native_dgemm_ms\n");
+            std::fprintf(_f,
+                         "%lld,%lld,%lld,%c,%c,%u,%u,%u,%u,"
+                         "%llu,%u,"
+                         "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                         "%.4f,%.4f,%.4f,%.4f,"
+                         "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                         (long long)m,
+                         (long long)n,
+                         (long long)k,
+                         tA ? 'T' : 'N',
+                         tB ? 'T' : 'N',
+                         num_moduli,
+                         accum.effective_s_used,
+                         scale_chunk_size,
+                         chunk_size,
+                         (unsigned long long)settings.workspace_bytes,
+                         accum.n_sub_gemms,
+                         accum.t_prelim,
+                         accum.t_prelim_gemm,
+                         accum.t_refine,
+                         accum.t_adp,
+                         accum.t_scale,
+                         accum.t_int8,
+                         accum.t_accum,
+                         t_total,
+                         accum.t_ctx_create_ms,
+                         accum.t_layout_ms,
+                         accum.t_svmask_sync_ms,
+                         accum.t_batch_attr_ms,
+                         pm.t_prelim_ms,
+                         pm.t_prelim_gemm_ms,
+                         pm.t_refine_ms,
+                         pm.t_adp_ms,
+                         pm.t_scale_ms,
+                         pm.t_int8_gemms_ms,
+                         pm.t_accum_ms,
+                         pm.t_host_ms,
+                         pm.t_total_ms,
+                         pm.t_native_ms);
+            std::fclose(_f);
+        }
+        (void)hipEventDestroy(ev_end);
+        (void)hipEventDestroy(ev_start);
+    }
+    return st;
+}
+
+/* Parser for HIPBLASLT_EMULATION_FP{32,64}_MANTISSA_BIT_COUNT.
+ * Accepts decimal integers in [1..52]; values outside that range return INVALID. */
+FixedPointEmulationEnvValue fixedPointEmulationParseMantissaBitCountEnv(const char* value)
+{
+    using namespace FixedPointEmulation;
+    if(value == nullptr)
+        return {FIXED_POINT_EMULATION_ENV_UNSET, 0u};
+    char*      endp = nullptr;
+    const long n    = std::strtol(value, &endp, 10);
+    if(endp == value || *endp != '\0' || n < 1 || n > 52)
+        return {FIXED_POINT_EMULATION_ENV_INVALID, 0u};
+    return {FIXED_POINT_EMULATION_ENV_VALID, static_cast<unsigned>(n)};
+}
+
+/* Returns true when emulation is enabled for the given type.
+ *   HIP_R_64F: reads HIPBLASLT_EMULATE_DOUBLE_PRECISION
+ *   HIP_R_32F: reads HIPBLASLT_EMULATE_SINGLE_PRECISION
+ * Cached separately per type on first call.                                 */
+bool fixedPointEmulationIsEnabled(hipDataType type_a)
+{
+    if(type_a == HIP_R_64F)
+    {
+        static const bool v = []() -> bool {
+            const auto parsed = fixedPointEmulationParseEnabledEnv(
+                std::getenv("HIPBLASLT_EMULATE_DOUBLE_PRECISION"));
+            return parsed.state == FIXED_POINT_EMULATION_ENV_VALID && parsed.value != 0u;
+        }();
+        return v;
+    }
+    if(type_a == HIP_R_32F)
+    {
+        static const bool v = []() -> bool {
+            const auto parsed = fixedPointEmulationParseEnabledEnv(
+                std::getenv("HIPBLASLT_EMULATE_SINGLE_PRECISION"));
+            return parsed.state == FIXED_POINT_EMULATION_ENV_VALID && parsed.value != 0u;
+        }();
+        return v;
+    }
+    return false;
+}
+
+/* Returns the ADP target mantissa-bit count for the given type.
+ * FP64: checks HIPBLASLT_EMULATION_FP64_MANTISSA_BIT_COUNT (integer bits),
+ *       then HIPBLASLT_EMULATION_FP64_TOLERANCE (tolerance → bits),
+ *       then defaults to 52 (full IEEE 754 FP64 precision).
+ * FP32: checks HIPBLASLT_EMULATION_FP32_MANTISSA_BIT_COUNT (integer bits),
+ *       then HIPBLASLT_EMULATION_FP32_TOLERANCE (tolerance → bits),
+ *       then defaults to 23 (full IEEE 754 FP32 precision).               */
+int fixedPointEmulationAdpMantissaBits(hipDataType type_a)
+{
+    if(type_a == HIP_R_64F)
+    {
+        static const int v = []() -> int {
+            /* 1. Per-type bit-count env var. */
+            const auto p = fixedPointEmulationParseMantissaBitCountEnv(
+                std::getenv("HIPBLASLT_EMULATION_FP64_MANTISSA_BIT_COUNT"));
+            if(p.state == FIXED_POINT_EMULATION_ENV_VALID)
+                return static_cast<int>(p.value);
+            /* 2. Per-type tolerance env var (converted to bit count). */
+            const auto t = fixedPointEmulationParseToleranceEnv(
+                std::getenv("HIPBLASLT_EMULATION_FP64_TOLERANCE"));
+            if(t.state == FIXED_POINT_EMULATION_ENV_VALID)
+                return static_cast<int>(t.value);
+            /* 3. Default: full IEEE 754 FP64 precision = 52 mantissa bits. */
+            return 52;
+        }();
+        return v;
+    }
+    if(type_a == HIP_R_32F)
+    {
+        static const int v = []() -> int {
+            /* 1. Per-type bit-count env var. */
+            const auto p = fixedPointEmulationParseMantissaBitCountEnv(
+                std::getenv("HIPBLASLT_EMULATION_FP32_MANTISSA_BIT_COUNT"));
+            if(p.state == FIXED_POINT_EMULATION_ENV_VALID)
+                return static_cast<int>(p.value);
+            /* 2. Per-type tolerance env var (converted to bit count). */
+            const auto t = fixedPointEmulationParseToleranceEnv(
+                std::getenv("HIPBLASLT_EMULATION_FP32_TOLERANCE"));
+            if(t.state == FIXED_POINT_EMULATION_ENV_VALID)
+                return static_cast<int>(t.value);
+            /* 3. Default: full IEEE 754 FP32 precision = 23 mantissa bits. */
+            return 23;
+        }();
+        return v;
+    }
+    hipblaslt_cerr << "[hipBLASLt] ERROR: fixedPointEmulationAdpMantissaBits called with unsupported type "
+                   << static_cast<int>(type_a) << std::endl;
+    return 0;
+}
+
+/* Unified performance check — dispatches on type_a.
+ * Uses FP32-specific ai_fp32/ratio_fp32 for HIP_R_32F (Step 7),
+ * and FP64-specific ai/ratio for HIP_R_64F.                              */
+bool fixedPointEmulationPerformanceCheck(const _rocblaslt_handle* h,
+                                          hipDataType              type_a,
+                                          hipblasOperation_t       opA,
+                                          hipblasOperation_t       opB,
+                                          int64_t                  m,
+                                          int64_t                  n,
+                                          int64_t                  k,
+                                          size_t                   workspace_bytes)
+{
+    using namespace FixedPointEmulation;
+    const int  device = h->device;
+    const bool tA     = (opA != HIPBLAS_OP_N);
+    const bool tB     = (opB != HIPBLAS_OP_N);
+    /* ADP mode: handle is at sentinel AND env var absent. */
+    const bool     dyn        = (h->emulation.num_moduli < 2) && (fixedPointEmulationNumModuli() == 0u);
+    const unsigned num_moduli = fixedPointEmulationEffectiveNumModuli(h);
+    /* Use type-specific performance model (FP32 vs FP64) so the gate correctly
+     * compares emulation time against native SGEMM or DGEMM respectively.
+     * Use ADP-aware s estimate to avoid overestimating emulation cost in dynamic mode. */
+    const int adp_bits_pc = fixedPointEmulationAdpMantissaBits(type_a);
+    const unsigned pm_num = perf_model_s(num_moduli, dyn, adp_bits_pc);
+    const double t_emul   = effective_time_ms(tA, tB, m, n, k, pm_num, device, dyn,
+                                              workspace_bytes, type_a);
+    const double t_native = perf_model_times(tA, tB, m, n, k, pm_num, device, dyn,
+                                             ~size_t{0}, type_a).t_native_ms;
+    return t_emul <= t_native;
+}
+
+/* Convenience wrapper: returns true when emulation would be applied for this
+ * type and problem (enabled + device supported + strategy gate passes).      */
+bool fixedPointEmulationWouldApply(const _rocblaslt_handle* h,
+                                    hipDataType              type_a,
+                                    hipblasOperation_t       opA,
+                                    hipblasOperation_t       opB,
+                                    int64_t                  m,
+                                    int64_t                  n,
+                                    int64_t                  k,
+                                    int32_t                  batch_count)
+{
+    return fixedPointEmulationDecision(h, type_a, opA, opB, m, n, k, batch_count,
+                                        /*workspace_bytes=*/~size_t{0u}).apply;
+}
+
+/* =========================================================================
+ * fp32EmulatedGemm — FP32 public entry point (Step 6 — native float path)
+ *
+ * Mirrors fp64EmulatedGemm exactly.  All kernels are now templated on T=float
+ * so no intermediate copies are needed.  alpha and beta are passed as
+ * const float* directly; emulated_gemm_impl<float> reads them as float and
+ * widens to double at arithmetic time (inside accum_finalize_kernel).
+ * ========================================================================= */
+rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
+                                   hipblasOperation_t                 opA,
+                                   hipblasOperation_t                 opB,
+                                   int64_t                            m,
+                                   int64_t                            n,
+                                   int64_t                            k,
+                                   const float*                       alpha,
+                                   const float*                       A,
+                                   int64_t                            lda,
+                                   const float*                       B,
+                                   int64_t                            ldb,
+                                   const float*                       beta,
+                                   const float*                       C,
+                                   int64_t                            ldc,
+                                   float*                             D,
+                                   int64_t                            ldd,
+                                   hipStream_t                        stream,
+                                   const FixedPointEmulationSettings& settings)
+{
+    using namespace FixedPointEmulation;
+
+    const _rocblaslt_handle* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
+    const unsigned num_moduli  = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
+                                     ? settings.num_moduli
+                                     : fixedPointEmulationEffectiveNumModuli(h);
+    const int device = h->device;
+
+    FixedPointEmulationSettings effectiveSettings = settings;
+
+    {
+        const size_t W = settings.workspace_bytes;
+        const void*  P = settings.workspace;
+
+        static std::atomic<int> s_ws_absent_warns{0};
+        static std::atomic<int> s_ws_small_warns{0};
+
+        if(P == nullptr || W == 0)
+        {
+            if(s_ws_absent_warns.fetch_add(1, std::memory_order_relaxed) < 5)
+                hipblaslt_cerr
+                    << "[hipBLASLt WARNING] FP32 emulation requires a workspace.\n"
+                    << "  Call hipblasLtEmulationWorkspaceSize() for the optimal size.\n"
+                    << "  Falling back to native SGEMM." << std::endl;
+            return rocblaslt_status_memory_error;
+        }
+
+        const bool tA_g = (opA != HIPBLAS_OP_N), tB_g = (opB != HIPBLAS_OP_N);
+        const bool dyn_g = effectiveSettings.dynamic_mode;
+        const size_t cola8i_g = pad(static_cast<size_t>(m));
+        const size_t padn_g   = pad(static_cast<size_t>(n));
+        const size_t base_oh  =
+              cola8i_g * sizeof(int16_t) + padn_g * sizeof(int16_t) + sizeof(uint32_t)
+            + cola8i_g * sizeof(int32_t) + padn_g * sizeof(int32_t) + 2 * sizeof(float)
+            + OZ2_INT8_GEMM_WS_BYTES;
+
+        const unsigned s_layout_g = dyn_g ? S_MAX : num_moduli;
+        const size_t   W_var1 = (W > base_oh) ? W - base_oh : 0u;
+        const unsigned cs1    = compute_chunk_size(m, n, k, s_layout_g, W_var1);
+        size_t W_var;
+        if(cs1 < s_layout_g)
+        {
+            const size_t szC32i_g = cola8i_g * static_cast<size_t>(n);
+            const size_t zlo_oh   = 2u * szC32i_g * sizeof(double);
+            W_var = (W > base_oh + zlo_oh) ? W - base_oh - zlo_oh : 0u;
+        }
+        else { W_var = W_var1; }
+
+        const bool is_eager_g = (h->emulation_fp32.strategy == 2) ||
+                                 (h->emulation_fp32.strategy != 1 && fixedPointEmulationIsEager());
+
+        /* ADP-aware performance model s: use the minimum s satisfying the precision
+         * target (adp_bits + 2 safety bits) instead of S_MAX in dynamic mode.      */
+        const int adp_bits_g = (settings.adp_mantissa_bits > 0)
+            ? static_cast<int>(settings.adp_mantissa_bits)
+            : fixedPointEmulationAdpMantissaBits(HIP_R_32F);
+        const unsigned pm_s_g = perf_model_s(num_moduli, dyn_g, adp_bits_g);
+
+        /* FP32 performance model: compare against native SGEMM, not DGEMM. */
+        const double t_emul_W  = is_eager_g ? 0.0
+            : effective_time_ms(tA_g, tB_g, m, n, k, pm_s_g, device, dyn_g, W, HIP_R_32F);
+        const double t_native_g = is_eager_g ? 1.0
+            : perf_model_times(tA_g, tB_g, m, n, k, pm_s_g, device, dyn_g, ~size_t{0}, HIP_R_32F).t_native_ms;
+        if(!is_eager_g && t_emul_W > t_native_g)
+        {
+            const double t_emul_opt = effective_time_ms(tA_g, tB_g, m, n, k,
+                                                        pm_s_g, device, dyn_g, ~size_t{0}, HIP_R_32F);
+            if(t_emul_opt <= t_native_g
+               && s_ws_small_warns.fetch_add(1, std::memory_order_relaxed) < 5)
+            {
+                FixedPointEmulationDecision ws_dec{};
+                ws_dec.dynamic_mode = dyn_g;
+                ws_dec.num_moduli   = num_moduli;
+                const size_t opt_ws = fixedPointEmulationWorkspaceSize(
+                    h, HIP_R_32F, opA, opB, m, n, k, ws_dec);
+                hipblaslt_cerr
+                    << "[hipBLASLt WARNING] FP32 emulation workspace (" << (W >> 20)
+                    << " MiB) too small (m=" << m << ",n=" << n << ",k=" << k << ").\n"
+                    << "  Optimal: " << (opt_ws >> 20) << " MiB."
+                    << " Falling back to native SGEMM." << std::endl;
+            }
+            return rocblaslt_status_memory_error;
+        }
+    }
+    /* ────────────────────────────────────────────────────────────────────── */
+
+    const char* const _pf   = profile_file();
+    const bool        _prof = (_pf != nullptr);
+
+    ProfileAccum accum{};
+    hipEvent_t   ev_start{}, ev_end{};
+    if(_prof)
+    {
+        (void)hipEventCreate(&ev_start);
+        (void)hipEventCreate(&ev_end);
+        (void)hipEventRecord(ev_start, stream);
+    }
+
+    /* Native FP32 path: alpha and beta are passed as const float*; emulated_gemm_impl<float>
+     * dereferences them as float and widens to double inside accum_finalize_kernel.
+     * No intermediate float→double copies needed.                             */
+    const rocblaslt_status st = emulated_gemm_impl<float>(h,
+                                                           opA, opB, m, n, k,
+                                                           alpha, A, lda, B, ldb,
+                                                           beta,  C, ldc, D, ldd,
+                                                           stream,
+                                                           effectiveSettings,
+                                                           _prof ? &accum : nullptr);
+
+    if(_prof)
+    {
+        (void)hipEventRecord(ev_end, stream);
+        (void)hipStreamSynchronize(stream);
+        float t_total = 0.f;
+        (void)hipEventElapsedTime(&t_total, ev_start, ev_end);
+
+        const unsigned prof_s         = accum.effective_s_used ? accum.effective_s_used : num_moduli;
+        const unsigned chunk_size     = compute_chunk_size(m, n, k, prof_s, ~size_t{0});
+        const unsigned scale_chunk_size = chunk_size;
+        const bool     tA               = (opA != HIPBLAS_OP_N);
+        const bool     tB               = (opB != HIPBLAS_OP_N);
+        const int adp_bits_prof_32 = (settings.adp_mantissa_bits > 0)
+            ? static_cast<int>(settings.adp_mantissa_bits)
+            : fixedPointEmulationAdpMantissaBits(HIP_R_32F);
+        const PerfModelTimes pm = effective_perf_model_times(
+            tA, tB, m, n, k,
+            perf_model_s(num_moduli, settings.dynamic_mode, adp_bits_prof_32),
+            device, settings.dynamic_mode, ~size_t{0}, HIP_R_32F);
+
+        std::FILE* _f = std::fopen(_pf, "a");
+        if(_f)
+        {
+            if(std::ftell(_f) == 0)
+                std::fprintf(
+                    _f,
+                    "m,n,k,transA,transB,num_moduli,effective_s,scale_chunk_size,gemm_chunk_size,"
+                    "workspace_bytes,num_sub_gemms,"
+                    "t_prelim_ms,t_prelim_gemm_ms,t_refine_ms,"
+                    "t_adp_ms,t_scale_ms,t_int8_gemm_ms,t_accum_ms,"
+                    "t_total_ms,"
+                    "cpu_ctx_create_ms,cpu_layout_ms,cpu_svmask_sync_ms,cpu_batch_attr_ms,"
+                    "pred_prelim_ms,pred_prelim_gemm_ms,pred_refine_ms,pred_adp_ms,"
+                    "pred_scale_ms,pred_int8_gemm_ms,pred_accum_ms,"
+                    "pred_host_ms,pred_total_ms,pred_native_sgemm_ms\n");
             std::fprintf(_f,
                          "%lld,%lld,%lld,%c,%c,%u,%u,%u,%u,"
                          "%llu,%u,"

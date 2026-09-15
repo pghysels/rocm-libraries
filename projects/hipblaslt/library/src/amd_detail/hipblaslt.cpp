@@ -28,7 +28,7 @@
 #include "UserDrivenTuningParser.hpp"
 #include "check_numerics_matrix.hpp"
 #include "exceptions.hpp"
-#include "fp64_emulation.hpp"
+#include "fixed_point_emulation.hpp"
 #include "handle.h"
 #include "hipblaslt/hipblaslt-ext-op.h"
 #include "hipblaslt_internal.hpp"
@@ -533,15 +533,15 @@ try
         const int32_t     batch_count = A_layout->batch_count;
         const hipDataType type_a      = A_layout->type;
 
-        const Fp64EmulationDecision emulDecision =
-            fp64EmulationDecision(h, type_a, desc_ptr->op_A, desc_ptr->op_B, m, n, k, batch_count,
+        const FixedPointEmulationDecision emulDecision =
+            fixedPointEmulationDecision(h, type_a, desc_ptr->op_A, desc_ptr->op_B, m, n, k, batch_count,
                                           reinterpret_cast<const _rocblaslt_matmul_preference*>(pref)->max_workspace_bytes);
         if(emulDecision.status != rocblaslt_status_success)
             return RocBlasLtStatusToHIPStatus(emulDecision.status);
         if(emulDecision.apply && *returnAlgoCount > 0)
         {
             const size_t emul_ws =
-                fp64EmulationWorkspaceSize(h, desc_ptr->op_A, desc_ptr->op_B,
+                fixedPointEmulationWorkspaceSize(h, type_a, desc_ptr->op_A, desc_ptr->op_B,
                                            m, n, k, emulDecision);
             for(int i = 0; i < *returnAlgoCount; ++i)
                 heuristicResultsArray[i].workspaceSize = emul_ws;
@@ -842,7 +842,8 @@ try
 {
     if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
     auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    h->emulation.enabled = enabled ? 1 : 0;
+    h->emulation.enabled      = enabled ? 1 : 0;
+    h->emulation_fp32.enabled = enabled ? 1 : 0;
     return HIPBLAS_STATUS_SUCCESS;
 }
 catch(...)
@@ -859,7 +860,8 @@ try
     if(strategy < HIPBLASLT_EMULATION_STRATEGY_DEFAULT
        || strategy > HIPBLASLT_EMULATION_STRATEGY_EAGER)
         return HIPBLAS_STATUS_INVALID_VALUE;
-    h->emulation.strategy = static_cast<int>(strategy);
+    h->emulation.strategy      = static_cast<int>(strategy);
+    h->emulation_fp32.strategy = static_cast<int>(strategy);
     return HIPBLAS_STATUS_SUCCESS;
 }
 catch(...)
@@ -894,7 +896,8 @@ try
     if(numModuli != -1 && (numModuli < 2 || numModuli > 20))
         return HIPBLAS_STATUS_INVALID_VALUE;
     auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    h->emulation.num_moduli = numModuli;
+    h->emulation.num_moduli      = numModuli;
+    h->emulation_fp32.num_moduli = numModuli;
     /* Warn once per process when FIXED mode is selected. */
     if(numModuli >= 2)
     {
@@ -920,7 +923,8 @@ try
 {
     if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
     auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    h->emulation.special_values_mask = mask;
+    h->emulation.special_values_mask      = mask;
+    h->emulation_fp32.special_values_mask = mask;
     return HIPBLAS_STATUS_SUCCESS;
 }
 catch(...)
@@ -937,13 +941,15 @@ try
     /* tolerance <= 0 or > 1 resets to the process-wide env var default (sentinel 0). */
     if(tolerance <= 0.0 || tolerance > 1.0)
     {
-        h->emulation.adp_mantissa_bits = 0;
+        h->emulation.adp_mantissa_bits      = 0;
+        h->emulation_fp32.adp_mantissa_bits = 0;
     }
     else
     {
         const int bits = static_cast<int>(std::floor(-std::log2(tolerance)));
         /* Clamp to [1, 52]: 52 = full FP64 precision. */
-        h->emulation.adp_mantissa_bits = std::max(1, std::min(bits, 52));
+        h->emulation.adp_mantissa_bits      = std::max(1, std::min(bits, 52));
+        h->emulation_fp32.adp_mantissa_bits = std::max(1, std::min(bits, 52));
     }
     return HIPBLAS_STATUS_SUCCESS;
 }
@@ -962,15 +968,20 @@ try
 {
     if(m < 0 || n < 0 || k < 0) return 0;
     /* Resolve all handle settings via the canonical decision function.
-     * type_a=HIP_R_64F is the only type that triggers emulation;
+     * Checks FP64 first, then FP32 — the workspace formula is type-independent
+     * (depends only on m, n, k, and num_moduli), so the first applicable type
+     * returns the correct size for either data type.
      * batch_count=1 because emulation only supports non-batched GEMMs.
-     * Returns 0 when d.apply=false (device not in perf-model table, or
-     * emulation disabled on the handle) — no emulation workspace needed.    */
+     * Returns 0 when no type has emulation enabled or the device is unsupported. */
     const auto* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
-    const Fp64EmulationDecision d =
-        fp64EmulationDecision(h, HIP_R_64F, opA, opB, m, n, k, 1, ~size_t{0});
-    if(d.status != rocblaslt_status_success || !d.apply) return 0;
-    return fp64EmulationWorkspaceSize(h, opA, opB, m, n, k, d);
+    for(hipDataType t : {HIP_R_64F, HIP_R_32F})
+    {
+        const FixedPointEmulationDecision d =
+            fixedPointEmulationDecision(h, t, opA, opB, m, n, k, 1, ~size_t{0});
+        if(d.status != rocblaslt_status_success || !d.apply) continue;
+        return fixedPointEmulationWorkspaceSize(h, t, opA, opB, m, n, k, d);
+    }
+    return 0;
 }
 catch(...)
 {
