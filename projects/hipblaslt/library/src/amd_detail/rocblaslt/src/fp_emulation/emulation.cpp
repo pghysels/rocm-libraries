@@ -139,42 +139,21 @@ namespace FixedPointEmulation
 
     struct PerfModelDeviceParams
     {
-        double hbm_bw;    /* effective HBM bandwidth in bytes/s (calibrated)       */
-        double peak_int8; /* effective INT8 GEMM throughput in ops/s (calibrated)   */
-        double peak_fp64; /* effective FP64 GEMM throughput in FLOP/s (calibrated)  */
-        double peak_fp32; /* effective FP32 GEMM throughput in FLOP/s (calibrated)  */
-        /* Note: these are calibrated effective throughputs at large N,
-         * not theoretical hardware spec peaks.  A single peak_int8 is used for
-         * both FP32 and FP64 emulation contexts (same INT8 tensor core hardware).  */
+        double bw;
+        double int8;
+        double fp64;
+        double fp32;
     };
 
     /* Returns the perf-model parameters for the given HIP device, or nullopt if
      * the device is not in the table (in which case emulation should not run). */
     static std::optional<PerfModelDeviceParams> get_perf_model_params(int device)
     {
-        /* Order: hbm_bw (bytes/s), peak_int8 (ops/s), peak_fp64 (FLOP/s), peak_fp32 (FLOP/s)
-         *
-         * Values derived from calibration benchmarks on each device.
-         * For devices without empirical FP32 data, peak_fp32 is estimated from
-         * theoretical FP32/FP64 throughput ratios (marked with "est.").
-         *
-         * MI300X:  hbm_bw=3.93 TB/s  → peak_fp64= 10.4 TFlops, peak_int8=1746 TOPS
-         *                               peak_fp32= 48.7 TFlops (est., r≈4.7)
-         * MI350X:  hbm_bw=6.08 TB/s  → peak_fp64= 68.2 TFlops, peak_int8=3172 TOPS
-         *                               peak_fp32=134   TFlops (calibrated on 0x75a0)
-         * MI350:   hbm_bw=6.82 TB/s  → peak_fp64= 77.3 TFlops, peak_int8=3301 TOPS
-         *                               peak_fp32=309   TFlops (est., r≈4.0)              */
         static const std::unordered_map<uint32_t, PerfModelDeviceParams> hw_params_by_pci_id = {
-            /* MI300X */
-            {0x74a0u, {3.93e12, 1.746e15, 1.037e13, 4.874e13}},
-            {0x74a1u, {3.93e12, 1.746e15, 1.037e13, 4.874e13}},
-            {0x74a9u, {3.93e12, 1.746e15, 1.037e13, 4.874e13}},
-            /* MI350X: peak_fp32 calibrated from measured SGEMM at N=8192–65536 */
             {0x75a0u, {6.08e12, 3.172e15, 6.824e13, 1.34e14}},
             {0x75b0u, {6.08e12, 3.172e15, 6.824e13, 1.34e14}},
-            /* MI350: peak_fp32 estimated (empirical calibration pending) */
-            {0x75a3u, {6.82e12, 3.301e15, 7.726e13, 3.090e14}},
-            {0x75b3u, {6.82e12, 3.301e15, 7.726e13, 3.090e14}},
+            {0x75a3u, {6.82e12, 3.301e15, 7.726e13, 1.54e14}},
+            {0x75b3u, {6.82e12, 3.301e15, 7.726e13, 1.54e14}},
         };
         static std::optional<std::optional<PerfModelDeviceParams>> device_params_cache[64];
 
@@ -196,11 +175,21 @@ namespace FixedPointEmulation
     }
 
     /* Returns the minimum number of moduli s ∈ [2, S_MAX] such that
-     * log2P[s-2] >= (adp_bits + 2), i.e. the smallest s that can satisfy the
-     * ADP precision target for a typical well-conditioned input.
-     * The +2 safety bits account for the truncation-error term in the ADP
-     * formula (which adds ~4 bits of overhead for large k) partially offset by
-     * the 2-bit safety margin already baked into the log2P table values.
+     * log2P[s-2] >= (adp_bits + 2), used ONLY in the PERFORMANCE MODEL
+     * (perf_model_s) to predict which s ADP will select at runtime.
+     *
+     * The +2 adds two bits beyond the bare mantissa target:
+     *   +1 for the IEEE 754 implicit leading bit (the ADP formula operates on
+     *      the significand, which has one more bit than the stored mantissa)
+     *   +1 safety margin so the heuristic does not underestimate the required s
+     *      for slightly ill-conditioned inputs.
+     *
+     * NOTE: the +1 safety margin baked into the log2P table itself (added to
+     * prevent occasional CRT overflows in fixed-s mode) is a separate,
+     * independent correction applied at runtime during the shift-refinement
+     * step (refine_sftA_apply_kernel / refine_sftB_kernel).  It is NOT the
+     * same as — and does not interact with — this performance-model +2.
+     *
      * Falls back to S_MAX when adp_bits <= 0 (sentinel) or when all moduli
      * are needed to reach the target.                                        */
     static unsigned adp_expected_num_moduli(int adp_bits) noexcept
@@ -264,15 +253,10 @@ namespace FixedPointEmulation
                && "perf_model_times called for a device not in hw_params_by_pci_id");
         const PerfModelDeviceParams& hw = *hw_opt;
 
-        /* Select throughput ceiling and memory bandwidth based on input type.
-         * c0 = HBM bandwidth (bytes/s)
-         * c1 = native GEMM throughput (FLOP/s), type-specific
-         * c2 = INT8 GEMM throughput (ops/s), same hardware for both types    */
-        const bool   is_fp32       = (type_a == HIP_R_32F);
-        const double c0            = hw.hbm_bw;
-        const double c1            = is_fp32 ? hw.peak_fp32 : hw.peak_fp64;
-        const double c2            = hw.peak_int8;
-        /* Memory bytes per element: 4 for float, 8 for double.              */
+        const bool   is_fp32 = (type_a == HIP_R_32F);
+        const double c0      = hw.bw;
+        const double c1      = is_fp32 ? hw.fp32 : hw.fp64;
+        const double c2      = hw.int8;
         const double bytes_per_elem = is_fp32 ? 4.0 : 8.0;
         const double s   = static_cast<double>(num_moduli);
         const double mn  = static_cast<double>(m) * static_cast<double>(n);
@@ -301,13 +285,6 @@ namespace FixedPointEmulation
         const double t_host = K::host_overhead_s;
 
         const double t_gemm_accum = t_int8_gemms + t_accum_kern;
-        /* ADP (dynamic-mode) overhead: two tiny reduction kernels followed by a
-         * hipStreamSynchronize that blocks the CPU until the GPU drains.
-         *   adp_reduce_A_kernel reads row_max[m]  (~m × 4 bytes, negligible)
-         *   adp_reduce_B_kernel reads col_max[n]  (~n × 4 bytes, negligible)
-         *     — col_max[] was precomputed by col_max_kernel (charged to t_refine);
-         *       adp_reduce_B_kernel no longer reads the full m×n C32i matrix.
-         * Bottleneck is entirely the CPU-GPU hipStreamSynchronize roundtrip.       */
         const double t_adp
             = dynamic_mode
                   ? 2.0 * K::latency_kernel_s /* adp_reduce_A_kernel + adp_reduce_B_kernel */
@@ -335,7 +312,7 @@ namespace FixedPointEmulation
     /* Minimum problem size for efficient INT8 tensor core execution.
      * Below this threshold MFMA tiles are under-utilised and native DGEMM wins.
      * Both effective_time_ms and emulated_gemm_impl fall back immediately.      */
-    static constexpr int64_t FP64_EMUL_MIN_MN = 16;
+    static constexpr int64_t FIXED_POINT_EMUL_MIN_MN = 16;
 
     /* Returns the minimum achievable emulation time in ms, accounting for the
      * recursive binary-halving that fp64EmulatedGemm applies when n_chunks > 1.
@@ -361,7 +338,7 @@ namespace FixedPointEmulation
                                     size_t      workspace_bytes,
                                     hipDataType type_a)
     {
-        if(m < FP64_EMUL_MIN_MN || n < FP64_EMUL_MIN_MN)
+        if(m < FIXED_POINT_EMUL_MIN_MN || n < FIXED_POINT_EMUL_MIN_MN)
         {
             /* For sub-threshold shapes (m or n < 16) emulated_gemm_impl falls back to
              * native GEMM immediately, so emulation has strictly more overhead than
@@ -1718,6 +1695,8 @@ namespace FixedPointEmulation
                                                  int64_t                  ldd,
                                                  hipStream_t              stream)
     {
+        static_assert(std::is_same_v<T, double> || std::is_same_v<T, float>,
+                      "native_gemm_fallback<T>: T must be double (FP64) or float (FP32)");
         /* Resolve hip data type and compute type from T at compile time. */
         constexpr hipDataType          hip_type = std::is_same_v<T, double>
                                                       ? HIP_R_64F
@@ -1751,16 +1730,6 @@ namespace FixedPointEmulation
         if(hipblasLtCreate(&native_handle) != HIPBLAS_STATUS_SUCCESS)
             return rocblaslt_status_internal_error;
 
-        /* Explicitly disable emulation on this fresh handle for BOTH types.
-         * The default enabled=-1 means "check env var"; 0 means "force off"
-         * regardless of the HIPBLASLT_EMULATE_* env vars, preventing
-         * recursive re-entry no matter which type triggered the fallback. */
-        {
-            auto* nh = reinterpret_cast<_rocblaslt_handle*>(native_handle);
-            nh->emulation.enabled      = 0;  /* FP64 */
-            nh->emulation_fp32.enabled = 0;  /* FP32 */
-        }
-
         /* Physical (stored) matrix dimensions for column-major layout:
          *   opA=N → A is m×k; opA=T → A is k×m (transposed in matmulDesc).
          *   opB=N → B is k×n; opB=T → B is n×k.                             */
@@ -1780,6 +1749,11 @@ namespace FixedPointEmulation
         hipblasLtMatrixLayoutCreate(
             &layoutD, hip_type, static_cast<uint64_t>(m), static_cast<uint64_t>(n), ldd);
         hipblasLtMatmulDescCreate(&desc, ctype, hip_type);
+        {
+            /* Force-disable emulation on this desc to prevent recursive re-entry. */
+            const int32_t emul_off = 0;
+            hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_EMULATION_ENABLED_EXT, &emul_off, sizeof(emul_off));
+        }
         hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
         hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
 
@@ -2280,6 +2254,8 @@ namespace FixedPointEmulation
                                                const FixedPointEmulationSettings& settings,
                                                ProfileAccum*                prof)
     {
+        static_assert(std::is_same_v<T, double> || std::is_same_v<T, float>,
+                      "emulated_gemm_impl<T>: T must be double (FP64) or float (FP32)");
         /* Type-specific label strings for warning messages. */
         constexpr const char* type_name  = std::is_same_v<T, double> ? "FP64" : "FP32";
         constexpr const char* native_str = std::is_same_v<T, double> ? "DGEMM" : "SGEMM";
@@ -2288,7 +2264,7 @@ namespace FixedPointEmulation
          * fixedPointEmulationEffectiveNumModuli properly converts that to 16.           */
         const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
                                         ? settings.num_moduli
-                                        : fixedPointEmulationEffectiveNumModuli(h);
+                                        : fixedPointEmulationEffectiveNumModuli(nullptr);
         /* Workspace budget: derive from workspace_bytes using two-call approach. */
         const size_t W_wb_i   = settings.workspace_bytes;
         const size_t co_i     = pad(static_cast<size_t>(m));
@@ -2436,8 +2412,8 @@ namespace FixedPointEmulation
         }
         /* ── Existing monolithic path ────────────────────────────────────── */
 
-        /* Minimum problem size guard — see FP64_EMUL_MIN_MN. */
-        if(m < FP64_EMUL_MIN_MN || n < FP64_EMUL_MIN_MN)
+        /* Minimum problem size guard — see FIXED_POINT_EMUL_MIN_MN. */
+        if(m < FIXED_POINT_EMUL_MIN_MN || n < FIXED_POINT_EMUL_MIN_MN)
             return native_gemm_fallback<T>(h, opA, opB, m, n, k, alpha, A, lda, B, ldb,
                                            beta, C, ldc, D, ldd, stream);
 
@@ -2755,7 +2731,9 @@ namespace FixedPointEmulation
             const float adp_bits = static_cast<float>(
                 (settings.adp_mantissa_bits > 0)
                     ? settings.adp_mantissa_bits
-                    : fixedPointEmulationAdpMantissaBits(std::is_same_v<T, double> ? HIP_R_64F : HIP_R_32F));
+                    : fixedPointEmulationAdpMantissaBits(std::is_same_v<T, double> ? HIP_R_64F : HIP_R_32F))
+            /* assume that relatice componentwise error scales O(sqrt(K)) */
+                    - std::floor(0.5f * std::log2(static_cast<float>(k)));
 
             /* A-side: reads row_max[] and sftA[] before apply_kernel modifies sftA. */
             hipLaunchKernelGGL(adp_reduce_A_kernel,
@@ -3087,26 +3065,25 @@ FixedPointEmulationEnvValue fixedPointEmulationParseNumModuliEnv(const char* val
 
 
 
-FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle* h,
-                                            hipDataType              type_a,
-                                            hipblasOperation_t       opA,
-                                            hipblasOperation_t       opB,
-                                            int64_t                  m,
-                                            int64_t                  n,
-                                            int64_t                  k,
-                                            int32_t                  batch_count,
-                                            size_t                   workspace_bytes)
+FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle*      h,
+                                                         const _rocblaslt_matmul_desc* desc,
+                                                         hipDataType                   type_a,
+                                                         hipblasOperation_t            opA,
+                                                         hipblasOperation_t            opB,
+                                                         int64_t                       m,
+                                                         int64_t                       n,
+                                                         int64_t                       k,
+                                                         int32_t                       batch_count,
+                                                         size_t                        workspace_bytes)
 {
     /* Setting Precedence (highest to lowest):
-     *   1. Handle setter (hipblasLtSet* functions) — set after handle creation;
-     *      permanently overrides any env var for the lifetime of this handle.
+     *   1. Per-matmul descriptor fields (desc->emulation_*; sentinel = inherit).
      *   2. Environment variable — read once at first use, process-wide default.
-     *   3. Built-in default (ADP mode, 16 moduli, special-values mask = 0x3).
+     *   3. Built-in default (ADP mode, S_MAX moduli, special-values mask = 0x3).
      *
-     * The handle fields are initialized to sentinel values (-1 / ~0u / 0) at
-     * creation.  A sentinel means "use the env var"; a non-sentinel means "use
-     * this value".  Calling any hipblasLtSet* function writes a non-sentinel,
-     * disabling the env-var fallback for that setting on this handle.         */
+     * Descriptor fields are initialized to sentinel values (-1 / ~0u / 0).
+     * A sentinel means "inherit from env var"; a non-sentinel means "use this
+     * value", disabling the env-var fallback for that setting.               */
     using namespace FixedPointEmulation;
     FixedPointEmulationDecision result{};
     result.status       = rocblaslt_status_success;
@@ -3116,16 +3093,17 @@ FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle*
     result.dynamic_mode = false;
 
     /* Type and batch-count pre-checks (no env-var validation needed). */
-    const bool is_fp32 = (type_a == HIP_R_32F);
     if((type_a != HIP_R_64F && type_a != HIP_R_32F) || batch_count != 1)
         return result; /* apply=false, success */
 
-    /* Select the per-handle emulation settings struct for this type. */
-    const _rocblaslt_handle::EmulationSettings& emu = is_fp32 ? h->emulation_fp32 : h->emulation;
-
-    /* Emulation enabled check (dispatch on type). */
-    const bool emulEnabled = (emu.enabled == 1)
-        || (emu.enabled != 0 && fixedPointEmulationIsEnabled(type_a));
+    /* Emulation enabled check.
+     * Priority: desc->emulation_enabled (non-sentinel) > env var.
+     *   desc_enabled == 1  -> force on
+     *   desc_enabled == 0  -> force off (returns false)
+     *   desc_enabled == -1 -> inherit from env var                          */
+    const int desc_enabled = desc ? desc->emulation_enabled : -1;
+    const bool emulEnabled = (desc_enabled == 1)
+        || (desc_enabled != 0 && fixedPointEmulationIsEnabled(type_a));
     if(!emulEnabled)
         return result;
 
@@ -3134,30 +3112,44 @@ FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle*
     if(!get_perf_model_params(dev))
         return result;
 
-    /* Resolve num_moduli from handle settings (uses type-appropriate struct). */
+    /* Resolve num_moduli.
+     * Priority: desc->emulation_num_moduli (FIXED) > env var > ADP upper bound. */
     {
-        using namespace FixedPointEmulation;
-        result.num_moduli = (emu.num_moduli >= 2 && emu.num_moduli <= static_cast<int>(S_MAX))
-            ? static_cast<unsigned>(emu.num_moduli)
+        const int desc_nm = desc ? desc->emulation_num_moduli : -1;
+        result.num_moduli = (desc_nm >= 2 && desc_nm <= static_cast<int>(S_MAX))
+            ? static_cast<unsigned>(desc_nm)
             : (fixedPointEmulationNumModuli() != 0u ? fixedPointEmulationNumModuli() : S_MAX);
     }
 
-    /* Handle special_values_mask override. */
-    if(emu.special_values_mask != ~0u)
-        result.sv_mask = emu.special_values_mask;
+    /* Resolve special_values_mask.
+     * Priority: desc->emulation_sv_mask (non-~0u) > env var. */
+    {
+        const unsigned int desc_sv = desc ? desc->emulation_sv_mask : ~0u;
+        if(desc_sv != ~0u)
+            result.sv_mask = desc_sv;
+    }
 
-    /* dynamic_mode: DYNAMIC (ADP) mantissa control — adaptively selects
-     * the minimum s needed for the target precision on the given input data. */
-    result.dynamic_mode      = (emu.num_moduli < 2) && (fixedPointEmulationNumModuli() == 0u);
-    /* ADP target precision: handle setter (>0) > type-specific env var > type default. */
-    result.adp_mantissa_bits = (emu.adp_mantissa_bits > 0)
-                                   ? emu.adp_mantissa_bits
-                                   : fixedPointEmulationAdpMantissaBits(type_a);
+    /* dynamic_mode: ADP when no fixed moduli count is set. */
+    {
+        const int desc_nm = desc ? desc->emulation_num_moduli : -1;
+        result.dynamic_mode = (desc_nm < 2) && (fixedPointEmulationNumModuli() == 0u);
+    }
 
-    /* Strategy (eager vs performant). */
-    const bool eager
-        = (emu.strategy == 2) || (emu.strategy != 1 && fixedPointEmulationIsEager());
-    if(eager || fixedPointEmulationPerformanceCheck(h, type_a, opA, opB, m, n, k, workspace_bytes))
+    /* ADP target precision.
+     * Priority: desc->emulation_mantissa_bits (> 0) > type-specific env var. */
+    {
+        const int desc_bits = desc ? desc->emulation_mantissa_bits : 0;
+        result.adp_mantissa_bits = (desc_bits > 0)
+                                       ? desc_bits
+                                       : fixedPointEmulationAdpMantissaBits(type_a);
+    }
+
+    /* Strategy (eager vs performant).
+     * Priority: desc->emulation_strategy (non-sentinel) > env var. */
+    {
+        const int desc_strat = desc ? desc->emulation_strategy : -1;
+        const bool eager = (desc_strat == 2) || (desc_strat != 1 && fixedPointEmulationIsEager());
+    if(eager || fixedPointEmulationPerformanceCheck(h, desc, type_a, opA, opB, m, n, k, workspace_bytes))
     {
         result.apply = true;
         /* Store the caller's workspace preference so fixedPointEmulationWorkspaceSize
@@ -3166,22 +3158,23 @@ FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle*
          * allocated.                                       */
         result.workspace_cap = workspace_bytes;
     }
+    } /* end strategy block */
 
     return result;
 }
 
-unsigned fixedPointEmulationEffectiveNumModuli(const _rocblaslt_handle* h)
+unsigned fixedPointEmulationEffectiveNumModuli(const _rocblaslt_matmul_desc* desc)
 {
     using namespace FixedPointEmulation;
-    /* Priority: handle setter > env var > built-in default (16 = ADP upper bound).
-     * handle ∈ [2..18] → FIXED from handle.
-     * handle == -1 (sentinel) → check env var; if absent → default 16 for ADP.  */
-    if(h->emulation.num_moduli >= 2 && h->emulation.num_moduli <= static_cast<int>(S_MAX))
-        return static_cast<unsigned>(h->emulation.num_moduli);
+    /* Priority: desc field in [2..18] -> FIXED from desc.
+     * desc field == -1 (sentinel) -> check env var; if absent -> S_MAX for ADP. */
+    if(desc && desc->emulation_num_moduli >= 2
+       && desc->emulation_num_moduli <= static_cast<int>(S_MAX))
+        return static_cast<unsigned>(desc->emulation_num_moduli);
     const unsigned env_s = fixedPointEmulationNumModuli();
-    /* 0 = env var absent → ADP mode: return S_MAX as the moduli upper bound.
+    /* 0 = env var absent -> ADP mode: return S_MAX as the moduli upper bound.
      * ADP selects the actual per-call s from the data; the workspace always
-     * uses S_MAX.  Fixed env var → use that exact count.                    */
+     * uses S_MAX.  Fixed env var -> use that exact count.                   */
     return env_s != 0u ? env_s : S_MAX;
 }
 
@@ -3212,7 +3205,8 @@ size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
      * implementation goes to the monolithic path.  The monolithic path needs the full
      * (m, n) workspace, which is larger than max(WS(half), WS(half)), resulting in
      * the workspace being under-allocated and a buffer overflow at runtime.           */
-    const unsigned split_num_moduli = fixedPointEmulationEffectiveNumModuli(h);
+    /* split_num_moduli matches settings.num_moduli in emulated_gemm_impl (= decision.num_moduli). */
+    const unsigned split_num_moduli = decision.num_moduli;
     /* When the fused kernel is forced (HIPBLASLT_EMULATION_FUSED=on/force), use the
      * fused chunk formula (excludes C32i from workspace budget).  This eliminates
      * binary-halving for all practical shapes, avoiding per-leaf pipeline overhead.
@@ -3323,8 +3317,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
      * env var absent → substitute the ADP default of 16.                      */
     const unsigned num_moduli  = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
                                      ? settings.num_moduli
-                                     : fixedPointEmulationEffectiveNumModuli(
-                                           reinterpret_cast<const _rocblaslt_handle*>(handle));
+                                     : fixedPointEmulationEffectiveNumModuli(nullptr);
     const int      device      = h->device;
 
     FixedPointEmulationSettings effectiveSettings = settings;
@@ -3380,8 +3373,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
          * In EAGER mode the gate is skipped so small N problems (where the
          * performance model is inaccurate and incorrectly predicts emulation
          * is slower) still proceed with emulation as the user requested.      */
-        const bool is_eager_g = (h->emulation.strategy == 2) ||
-                                 (h->emulation.strategy != 1 && fixedPointEmulationIsEager());
+        const bool is_eager_g = settings.eager;
 
         /* ADP-aware performance model s: use the minimum s satisfying the precision
          * target (adp_bits + 2 safety bits) instead of S_MAX in dynamic mode.      */
@@ -3634,22 +3626,24 @@ int fixedPointEmulationAdpMantissaBits(hipDataType type_a)
 /* Unified performance check — dispatches on type_a.
  * Uses FP32-specific ai_fp32/ratio_fp32 for HIP_R_32F (Step 7),
  * and FP64-specific ai/ratio for HIP_R_64F.                              */
-bool fixedPointEmulationPerformanceCheck(const _rocblaslt_handle* h,
-                                          hipDataType              type_a,
-                                          hipblasOperation_t       opA,
-                                          hipblasOperation_t       opB,
-                                          int64_t                  m,
-                                          int64_t                  n,
-                                          int64_t                  k,
-                                          size_t                   workspace_bytes)
+bool fixedPointEmulationPerformanceCheck(const _rocblaslt_handle*      h,
+                                          const _rocblaslt_matmul_desc* desc,
+                                          hipDataType                   type_a,
+                                          hipblasOperation_t            opA,
+                                          hipblasOperation_t            opB,
+                                          int64_t                       m,
+                                          int64_t                       n,
+                                          int64_t                       k,
+                                          size_t                        workspace_bytes)
 {
     using namespace FixedPointEmulation;
     const int  device = h->device;
     const bool tA     = (opA != HIPBLAS_OP_N);
     const bool tB     = (opB != HIPBLAS_OP_N);
-    /* ADP mode: handle is at sentinel AND env var absent. */
-    const bool     dyn        = (h->emulation.num_moduli < 2) && (fixedPointEmulationNumModuli() == 0u);
-    const unsigned num_moduli = fixedPointEmulationEffectiveNumModuli(h);
+    /* ADP mode: no fixed moduli set in desc or env var. */
+    const int  desc_nm = desc ? desc->emulation_num_moduli : -1;
+    const bool     dyn        = (desc_nm < 2) && (fixedPointEmulationNumModuli() == 0u);
+    const unsigned num_moduli = fixedPointEmulationEffectiveNumModuli(desc);
     /* Use type-specific performance model (FP32 vs FP64) so the gate correctly
      * compares emulation time against native SGEMM or DGEMM respectively.
      * Use ADP-aware s estimate to avoid overestimating emulation cost in dynamic mode. */
@@ -3664,16 +3658,17 @@ bool fixedPointEmulationPerformanceCheck(const _rocblaslt_handle* h,
 
 /* Convenience wrapper: returns true when emulation would be applied for this
  * type and problem (enabled + device supported + strategy gate passes).      */
-bool fixedPointEmulationWouldApply(const _rocblaslt_handle* h,
-                                    hipDataType              type_a,
-                                    hipblasOperation_t       opA,
-                                    hipblasOperation_t       opB,
-                                    int64_t                  m,
-                                    int64_t                  n,
-                                    int64_t                  k,
-                                    int32_t                  batch_count)
+bool fixedPointEmulationWouldApply(const _rocblaslt_handle*      h,
+                                    const _rocblaslt_matmul_desc* desc,
+                                    hipDataType                   type_a,
+                                    hipblasOperation_t            opA,
+                                    hipblasOperation_t            opB,
+                                    int64_t                       m,
+                                    int64_t                       n,
+                                    int64_t                       k,
+                                    int32_t                       batch_count)
 {
-    return fixedPointEmulationDecision(h, type_a, opA, opB, m, n, k, batch_count,
+    return fixedPointEmulationDecision(h, desc, type_a, opA, opB, m, n, k, batch_count,
                                         /*workspace_bytes=*/~size_t{0u}).apply;
 }
 
@@ -3709,7 +3704,7 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
     const _rocblaslt_handle* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
     const unsigned num_moduli  = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
                                      ? settings.num_moduli
-                                     : fixedPointEmulationEffectiveNumModuli(h);
+                                     : fixedPointEmulationEffectiveNumModuli(nullptr);
     const int device = h->device;
 
     FixedPointEmulationSettings effectiveSettings = settings;
@@ -3752,8 +3747,7 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
         }
         else { W_var = W_var1; }
 
-        const bool is_eager_g = (h->emulation_fp32.strategy == 2) ||
-                                 (h->emulation_fp32.strategy != 1 && fixedPointEmulationIsEager());
+        const bool is_eager_g = settings.eager;
 
         /* ADP-aware performance model s: use the minimum s satisfying the precision
          * target (adp_bits + 2 safety bits) instead of S_MAX in dynamic mode.      */

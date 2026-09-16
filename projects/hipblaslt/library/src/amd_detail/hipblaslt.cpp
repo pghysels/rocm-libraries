@@ -534,7 +534,7 @@ try
         const hipDataType type_a      = A_layout->type;
 
         const FixedPointEmulationDecision emulDecision =
-            fixedPointEmulationDecision(h, type_a, desc_ptr->op_A, desc_ptr->op_B, m, n, k, batch_count,
+            fixedPointEmulationDecision(h, desc_ptr, type_a, desc_ptr->op_A, desc_ptr->op_B, m, n, k, batch_count,
                                           reinterpret_cast<const _rocblaslt_matmul_preference*>(pref)->max_workspace_bytes);
         if(emulDecision.status != rocblaslt_status_success)
             return RocBlasLtStatusToHIPStatus(emulDecision.status);
@@ -834,150 +834,34 @@ catch(...)
 }
 
 /* =========================================================================
- * FP64 emulation handle-level API
+ * Emulation API — per-matmul settings via HIPBLASLT_MATMUL_DESC_EMULATION_*_EXT
+ * See hipblasLtMatmulDescSetAttribute / hipblasLtMatmulDescGetAttribute.
+ * The old handle-level setters have been removed; use matmul desc attributes.
  * ========================================================================= */
 
-hipblasStatus_t hipblasLtSetEmulationEnabled(hipblasLtHandle_t handle, bool enabled)
-try
-{
-    if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    h->emulation.enabled      = enabled ? 1 : 0;
-    h->emulation_fp32.enabled = enabled ? 1 : 0;
-    return HIPBLAS_STATUS_SUCCESS;
-}
-catch(...)
-{
-    return exception_to_hipblas_status();
-}
-
-hipblasStatus_t hipblasLtSetEmulationStrategy(hipblasLtHandle_t            handle,
-                                              hipblasLtEmulationStrategy_t strategy)
-try
-{
-    if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    if(strategy < HIPBLASLT_EMULATION_STRATEGY_DEFAULT
-       || strategy > HIPBLASLT_EMULATION_STRATEGY_EAGER)
-        return HIPBLAS_STATUS_INVALID_VALUE;
-    h->emulation.strategy      = static_cast<int>(strategy);
-    h->emulation_fp32.strategy = static_cast<int>(strategy);
-    return HIPBLAS_STATUS_SUCCESS;
-}
-catch(...)
-{
-    return exception_to_hipblas_status();
-}
-
-hipblasStatus_t hipblasLtGetEmulationStrategy(hipblasLtHandle_t             handle,
-                                              hipblasLtEmulationStrategy_t* strategy)
-try
-{
-    if(handle == nullptr || strategy == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    auto* h    = reinterpret_cast<_rocblaslt_handle*>(handle);
-    int   raw  = h->emulation.strategy;
-    *strategy  = (raw < 0)
-                     ? HIPBLASLT_EMULATION_STRATEGY_DEFAULT
-                     : static_cast<hipblasLtEmulationStrategy_t>(raw);
-    return HIPBLAS_STATUS_SUCCESS;
-}
-catch(...)
-{
-    return exception_to_hipblas_status();
-}
-
-
-
-hipblasStatus_t hipblasLtSetEmulationNumModuli(hipblasLtHandle_t handle, int numModuli)
-try
-{
-    if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    /* -1 = reset to ADP (default); [2..20] = FIXED with exactly numModuli moduli. */
-    if(numModuli != -1 && (numModuli < 2 || numModuli > 20))
-        return HIPBLAS_STATUS_INVALID_VALUE;
-    auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    h->emulation.num_moduli      = numModuli;
-    h->emulation_fp32.num_moduli = numModuli;
-    /* Warn once per process when FIXED mode is selected. */
-    if(numModuli >= 2)
-    {
-        static std::atomic<bool> fixed_warned{false};
-        if(!fixed_warned.exchange(true, std::memory_order_relaxed))
-            std::fprintf(stderr,
-                "[hipBLASLt WARNING] FP64 emulation FIXED mode selected.\n"
-                "  FIXED mode does NOT guarantee numerical accuracy or correctness.\n"
-                "  CRT sign flips can occur for inputs with large dynamic range.\n"
-                "  Use ADP mode (the default) for reliable results.\n"
-                "  Only use FIXED mode if you have validated it for your specific inputs.\n");
-    }
-    return HIPBLAS_STATUS_SUCCESS;
-}
-catch(...)
-{
-    return exception_to_hipblas_status();
-}
-
-hipblasStatus_t hipblasLtSetEmulationSpecialValuesSupport(hipblasLtHandle_t handle,
-                                                          unsigned int      mask)
-try
-{
-    if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    h->emulation.special_values_mask      = mask;
-    h->emulation_fp32.special_values_mask = mask;
-    return HIPBLAS_STATUS_SUCCESS;
-}
-catch(...)
-{
-    return exception_to_hipblas_status();
-}
-
-
-hipblasStatus_t hipblasLtSetEmulationTolerance(hipblasLtHandle_t handle, double tolerance)
-try
-{
-    if(handle == nullptr) return HIPBLAS_STATUS_INVALID_VALUE;
-    auto* h = reinterpret_cast<_rocblaslt_handle*>(handle);
-    /* tolerance <= 0 or > 1 resets to the process-wide env var default (sentinel 0). */
-    if(tolerance <= 0.0 || tolerance > 1.0)
-    {
-        h->emulation.adp_mantissa_bits      = 0;
-        h->emulation_fp32.adp_mantissa_bits = 0;
-    }
-    else
-    {
-        const int bits = static_cast<int>(std::floor(-std::log2(tolerance)));
-        /* Clamp to [1, 52]: 52 = full FP64 precision. */
-        h->emulation.adp_mantissa_bits      = std::max(1, std::min(bits, 52));
-        h->emulation_fp32.adp_mantissa_bits = std::max(1, std::min(bits, 52));
-    }
-    return HIPBLAS_STATUS_SUCCESS;
-}
-catch(...)
-{
-    return exception_to_hipblas_status();
-}
-
-size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t  handle,
-                                           hipblasOperation_t opA,
-                                           hipblasOperation_t opB,
-                                           int64_t            m,
-                                           int64_t            n,
-                                           int64_t            k)
+size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t     handle,
+                                       hipblasLtMatmulDesc_t matmulDesc,
+                                       hipblasOperation_t    opA,
+                                       hipblasOperation_t    opB,
+                                       int64_t               m,
+                                       int64_t               n,
+                                       int64_t               k)
 try
 {
     if(m < 0 || n < 0 || k < 0) return 0;
-    /* Resolve all handle settings via the canonical decision function.
+    /* Resolve emulation settings via the canonical decision function.
+     * Reads from matmulDesc (if non-null) then falls back to env vars.
      * Checks FP64 first, then FP32 — the workspace formula is type-independent
      * (depends only on m, n, k, and num_moduli), so the first applicable type
      * returns the correct size for either data type.
      * batch_count=1 because emulation only supports non-batched GEMMs.
      * Returns 0 when no type has emulation enabled or the device is unsupported. */
-    const auto* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
+    const auto* h    = reinterpret_cast<const _rocblaslt_handle*>(handle);
+    const auto* desc = reinterpret_cast<const _rocblaslt_matmul_desc*>(matmulDesc);
     for(hipDataType t : {HIP_R_64F, HIP_R_32F})
     {
         const FixedPointEmulationDecision d =
-            fixedPointEmulationDecision(h, t, opA, opB, m, n, k, 1, ~size_t{0});
+            fixedPointEmulationDecision(h, desc, t, opA, opB, m, n, k, 1, ~size_t{0});
         if(d.status != rocblaslt_status_success || !d.apply) continue;
         return fixedPointEmulationWorkspaceSize(h, t, opA, opB, m, n, k, d);
     }

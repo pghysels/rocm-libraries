@@ -109,34 +109,6 @@ struct _rocblaslt_handle
     int   useRocRoller     = -1;
 #endif
 
-    /* FP64/FP32 emulation (Ozaki Scheme II / Fixed-Point Emulation) — per-handle overrides.
-     *
-     * Setting precedence (highest to lowest):
-     *   1. Handle setter (hipblasLtSet* functions) — permanently overrides env var
-     *      for the lifetime of this handle.
-     *   2. Environment variable — read once at first use, process-wide default.
-     *   3. Built-in default (ADP mode, S_MAX moduli, special-values mask = 0x3).
-     *
-     * Sentinel values (-1 / ~0u) mean "use the process-wide env var default".
-     * Calling any hipblasLtSet* function writes a non-sentinel value, disabling
-     * the env-var fallback for that setting on this handle.
-     *
-     * num_moduli: -1    = sentinel/ADP (env var or built-in default = ADP mode)
-     *             2..20 = FIXED with exactly that many moduli
-     * adp_mantissa_bits: FP64 default=52, FP32 default=23; 0=env var     */
-    struct EmulationSettings {
-        int          enabled;               /* 1=force on, 0=force off, -1=env var (default) */
-        int          strategy;              /* 0=DEFAULT, 1=PERFORMANT, 2=EAGER; -1=env var */
-        int          num_moduli;            /* 2..20=FIXED; -1=ADP/sentinel (env var or default) */
-        unsigned int special_values_mask;   /* Inf/NaN mask; ~0u=env var */
-        int          adp_mantissa_bits;     /* ADP target precision in mantissa bits; 0=env var */
-    };
-    /* FP64 emulation settings (reads HIPBLASLT_EMULATE_DOUBLE_PRECISION etc.). */
-    EmulationSettings emulation    = {-1, -1, -1, ~0u, 0};
-    /* FP32 emulation settings (reads HIPBLASLT_EMULATE_SINGLE_PRECISION etc.).
-     * adp_mantissa_bits default: 23 (full IEEE 754 FP32 precision).       */
-    EmulationSettings emulation_fp32 = {-1, -1, -1, ~0u, 0};
-
     // HIPBLASLT_CHECK_NUMERICS state. Read once in the ctor; opt-in via env.
     // See check_numerics_matrix.hpp for the scanner protocol.
     hipblaslt_check_numerics_mode check_numerics = hipblaslt_check_numerics_mode_no_check;
@@ -251,38 +223,56 @@ struct _rocblaslt_matmul_desc
     // Default value is 0 which means same bias vector will be used across all batches (broadcast).
     int32_t bias_stride = 0;
 
+    /* Per-matmul emulation settings (HIPBLASLT_MATMUL_DESC_EMULATION_*_EXT).
+     * Sentinel values mean "inherit from env var / built-in default":
+     *   emulation_enabled          : -1 = inherit, 0 = force off, 1 = force on
+     *   emulation_strategy         : -1 = inherit, 0/1/2 = DEFAULT/PERFORMANT/EAGER
+     *   emulation_num_moduli       : -1 = ADP/inherit, 2..20 = FIXED
+     *   emulation_sv_mask          : ~0u = inherit (default=0x3)
+     *   emulation_mantissa_bits: 0 = inherit, 1..52 = explicit bit count     */
+    int          emulation_enabled       = -1;
+    int          emulation_strategy      = -1;
+    int          emulation_num_moduli    = -1;
+    unsigned int emulation_sv_mask       = ~0u;
+    int          emulation_mantissa_bits = 0;
+
     std::shared_ptr<void> m_data; // Tensile data
 
     void copy(const _rocblaslt_matmul_desc& src)
     {
-        this->op_A                    = src.op_A;
-        this->op_B                    = src.op_B;
-        this->epilogue                = src.epilogue;
-        this->bias                    = src.bias;
-        this->scaleA                  = src.scaleA;
-        this->scaleB                  = src.scaleB;
-        this->scaleC                  = src.scaleC;
-        this->scaleD                  = src.scaleD;
-        this->scaleE                  = src.scaleE;
-        this->scaleAType              = src.scaleAType;
-        this->scaleBType              = src.scaleBType;
-        this->pointermode             = src.pointermode;
-        this->amaxD                   = src.amaxD;
-        this->bias_type               = src.bias_type;
-        this->e                       = src.e;
-        this->aux_type                = src.aux_type;
-        this->lde                     = src.lde;
-        this->stride_e                = src.stride_e;
-        this->compute_type            = src.compute_type;
-        this->compute_type_original   = src.compute_type_original;
-        this->compute_input_typeA     = src.compute_input_typeA;
-        this->compute_input_typeB     = src.compute_input_typeB;
-        this->scale_type              = src.scale_type;
-        this->act0                    = src.act0;
-        this->act1                    = src.act1;
-        this->sm_count_target         = src.sm_count_target;
+        this->op_A                        = src.op_A;
+        this->op_B                        = src.op_B;
+        this->epilogue                    = src.epilogue;
+        this->bias                        = src.bias;
+        this->scaleA                      = src.scaleA;
+        this->scaleB                      = src.scaleB;
+        this->scaleC                      = src.scaleC;
+        this->scaleD                      = src.scaleD;
+        this->scaleE                      = src.scaleE;
+        this->scaleAType                  = src.scaleAType;
+        this->scaleBType                  = src.scaleBType;
+        this->pointermode                 = src.pointermode;
+        this->amaxD                       = src.amaxD;
+        this->bias_type                   = src.bias_type;
+        this->e                           = src.e;
+        this->aux_type                    = src.aux_type;
+        this->lde                         = src.lde;
+        this->stride_e                    = src.stride_e;
+        this->compute_type                = src.compute_type;
+        this->compute_type_original       = src.compute_type_original;
+        this->compute_input_typeA         = src.compute_input_typeA;
+        this->compute_input_typeB         = src.compute_input_typeB;
+        this->scale_type                  = src.scale_type;
+        this->act0                        = src.act0;
+        this->act1                        = src.act1;
+        this->sm_count_target             = src.sm_count_target;
         this->streamk_tile_scheduling_ext = src.streamk_tile_scheduling_ext;
-        this->bias_stride             = src.bias_stride;
+        this->bias_stride                 = src.bias_stride;
+        this->emulation_enabled           = src.emulation_enabled;
+        this->emulation_strategy          = src.emulation_strategy;
+        this->emulation_num_moduli        = src.emulation_num_moduli;
+        this->emulation_sv_mask           = src.emulation_sv_mask;
+        this->emulation_mantissa_bits     = src.emulation_mantissa_bits;
     }
 };
 

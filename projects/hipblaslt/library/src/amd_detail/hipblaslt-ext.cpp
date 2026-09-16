@@ -1110,7 +1110,7 @@ namespace hipblaslt_ext
              * total workspace so callers can pre-allocate it.                */
             const auto* h = reinterpret_cast<const _rocblaslt_handle*>(m_handle);
             const FixedPointEmulationDecision emulDecision =
-                fixedPointEmulationDecision(h, problemtype.getTypeA(),
+                fixedPointEmulationDecision(h, nullptr, problemtype.getTypeA(),
                                       problemtype.getOpA(), problemtype.getOpB(),
                                       m, n, k, batch_count, ~size_t{0});
             m_emul_workspace_bytes = emulDecision.apply
@@ -1168,7 +1168,7 @@ namespace hipblaslt_ext
                                      : static_cast<int64_t>(A_layout->m);
             const int32_t batch = A_layout->batch_count;
             const FixedPointEmulationDecision emulDecision =
-                fixedPointEmulationDecision(h, A_layout->type,
+                fixedPointEmulationDecision(h, desc_ptr, A_layout->type,
                                       desc_ptr->op_A, desc_ptr->op_B,
                                       m_sz, n_sz, k_sz, batch, ~size_t{0});
             m_emul_workspace_bytes = emulDecision.apply

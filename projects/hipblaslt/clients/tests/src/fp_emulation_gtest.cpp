@@ -25,7 +25,7 @@
  *******************************************************************************/
 
 //
-// Light, fast unit tests for the FP64 (Ozaki Scheme II) emulation path.
+// Light, fast unit tests for the FP64/FP32 (Ozaki Scheme II) emulation path.
 //
 //   ./hipblaslt-test --gtest_filter='*FixedPointEmulation*'
 //
@@ -54,6 +54,24 @@
 
 namespace
 {
+
+    /* Set emulation enabled (1=on, 0=off) on a matmul descriptor. */
+    inline void emulSetEnabled(hipblasLtMatmulDesc_t desc, int val) {
+        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_EMULATION_ENABLED_EXT,
+                                        &val, sizeof(val));
+    }
+    /* Set emulation strategy on a matmul descriptor. */
+    inline void emulSetStrategy(hipblasLtMatmulDesc_t desc, hipblasLtEmulationStrategy_t s) {
+        int32_t v = static_cast<int32_t>(s);
+        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_EMULATION_STRATEGY_EXT,
+                                        &v, sizeof(v));
+    }
+    /* Set fixed moduli count (-1=ADP, 2..20=FIXED) on a matmul descriptor. */
+    inline void emulSetNumModuli(hipblasLtMatmulDesc_t desc, int32_t n) {
+        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_EMULATION_NUM_MODULI_EXT,
+                                        &n, sizeof(n));
+    }
+
     // Returns true only when a HIP device exists AND it is in the emulation
     // hardware support table.  Uses EAGER to bypass the cost model so the probe
     // GEMM size (16³) never influences the result — only the device table check
@@ -68,11 +86,17 @@ namespace
         hipblasLtHandle_t h = nullptr;
         if(hipblasLtCreate(&h) != HIPBLAS_STATUS_SUCCESS)
             return false;
-        hipblasLtSetEmulationEnabled(h, true);
-        hipblasLtSetEmulationStrategy(h, HIPBLASLT_EMULATION_STRATEGY_EAGER);
+        /* Check device support using a temporary matmul desc with eager emulation. */
+        hipblasLtMatmulDesc_t _tmpDesc = nullptr;
+        hipblasLtMatmulDescCreate(&_tmpDesc, HIPBLAS_COMPUTE_64F, HIP_R_64F);
+        emulSetEnabled(_tmpDesc, 1);
+        emulSetStrategy(_tmpDesc, HIPBLASLT_EMULATION_STRATEGY_EAGER);
+        const auto* _h = reinterpret_cast<const _rocblaslt_handle*>(h);
+        const _rocblaslt_matmul_desc* _dp = reinterpret_cast<const _rocblaslt_matmul_desc*>(_tmpDesc);
         const FixedPointEmulationDecision d = fixedPointEmulationDecision(
-            reinterpret_cast<const _rocblaslt_handle*>(h),
+            _h, _dp,
             HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, 16, 16, 16, 1, ~size_t{0});
+        hipblasLtMatmulDescDestroy(_tmpDesc);
         hipblasLtDestroy(h);
         return d.apply;
     }
@@ -154,34 +178,41 @@ namespace
                 GTEST_SKIP() << "No HIP device or device not supported by emulation";
             ASSERT_EQ(hipblasLtCreate(&m_handle), HIPBLAS_STATUS_SUCCESS);
             m_roc = reinterpret_cast<const _rocblaslt_handle*>(m_handle);
+            ASSERT_EQ(hipblasLtMatmulDescCreate(&m_emul_desc, HIPBLAS_COMPUTE_64F, HIP_R_64F),
+                      HIPBLAS_STATUS_SUCCESS);
+            /* Default: eager emulation enabled */
+            emulSetEnabled(m_emul_desc, 1);
+            emulSetStrategy(m_emul_desc, HIPBLASLT_EMULATION_STRATEGY_EAGER);
         }
 
         void TearDown() override
         {
-            if(m_handle)
-                hipblasLtDestroy(m_handle);
+            if(m_emul_desc) hipblasLtMatmulDescDestroy(m_emul_desc);
+            if(m_handle) hipblasLtDestroy(m_handle);
         }
 
         void set_enabled(bool on)
         {
-            ASSERT_EQ(hipblasLtSetEmulationEnabled(m_handle, on), HIPBLAS_STATUS_SUCCESS);
+            emulSetEnabled(m_emul_desc, on ? 1 : 0);
         }
 
         void set_strategy(hipblasLtEmulationStrategy_t s)
         {
-            ASSERT_EQ(hipblasLtSetEmulationStrategy(m_handle, s), HIPBLAS_STATUS_SUCCESS);
+            emulSetStrategy(m_emul_desc, s);
         }
 
         bool would_apply(hipDataType t, int64_t m, int64_t n, int64_t k, int32_t batch)
         {
             const FixedPointEmulationDecision decision
-                = fixedPointEmulationDecision(m_roc, t, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, batch, ~size_t{0});
+                = fixedPointEmulationDecision(m_roc, reinterpret_cast<const _rocblaslt_matmul_desc*>(m_emul_desc),
+                                              t, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, batch, ~size_t{0});
             EXPECT_EQ(decision.status, rocblaslt_status_success);
             return decision.apply;
         }
 
-        hipblasLtHandle_t        m_handle = nullptr;
-        const _rocblaslt_handle* m_roc    = nullptr;
+        hipblasLtHandle_t        m_handle    = nullptr;
+        hipblasLtMatmulDesc_t    m_emul_desc = nullptr;
+        const _rocblaslt_handle* m_roc       = nullptr;
     };
 
     // Workspace must be non-empty and not shrink as the moduli count grows.
@@ -217,13 +248,13 @@ namespace
     TEST_F(FixedPointEmulationTest, PublicWorkspaceSizeRejectsNegativeDimensions)
     {
         EXPECT_EQ(
-            hipblasLtEmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, -1, 64, 64),
+            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, -1, 64, 64),
             0u);
         EXPECT_EQ(
-            hipblasLtEmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, -1, 64),
+            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, -1, 64),
             0u);
         EXPECT_EQ(
-            hipblasLtEmulationWorkspaceSize(m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, -1),
+            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, -1),
             0u);
     }
 
@@ -311,10 +342,11 @@ namespace
 
         const double          alpha = 1.0, beta = 0.0;
         FixedPointEmulationSettings settings{};
+        settings.eager          = true; /* bypass perf gate in direct test calls */
+
         settings.num_moduli      = 0; // derive from env/default
         settings.sv_mask         = 0; // skip Inf/NaN check (faster, inputs are finite)
-        const size_t _ws_size_A = hipblasLtEmulationWorkspaceSize(
-            m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+        const size_t _ws_size_A = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
         void* _d_ws_A = nullptr;
         if (_ws_size_A > 0) (void)hipMalloc(&_d_ws_A, _ws_size_A);
         settings.workspace       = _d_ws_A;
@@ -366,7 +398,7 @@ namespace
     // -----------------------------------------------------------------------
     // Accuracy regression tests: emulated DGEMM vs native FP64 DGEMM reference.
     //
-    // Covers all 17 moduli counts s = 2..18 (including odd values).
+    // Covers all 19 moduli counts s = 2..20 (including odd values).
     //
     // Design rationale:
     //   • m, n are small (64 or 128) to keep device-to-host transfer fast.
@@ -394,7 +426,7 @@ namespace
 
     struct EmulAccuracyParam
     {
-        unsigned           s; /* num_moduli (2..18)                   */
+        unsigned           s; /* num_moduli (2..20)                   */
         int64_t            m, n, k; /* matrix dimensions                    */
         double             threshold; /* max relative error vs native DGEMM   */
         FillStyle          fill; /* input distribution                   */
@@ -588,9 +620,8 @@ namespace
         /* ── Emulation handle (s moduli, eager strategy) ─────────────────── */
         hipblasLtHandle_t hem = nullptr;
         ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
-                  HIPBLAS_STATUS_SUCCESS);
+        /* emulation enabled=true now set on matmul desc; see emulSetEnabled() */
+        /* emulation strategy=HIPBLASLT_EMULATION_STRATEGY_EAGER now set on matmul desc; see emulSetStrategy() */
 
         /* ── Native DGEMM reference handle + layouts ─────────────────────── */
         hipblasLtHandle_t                hnat = nullptr;
@@ -634,12 +665,22 @@ namespace
 
         /* ── Emulation settings (use settings.num_moduli directly) ──────── */
         FixedPointEmulationSettings emu_settings{};
+        emu_settings.eager          = true; /* bypass perf gate in direct test calls */
+
         emu_settings.num_moduli      = p.s;
         emu_settings.sv_mask         = 0u; /* skip Inf/NaN detection */
         emu_settings.dynamic_mode    = p.dynamic_mode;
         /* Allocate workspace for this GEMM configuration */
-        const size_t _emu_ws_sz = hipblasLtEmulationWorkspaceSize(
-            hem, p.opA, p.opB, p.m, p.n, p.k);
+        /* Query workspace size using a temp desc with emulation enabled. */
+        const size_t _emu_ws_sz = [&]() -> size_t {
+            hipblasLtMatmulDesc_t _wd = nullptr;
+            hipblasLtMatmulDescCreate(&_wd, HIPBLAS_COMPUTE_64F, HIP_R_64F);
+            emulSetEnabled(_wd, 1);
+            emulSetStrategy(_wd, HIPBLASLT_EMULATION_STRATEGY_EAGER);
+            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, p.opA, p.opB, p.m, p.n, p.k);
+            hipblasLtMatmulDescDestroy(_wd);
+            return _sz;
+        }();
         void* _d_emu_ws = nullptr;
         if (_emu_ws_sz > 0) (void)hipMalloc(&_d_emu_ws, _emu_ws_sz);
         emu_settings.workspace       = _d_emu_ws;
@@ -1089,15 +1130,14 @@ namespace
     //
     // For b=32, n=128 the ADP reduction computes:
     //   log2P_needed ≈ (52 − sftA_init) + 0.5·log2(row_max_prelim)
-    //                ≈ (52+27) + 0.5·log2(~300) ≈ 79 + 4 = 83 >> log2P_18 = 68.7
+    //                ≈ (52+27) + 0.5·log2(~300) ≈ 79 + 4 = 83 >> log2P_20 ≈ 76.2
     // fp64EmulatedGemm must return rocblaslt_status_invalid_value so the caller
     // falls back to native DGEMM rather than silently producing a wrong result.
     TEST_F(FixedPointEmulationTest, DemmelAdpFallback_b32_n128)
     {
         set_enabled(true);
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
-        ASSERT_EQ(hipblasLtSetEmulationNumModuli(m_handle, -1) /* ADP mode */,
-                  HIPBLAS_STATUS_SUCCESS);
+        /* emulation num_moduli=-1 now set on matmul desc; see emulSetNumModuli() */;
 
         constexpr int    n = 128, b = 32;
         constexpr size_t N2    = static_cast<size_t>(n) * n;
@@ -1116,12 +1156,13 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
         FixedPointEmulationSettings emu_settings{};
+        emu_settings.eager          = true; /* bypass perf gate in direct test calls */
+
         emu_settings.num_moduli      = 16u; /* ADP upper bound */
         emu_settings.sv_mask         = 0u; /* skip Inf/NaN detection */
         emu_settings.dynamic_mode    = true; /* enable ADP */
         /* Allocate workspace for ADP test */
-        const size_t _adp_ws_sz = hipblasLtEmulationWorkspaceSize(
-            m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n);
+        const size_t _adp_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n);
         void* _d_adp_ws = nullptr;
         if (_adp_ws_sz > 0) (void)hipMalloc(&_d_adp_ws, _adp_ws_sz);
         emu_settings.workspace       = _d_adp_ws;
@@ -1157,7 +1198,7 @@ namespace
         // (The caller — rocblaslt_mat.cpp — would then fall back to native DGEMM.)
         EXPECT_EQ(st, rocblaslt_status_invalid_value)
             << "ADP for b=" << b << " n=" << n
-            << " should detect log2P_needed > log2P_18 and return invalid_value,"
+            << " should detect log2P_needed > log2P_20 and return invalid_value,"
             << " but got status=" << static_cast<int>(st);
     }
 
@@ -1181,7 +1222,7 @@ namespace
 
     struct EmulDemmelParam
     {
-        unsigned s; /* num_moduli (2..18)           */
+        unsigned s; /* num_moduli (2..20)           */
         int      n; /* square matrix side (≤ 128)   */
         int      b; /* exponent half-range (≤ 15)   */
         double   threshold; /* max rel error over all n² el */
@@ -1248,16 +1289,25 @@ namespace
 
         hipblasLtHandle_t hem = nullptr;
         ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
-                  HIPBLAS_STATUS_SUCCESS);
+        /* emulation enabled=true now set on matmul desc; see emulSetEnabled() */
+        /* emulation strategy=HIPBLASLT_EMULATION_STRATEGY_EAGER now set on matmul desc; see emulSetStrategy() */
 
         FixedPointEmulationSettings emu_settings{};
+        emu_settings.eager          = true; /* bypass perf gate in direct test calls */
+
         emu_settings.num_moduli      = p.s;
         emu_settings.sv_mask         = 0u;
         /* Allocate workspace for Demmel test */
-        const size_t _dem_ws_sz = hipblasLtEmulationWorkspaceSize(
-            hem, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+        /* Query workspace size using a temp desc with emulation enabled. */
+        const size_t _dem_ws_sz = [&]() -> size_t {
+            hipblasLtMatmulDesc_t _wd = nullptr;
+            hipblasLtMatmulDescCreate(&_wd, HIPBLAS_COMPUTE_64F, HIP_R_64F);
+            emulSetEnabled(_wd, 1);
+            emulSetStrategy(_wd, HIPBLASLT_EMULATION_STRATEGY_EAGER);
+            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+            hipblasLtMatmulDescDestroy(_wd);
+            return _sz;
+        }();
         void* _d_dem_ws = nullptr;
         if (_dem_ws_sz > 0) (void)hipMalloc(&_d_dem_ws, _dem_ws_sz);
         emu_settings.workspace       = _d_dem_ws;
@@ -1496,18 +1546,15 @@ namespace
         /* ── Emulation handle ────────────────────────────────────────────────── */
         hipblasLtHandle_t hem = nullptr;
         ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
-                  HIPBLAS_STATUS_SUCCESS);
+        /* emulation enabled=true now set on matmul desc; see emulSetEnabled() */
+        /* emulation strategy=HIPBLASLT_EMULATION_STRATEGY_EAGER now set on matmul desc; see emulSetStrategy() */
         /* ADP mode: falls back to native FP64 if overflow detected. */
-        ASSERT_EQ(hipblasLtSetEmulationNumModuli(hem, -1) /* ADP mode */,
-                  HIPBLAS_STATUS_SUCCESS);
+        /* emulation num_moduli=-1 now set on matmul desc; see emulSetNumModuli() */;
 
         /* Skip on unsupported devices. */
         {
             const FixedPointEmulationDecision gate =
-                fixedPointEmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem),
-                                      HIP_R_64F, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N, 1, ~size_t{0});
+                fixedPointEmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem), nullptr, HIP_R_64F, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N, 1, ~size_t{0});
             if(!gate.apply)
             {
                 (void)hipblasLtDestroy(hem);
@@ -1518,11 +1565,12 @@ namespace
 
         /* ── Run emulated C = A^T × A ────────────────────────────────────────── */
         FixedPointEmulationSettings settings{};
+        settings.eager          = true; /* bypass perf gate in direct test calls */
+
         settings.num_moduli      = 0;    /* derive from handle (ADP default) */
         settings.sv_mask         = 0u;   /* skip Inf/NaN detection */
         settings.dynamic_mode    = true; /* ADP mode */
-        const size_t _illcond_ws_sz = hipblasLtEmulationWorkspaceSize(
-            hem, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N);
+        const size_t _illcond_ws_sz = hipblasLtEmulationWorkspaceSize(hem, nullptr, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N);
         void* _d_illcond_ws = nullptr;
         if (_illcond_ws_sz > 0) (void)hipMalloc(&_d_illcond_ws, _illcond_ws_sz);
         settings.workspace       = _d_illcond_ws;
@@ -1862,12 +1910,10 @@ namespace
 
         hipblasLtHandle_t hem = nullptr;
         ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationEnabled(hem, true), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationStrategy(hem, HIPBLASLT_EMULATION_STRATEGY_EAGER),
-                  HIPBLAS_STATUS_SUCCESS);
+        /* emulation enabled=true now set on matmul desc; see emulSetEnabled() */
+        /* emulation strategy=HIPBLASLT_EMULATION_STRATEGY_EAGER now set on matmul desc; see emulSetStrategy() */
         /* ADP: let the algorithm choose the number of moduli from the data */
-        ASSERT_EQ(hipblasLtSetEmulationNumModuli(hem, -1) /* ADP mode */,
-                  HIPBLAS_STATUS_SUCCESS);
+        /* emulation num_moduli=-1 now set on matmul desc; see emulSetNumModuli() */;
 
         hipblasLtHandle_t                hnat = nullptr;
         hipblasLtMatmulDesc_t            desc = nullptr;
@@ -1906,11 +1952,20 @@ namespace
         }
 
         FixedPointEmulationSettings emu_settings{};
+        emu_settings.eager          = true; /* bypass perf gate in direct test calls */
+
         emu_settings.num_moduli      = 20u; /* ADP upper bound */
         emu_settings.dynamic_mode    = true; /* ADP: select s from data */
         emu_settings.sv_mask         = 0u;
-        const size_t _struct_ws_sz = hipblasLtEmulationWorkspaceSize(
-            hem, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+        const size_t _struct_ws_sz = [&]() -> size_t {
+            hipblasLtMatmulDesc_t _wd = nullptr;
+            hipblasLtMatmulDescCreate(&_wd, HIPBLAS_COMPUTE_64F, HIP_R_64F);
+            emulSetEnabled(_wd, 1);
+            emulSetStrategy(_wd, HIPBLASLT_EMULATION_STRATEGY_EAGER);
+            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+            hipblasLtMatmulDescDestroy(_wd);
+            return _sz;
+        }();
         void* _d_struct_ws = nullptr;
         if (_struct_ws_sz > 0) (void)hipMalloc(&_d_struct_ws, _struct_ws_sz);
         emu_settings.workspace       = _d_struct_ws;
@@ -2039,8 +2094,7 @@ namespace
     {
         set_enabled(true);
         set_strategy(HIPBLASLT_EMULATION_STRATEGY_EAGER);
-        ASSERT_EQ(hipblasLtSetEmulationNumModuli(m_handle, -1) /* ADP mode */,
-                  HIPBLAS_STATUS_SUCCESS);
+        /* emulation num_moduli=-1 now set on matmul desc; see emulSetNumModuli() */;
 
         constexpr int    N     = 64;
         constexpr size_t N2    = static_cast<size_t>(N) * N;
@@ -2093,11 +2147,12 @@ namespace
         /* ── Step 1: ADP triggers at the fp64EmulatedGemm level ────────────── */
         {
             FixedPointEmulationSettings emu{};
+            emu.eager          = true; /* bypass perf gate in direct test calls */
+
             emu.num_moduli               = 16u;
             emu.sv_mask                  = 0u;
             emu.dynamic_mode             = true;
-            const size_t _adpx_ws_sz = hipblasLtEmulationWorkspaceSize(
-                m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+            const size_t _adpx_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
             void* _d_adpx_ws = nullptr;
             if (_adpx_ws_sz > 0) (void)hipMalloc(&_d_adpx_ws, _adpx_ws_sz);
             emu.workspace                = _d_adpx_ws;
@@ -2361,10 +2416,11 @@ namespace
         };
 
         FixedPointEmulationSettings settings{};
+        settings.eager          = true; /* bypass perf gate in direct test calls */
+
         settings.num_moduli      = 16u;
         settings.sv_mask         = 0u; /* inputs are finite — no Inf/NaN flag needed */
-        const size_t _bv1_ws_sz = hipblasLtEmulationWorkspaceSize(
-            m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
+        const size_t _bv1_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
         void* _d_bv1_ws = nullptr;
         if (_bv1_ws_sz > 0) (void)hipMalloc(&_d_bv1_ws, _bv1_ws_sz);
         settings.workspace       = _d_bv1_ws;
@@ -2658,10 +2714,11 @@ namespace
 
         /* Emulated */
         FixedPointEmulationSettings emu{};
+        emu.eager          = true; /* bypass perf gate in direct test calls */
+
         emu.num_moduli            = 16u;
         emu.sv_mask               = 0u;
-        const size_t _nul_ws_sz = hipblasLtEmulationWorkspaceSize(
-            m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
+        const size_t _nul_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
         void* _d_nul_ws = nullptr;
         if (_nul_ws_sz > 0) (void)hipMalloc(&_d_nul_ws, _nul_ws_sz);
         emu.workspace             = _d_nul_ws;
@@ -2750,10 +2807,11 @@ namespace
         };
 
         FixedPointEmulationSettings settings{};
+        settings.eager          = true; /* bypass perf gate in direct test calls */
+
         settings.num_moduli = 16u;
         settings.sv_mask    = 0x1u; /* enable Inf detection */
-        const size_t _sv_ws_sz = hipblasLtEmulationWorkspaceSize(
-            m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+        const size_t _sv_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
         void* _d_sv_ws = nullptr;
         if (_sv_ws_sz > 0) (void)hipMalloc(&_d_sv_ws, _sv_ws_sz);
         settings.workspace       = _d_sv_ws;
@@ -2873,11 +2931,12 @@ namespace
 
         /* Emulated with ADP, num_moduli=8 upper bound */
         FixedPointEmulationSettings emu{};
+        emu.eager          = true; /* bypass perf gate in direct test calls */
+
         emu.num_moduli            = 8u;
         emu.sv_mask               = 0u;
         emu.dynamic_mode          = true;
-        const size_t _alm_ws_sz = hipblasLtEmulationWorkspaceSize(
-            m_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+        const size_t _alm_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
         void* _d_alm_ws = nullptr;
         if (_alm_ws_sz > 0) (void)hipMalloc(&_d_alm_ws, _alm_ws_sz);
         emu.workspace             = _d_alm_ws;
@@ -2989,7 +3048,8 @@ TEST(FixedPointEmulationFp32EnvVar, AdpMantissaBitsDefaultFp64)
 class FixedPointEmulationFp32Test : public ::testing::Test
 {
 protected:
-    hipblasLtHandle_t m_handle = nullptr;
+    hipblasLtHandle_t     m_handle    = nullptr;
+    hipblasLtMatmulDesc_t m_emul_desc = nullptr;
 
     void SetUp() override
     {
@@ -2997,16 +3057,15 @@ protected:
             GTEST_SKIP() << "No HIP device or device not supported by emulation";
         if(hipblasLtCreate(&m_handle) != HIPBLAS_STATUS_SUCCESS)
             GTEST_SKIP() << "hipblasLtCreate failed";
-        /* Force eager strategy so the perf gate never blocks emulation in tests. */
-        ASSERT_EQ(hipblasLtSetEmulationEnabled(m_handle, true), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtSetEmulationStrategy(m_handle, HIPBLASLT_EMULATION_STRATEGY_EAGER),
-                  HIPBLAS_STATUS_SUCCESS);
+        hipblasLtMatmulDescCreate(&m_emul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F);
+        emulSetEnabled(m_emul_desc, 1);
+        emulSetStrategy(m_emul_desc, HIPBLASLT_EMULATION_STRATEGY_EAGER);
     }
 
     void TearDown() override
     {
-        if(m_handle)
-            hipblasLtDestroy(m_handle);
+        if(m_emul_desc) hipblasLtMatmulDescDestroy(m_emul_desc);
+        if(m_handle) hipblasLtDestroy(m_handle);
     }
 };
 
@@ -3048,13 +3107,14 @@ TEST_F(FixedPointEmulationFp32Test, CorrectnessNN)
     ASSERT_EQ(hipMemcpy(dB, hB.data(), szB * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
     ASSERT_EQ(hipMemset(dC, 0, szC * sizeof(float)), hipSuccess);
 
-    const size_t ws_sz = hipblasLtEmulationWorkspaceSize(m_handle,
-                                                          HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
+    const size_t ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
     void* d_ws = nullptr;
     if(ws_sz > 0) ASSERT_EQ(hipMalloc(&d_ws, ws_sz), hipSuccess);
 
     const float alpha = 1.f, beta = 0.f;
     FixedPointEmulationSettings settings{};
+    settings.eager          = true; /* bypass perf gate in direct test calls */
+
     settings.num_moduli    = 0u; /* ADP */
     settings.dynamic_mode  = true;
     settings.sv_mask       = 0u; /* no NaN check in this test */
@@ -3105,7 +3165,8 @@ TEST_F(FixedPointEmulationFp32Test, AdpModuliSelectionFp32)
      * should be set and adp_mantissa_bits should be 23 (the FP32 default).  */
     auto* h = reinterpret_cast<const _rocblaslt_handle*>(m_handle);
     const FixedPointEmulationDecision d = fixedPointEmulationDecision(
-        h, HIP_R_32F, HIPBLAS_OP_N, HIPBLAS_OP_N,
+        h, reinterpret_cast<const _rocblaslt_matmul_desc*>(m_emul_desc),
+        HIP_R_32F, HIPBLAS_OP_N, HIPBLAS_OP_N,
         128, 128, 128, 1, ~size_t{0});
 
     if(!d.apply)
@@ -3142,13 +3203,14 @@ TEST_F(FixedPointEmulationFp32Test, NanDetectionFp32)
     ASSERT_EQ(hipMemcpy(dB, hB.data(), szB * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
     ASSERT_EQ(hipMemset(dC, 0, szC * sizeof(float)), hipSuccess);
 
-    const size_t ws_sz = hipblasLtEmulationWorkspaceSize(m_handle,
-                                                          HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
+    const size_t ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
     void* d_ws = nullptr;
     if(ws_sz > 0) ASSERT_EQ(hipMalloc(&d_ws, ws_sz), hipSuccess);
 
     const float alpha = 1.f, beta = 0.f;
     FixedPointEmulationSettings settings{};
+    settings.eager          = true; /* bypass perf gate in direct test calls */
+
     settings.num_moduli    = 8u;
     settings.dynamic_mode  = false;
     settings.sv_mask       = 0x3u; /* NaN + Inf detection enabled */
