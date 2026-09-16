@@ -13,10 +13,10 @@
  * Environment variables:
  *   HIPBLASLT_EMULATE_DOUBLE_PRECISION=0|1  enables FP64 emulation.
  *   HIPBLASLT_EMULATE_SINGLE_PRECISION=0|1  enables FP32 emulation.
- *   HIPBLASLT_EMULATION_NUM_MODULI=N        force fixed moduli count [2..20].
- *     WARNING: bypasses the adaptive (ADP) precision check; accuracy is not
- *     guaranteed for all inputs.  The recommended usage is NOT to set this
- *     variable and rely on the default ADP mode instead.
+ *   HIPBLASLT_EMULATION_NUM_MODULI=N        post-ADP testing override [2..20].
+ *     After ADP selects the minimum sufficient s, this env var overrides it.
+ *     Useful for testing specific moduli counts; accuracy is not guaranteed
+ *     for all inputs when set below the ADP-selected value.
  *   HIPBLASLT_EMULATION_STRATEGY=performant|eager
  *     performant (default): use emulation only when predicted to outperform native GEMM.
  *     eager: always emulate regardless of problem size or arithmetic intensity.
@@ -121,10 +121,11 @@ bool fixedPointEmulationIsEager();
  * Shared for both FP32 and FP64.                                           */
 uint32_t fixedPointEmulationSpecialValuesMask();
 
-/* Returns the fixed moduli count from HIPBLASLT_EMULATION_NUM_MODULI [2..20],
- * or 0 if the env var is absent or invalid (= ADP/dynamic mode).
- * Cached on first call.  Use fixedPointEmulationEffectiveNumModuli(desc) to
- * get the fully-resolved count (desc override -> env var -> S_MAX for ADP).
+/* Returns the post-ADP testing override from HIPBLASLT_EMULATION_NUM_MODULI
+ * [2..S_MAX], or 0 if the env var is absent or invalid.
+ * When non-zero, emulated_gemm_impl applies this as an override AFTER ADP
+ * selects the minimum sufficient s.  Accuracy is not guaranteed for all
+ * inputs when set below the ADP-selected value.
  * Maximum supported: 20 moduli (~155 bits of CRT capacity).               */
 unsigned fixedPointEmulationNumModuli();
 
@@ -145,11 +146,9 @@ int fixedPointEmulationAdpMantissaBits(hipDataType type_a);
  * ========================================================================= */
 struct FixedPointEmulationDecision
 {
-    rocblaslt_status status;       /* rocblaslt_status_invalid_value on bad env   */
-    bool             apply;        /* true -> use emulation; false -> native path */
-    unsigned int     num_moduli;   /* resolved moduli count to pass to settings   */
-    unsigned int     sv_mask;      /* resolved special-values mask                */
-    bool             dynamic_mode; /* true when DYNAMIC (ADP) mode selected       */
+    rocblaslt_status status;        /* rocblaslt_status_invalid_value on bad env   */
+    bool             apply;         /* true -> use emulation; false -> native path */
+    unsigned int     sv_mask;       /* resolved special-values mask                */
     size_t           workspace_cap; /* caller workspace limit; ~size_t{0} = none  */
     /* ADP target precision in mantissa bits.
      * 52 = full IEEE 754 FP64 precision; 23 = full IEEE 754 FP32 precision.
@@ -171,7 +170,8 @@ struct FixedPointEmulationDecision
  *   3. Built-in defaults (ADP mode, S_MAX moduli, sv_mask = 0x3)
  *
  * desc may be nullptr when called from code that has no matmul desc
- * (e.g. workspace size query with no attached desc).                       */
+ * (e.g. workspace size query with no attached desc).
+ * Always selects ADP (dynamic) mode; num_moduli is always S_MAX.          */
 FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle*      h,
                                                          const _rocblaslt_matmul_desc* desc,
                                                          hipDataType                   type_a,
@@ -196,16 +196,8 @@ bool fixedPointEmulationWouldApply(const _rocblaslt_handle*      h,
                                     int64_t                       k,
                                     int32_t                       batch_count);
 
-/* Returns the upper bound on CRT moduli (2..20) for the given matmul desc.
- * Used as the workspace layout count and the ADP upper bound.
- *   FIXED (num_moduli in [2..20] on desc or env var): returns that count.
- *   ADP   (sentinel/unset, env var absent): returns S_MAX (= 20).
- * desc may be nullptr; in that case only the env var is consulted.         */
-unsigned fixedPointEmulationEffectiveNumModuli(const _rocblaslt_matmul_desc* desc);
-
 /* Returns the workspace size in bytes for the given problem and input type.
- * The decision selects the layout moduli (S_MAX=20 in ADP mode,
- * decision.num_moduli in FIXED mode).
+ * Always uses S_MAX (= 20) moduli for the layout (always ADP mode).
  * When decision.workspace_cap != ~size_t{0}, the returned size is capped at
  * min(optimal, decision.workspace_cap).  This ensures the library never
  * reports a workspace larger than the user's allocation.                   */
@@ -223,9 +215,7 @@ size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
  * function to fall back to the process-wide env var defaults.              */
 struct FixedPointEmulationSettings
 {
-    unsigned int num_moduli;       /* 2..20; 0 = derive from env var           */
     unsigned int sv_mask;          /* special-values mask; ~0u = env var       */
-    bool         dynamic_mode;     /* true when ADP (Adaptive Precision) mode  */
     bool         eager;            /* true -> skip workspace performance gate  */
     void*        workspace;        /* caller workspace; nullptr = no workspace */
     size_t       workspace_bytes;  /* size of caller workspace                 */

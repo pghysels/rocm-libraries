@@ -1509,36 +1509,6 @@ rocblaslt_status rocblaslt_matmul_desc_set_attribute(rocblaslt_matmul_desc      
                     return rocblaslt_status_invalid_value;
                 }
                 break;
-            case ROCBLASLT_MATMUL_DESC_EMULATION_NUM_MODULI_EXT:
-                if(sizeof(int32_t) <= sizeInBytes)
-                {
-                    int32_t v = 0;
-                    memcpy(&v, buf, sizeof(int32_t));
-                    /* -1 = ADP/inherit; 2..20 = FIXED */
-                    if(v != -1 && (v < 2 || v > 20))
-                    {
-                        log_error(__func__, "invalid emulation_num_moduli value (must be -1 or 2..20)", v);
-                        return rocblaslt_status_invalid_value;
-                    }
-                    matmulDesc->emulation_num_moduli = v;
-                    if(v >= 2)
-                    {
-                        static std::atomic<bool> fixed_warned{false};
-                        if(!fixed_warned.exchange(true, std::memory_order_relaxed))
-                            std::fprintf(stderr,
-                                "[hipBLASLt WARNING] FP emulation FIXED mode selected.\n"
-                                "  FIXED mode does NOT guarantee numerical accuracy or correctness.\n"
-                                "  CRT sign flips can occur for inputs with large dynamic range.\n"
-                                "  Use ADP mode (the default) for reliable results.\n"
-                                "  Only use FIXED mode if you have validated it for your specific inputs.\n");
-                    }
-                }
-                else
-                {
-                    log_error(__func__, "invalid emulation_num_moduli buf size", sizeInBytes);
-                    return rocblaslt_status_invalid_value;
-                }
-                break;
             case ROCBLASLT_MATMUL_DESC_EMULATION_MAX_MANTISSA_BIT_COUNT_EXT:
                 if(sizeof(int32_t) <= sizeInBytes)
                 {
@@ -1913,11 +1883,6 @@ rocblaslt_status rocblaslt_matmul_desc_get_attribute(rocblaslt_matmul_desc      
                 if(sizeWritten) *sizeWritten = sizeof(int32_t);
                 if(sizeInBytes < sizeof(int32_t)) { log_error(__func__, "invalid emulation_strategy buf size", sizeInBytes); return rocblaslt_status_invalid_value; }
                 memcpy(buf, &matmulDesc->emulation_strategy, sizeof(int32_t));
-                break;
-            case ROCBLASLT_MATMUL_DESC_EMULATION_NUM_MODULI_EXT:
-                if(sizeWritten) *sizeWritten = sizeof(int32_t);
-                if(sizeInBytes < sizeof(int32_t)) { log_error(__func__, "invalid emulation_num_moduli buf size", sizeInBytes); return rocblaslt_status_invalid_value; }
-                memcpy(buf, &matmulDesc->emulation_num_moduli, sizeof(int32_t));
                 break;
             case ROCBLASLT_MATMUL_DESC_EMULATION_MAX_MANTISSA_BIT_COUNT_EXT:
                 if(sizeWritten) *sizeWritten = sizeof(int32_t);

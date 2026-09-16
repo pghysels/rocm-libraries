@@ -92,25 +92,24 @@ namespace FixedPointEmulation
     }
 
     /* Compute the effective INT8 workspace budget for the monolithic path given
-     * workspace_bytes and sub-problem dimensions (m, n).  Mirrors the two-step
-     * budget derivation in emulated_gemm_impl so that effective_time_ms accurately
-     * models the available budget at each recursive split level.             */
+     * workspace_bytes, sub-problem dimensions (m, n), and the moduli count s.
+     * Mirrors the two-step budget derivation in emulated_gemm_impl so that
+     * effective_time_ms accurately models the available budget at each recursive
+     * split level.                                                              */
     static size_t compute_budget_from_ws(int64_t  m,
                                          int64_t  n,
                                          int64_t  k,
                                          unsigned s,
-                                         bool     dynamic_mode,
                                          size_t   workspace_bytes)
     {
-        const unsigned s_lay  = dynamic_mode ? S_MAX : s;
-        const size_t   co     = pad(static_cast<size_t>(m));
-        const size_t   pn     = pad(static_cast<size_t>(n));
-        const size_t   boh    = co * sizeof(int16_t) + pn * sizeof(int16_t) + sizeof(uint32_t)
-                              + co * sizeof(int32_t) + pn * sizeof(int32_t) + 2 * sizeof(float)
-                              + OZ2_INT8_GEMM_WS_BYTES;
-        const size_t   W1     = (workspace_bytes > boh) ? workspace_bytes - boh : 0u;
-        const unsigned cs1    = compute_chunk_size(m, n, k, s_lay, W1);
-        if(cs1 < s_lay)
+        const size_t co  = pad(static_cast<size_t>(m));
+        const size_t pn  = pad(static_cast<size_t>(n));
+        const size_t boh = co * sizeof(int16_t) + pn * sizeof(int16_t) + sizeof(uint32_t)
+                         + co * sizeof(int32_t) + pn * sizeof(int32_t) + 2 * sizeof(float)
+                         + OZ2_INT8_GEMM_WS_BYTES;
+        const size_t   W1  = (workspace_bytes > boh) ? workspace_bytes - boh : 0u;
+        const unsigned cs1 = compute_chunk_size(m, n, k, s, W1);
+        if(cs1 < s)
         {
             const size_t zoh = 2u * co * static_cast<size_t>(n) * sizeof(double);
             return (workspace_bytes > boh + zoh) ? workspace_bytes - boh - zoh : 0u;
@@ -118,7 +117,6 @@ namespace FixedPointEmulation
         return W1;
     }
 
-    /* Kernel efficiency factors and latency constants calibrated on MI355X. */
     struct PerfModelKernelEffs
     {
         static constexpr double eff_prelim[2][2] = {{0.697, 0.561}, /* [N][N], [N][T] */
@@ -203,19 +201,6 @@ namespace FixedPointEmulation
         return S_MAX;
     }
 
-    /* Returns the effective moduli count to use in the performance model.
-     * Fixed mode: use num_moduli directly.
-     * Dynamic (ADP) mode: use adp_expected_num_moduli(adp_bits) — a realistic
-     * lower bound on the ADP runtime selection — instead of S_MAX, which would
-     * grossly overestimate scale and INT8 GEMM time for well-conditioned inputs.
-     * Examples with +2 safety bits:
-     *   FP64 adp_bits=52 → target=54 → min s where log2P[s-2]≥54 → s=15
-     *   FP32 adp_bits=23 → target=25 → min s where log2P[s-2]≥25 → s=7      */
-    static unsigned perf_model_s(unsigned num_moduli, bool dynamic_mode, int adp_bits) noexcept
-    {
-        return dynamic_mode ? adp_expected_num_moduli(adp_bits) : num_moduli;
-    }
-
     /* =========================================================================
      * Performance-model predicted times
      * Returns all sub-times in milliseconds.  Used both for the profiling CSV
@@ -243,7 +228,6 @@ namespace FixedPointEmulation
                                            int64_t     k,
                                            unsigned    num_moduli,
                                            int         device,
-                                           bool        dynamic_mode,
                                            size_t      budget,
                                            hipDataType type_a)
     {
@@ -283,13 +267,9 @@ namespace FixedPointEmulation
             = (mn * (4.0 * s + 32.0 * n_chunks - 16.0) / c0 + n_chunks * K::latency_kernel_s)
               / K::eff_accum;
         const double t_host = K::host_overhead_s;
-
         const double t_gemm_accum = t_int8_gemms + t_accum_kern;
-        const double t_adp
-            = dynamic_mode
-                  ? 2.0 * K::latency_kernel_s /* adp_reduce_A_kernel + adp_reduce_B_kernel */
-                        + K::latency_sync_s /* hipStreamSynchronize — dominant cost */
-                  : 0.0;
+        const double t_adp = 2.0 * K::latency_kernel_s /* adp_reduce_A_kernel + adp_reduce_B_kernel */
+                           + K::latency_sync_s; /* hipStreamSynchronize — dominant cost */
         const double t_total = t_prelim_kern + t_prelim_gemm + t_refine_kern + t_scale_kern
                                + t_gemm_accum + t_host + t_adp;
         const double t_native
@@ -334,21 +314,16 @@ namespace FixedPointEmulation
                                     int64_t     k,
                                     unsigned    s,
                                     int         device,
-                                    bool        dynamic_mode,
                                     size_t      workspace_bytes,
                                     hipDataType type_a)
     {
         if(m < FIXED_POINT_EMUL_MIN_MN || n < FIXED_POINT_EMUL_MIN_MN)
         {
-            /* For sub-threshold shapes (m or n < 16) emulated_gemm_impl falls back to
-             * native GEMM immediately, so emulation has strictly more overhead than
-             * native.  Return t_native * (1 + ε) so the performance gate always prefers
-             * native for these shapes.                                                  */
-            const double t_nat = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, ~size_t{0}, type_a).t_native_ms;
+            const double t_nat = perf_model_times(tA, tB, m, n, k, s, device, ~size_t{0}, type_a).t_native_ms;
             return t_nat * (1.0 + 1e-6);
         }
-        const size_t budget  = compute_budget_from_ws(m, n, k, s, dynamic_mode, workspace_bytes);
-        const double t_mono  = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget, type_a).t_total_ms;
+        const size_t budget  = compute_budget_from_ws(m, n, k, s, workspace_bytes);
+        const double t_mono  = perf_model_times(tA, tB, m, n, k, s, device, budget, type_a).t_total_ms;
 
         const unsigned chunk_sz = compute_chunk_size(m, n, k, s, budget);
         const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -358,10 +333,8 @@ namespace FixedPointEmulation
             const int64_t half_m  = split_m ? m / 2 : m;
             const int64_t half_n  = split_m ? n : n / 2;
 
-            /* Pass workspace_bytes (not budget) so each recursive sub-call recomputes
-             * its own budget from its own (half_m, half_n) dimensions.          */
             const double t_split
-                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode,
+                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device,
                                          workspace_bytes, type_a);
             if(t_split < t_mono)
                 return t_split;
@@ -380,12 +353,11 @@ namespace FixedPointEmulation
                                                      int64_t     k,
                                                      unsigned    s,
                                                      int         device,
-                                                     bool        dynamic_mode,
                                                      size_t      workspace_bytes,
                                                      hipDataType type_a)
     {
-        const size_t   budget = compute_budget_from_ws(m, n, k, s, dynamic_mode, workspace_bytes);
-        PerfModelTimes mono   = perf_model_times(tA, tB, m, n, k, s, device, dynamic_mode, budget, type_a);
+        const size_t   budget = compute_budget_from_ws(m, n, k, s, workspace_bytes);
+        PerfModelTimes mono   = perf_model_times(tA, tB, m, n, k, s, device, budget, type_a);
 
         const unsigned chunk_sz = compute_chunk_size(m, n, k, s, budget);
         const unsigned n_chunks = (s + chunk_sz - 1u) / chunk_sz;
@@ -396,12 +368,12 @@ namespace FixedPointEmulation
             const int64_t half_n  = split_m ? n : n / 2;
 
             const double t_split
-                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device, dynamic_mode,
+                = 2. * effective_time_ms(tA, tB, half_m, half_n, k, s, device,
                                          workspace_bytes, type_a);
             if(t_split < mono.t_total_ms)
             {
                 PerfModelTimes half = effective_perf_model_times(
-                    tA, tB, half_m, half_n, k, s, device, dynamic_mode, workspace_bytes, type_a);
+                    tA, tB, half_m, half_n, k, s, device, workspace_bytes, type_a);
                 half.t_prelim_ms *= 2.0;
                 half.t_prelim_gemm_ms *= 2.0;
                 half.t_refine_ms *= 2.0;
@@ -2259,27 +2231,12 @@ namespace FixedPointEmulation
         /* Type-specific label strings for warning messages. */
         constexpr const char* type_name  = std::is_same_v<T, double> ? "FP64" : "FP32";
         constexpr const char* native_str = std::is_same_v<T, double> ? "DGEMM" : "SGEMM";
-        /* settings.num_moduli comes from fixedPointEmulationEffectiveNumModuli (≥2).
-         * The fixedPointEmulationNumModuli() fallback would return 0 if env var absent;
-         * fixedPointEmulationEffectiveNumModuli properly converts that to 16.           */
-        const unsigned num_moduli = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
-                                        ? settings.num_moduli
-                                        : fixedPointEmulationEffectiveNumModuli(nullptr);
-        /* Workspace budget: derive from workspace_bytes using two-call approach. */
-        const size_t W_wb_i   = settings.workspace_bytes;
-        const size_t co_i     = pad(static_cast<size_t>(m));
-        const size_t pn_i     = pad(static_cast<size_t>(n));
-        const size_t boh_i    = co_i*sizeof(int16_t)+pn_i*sizeof(int16_t)+sizeof(uint32_t)
-                              + co_i*sizeof(int32_t)+pn_i*sizeof(int32_t)+2*sizeof(float)
-                              + OZ2_INT8_GEMM_WS_BYTES;
-        const unsigned sl_i   = settings.dynamic_mode ? S_MAX : num_moduli;
-        const size_t W1_i     = (W_wb_i > boh_i) ? W_wb_i - boh_i : 0u;
-        const unsigned cs1_i  = compute_chunk_size(m, n, k, sl_i, W1_i);
-        size_t ws_budget;
-        if(cs1_i < sl_i) {
-            const size_t zoh_i = 2u * co_i * static_cast<size_t>(n) * sizeof(double);
-            ws_budget = (W_wb_i > boh_i + zoh_i) ? W_wb_i - boh_i - zoh_i : 0u;
-        } else { ws_budget = W1_i; }
+        /* Always ADP mode: workspace layout always covers S_MAX moduli.
+         * fixedPointEmulationNumModuli() post-ADP override is applied later. */
+        const unsigned num_moduli = S_MAX;
+        /* Workspace budget: always use S_MAX because ADP selects effective_s
+         * at runtime — the workspace must accommodate up to S_MAX moduli.   */
+        const size_t ws_budget = compute_budget_from_ws(m, n, k, S_MAX, settings.workspace_bytes);
 
         {
             const unsigned chunk_sz = compute_chunk_size(m, n, k, num_moduli, ws_budget);
@@ -2317,18 +2274,17 @@ namespace FixedPointEmulation
                 const int adp_bits_impl = (settings.adp_mantissa_bits > 0)
                     ? static_cast<int>(settings.adp_mantissa_bits)
                     : fixedPointEmulationAdpMantissaBits(type_a_perf);
-                const unsigned pm_s_impl = perf_model_s(num_moduli, settings.dynamic_mode,
-                                                        adp_bits_impl);
+                const unsigned pm_s_impl = adp_expected_num_moduli(adp_bits_impl);
                 const double t_mono = force_split ? 0.0
-                    : perf_model_times(tA, tB, m, n, k, pm_s_impl, device, settings.dynamic_mode,
+                    : perf_model_times(tA, tB, m, n, k, pm_s_impl, device,
                                        ws_budget, type_a_perf)
                           .t_total_ms;
-                /* Pass settings.workspace_bytes (not ws_budget) so the sub-call recomputes
-                 * its own budget from the smaller (half_m, half_n) dimensions.           */
+                /* Pass workspace_bytes so the sub-call recomputes its own budget
+                 * from the smaller (half_m, half_n) dimensions.                  */
                 const double t_split = force_split ? 0.0
                     : 2.
                       * effective_time_ms(
-                          tA, tB, half_m, half_n, k, pm_s_impl, device, settings.dynamic_mode,
+                          tA, tB, half_m, half_n, k, pm_s_impl, device,
                           settings.workspace_bytes, type_a_perf);
 
                 if(force_split || t_split < t_mono)
@@ -2445,7 +2401,8 @@ namespace FixedPointEmulation
             }
         };
 
-        const unsigned layout_moduli = settings.dynamic_mode ? S_MAX : num_moduli;
+        /* Always ADP (dynamic) mode: layout always covers S_MAX moduli. */
+        const unsigned layout_moduli = S_MAX;
         const unsigned chunk_size = compute_chunk_size(m, n, k, layout_moduli, ws_budget);
 
         const size_t lda8i  = pad(static_cast<size_t>(k));
@@ -2718,12 +2675,11 @@ namespace FixedPointEmulation
                            col_max);
         _pstop(_t_refine); /* partial: refine_sftA_partial only */
 
-        /* ADP (dynamic mode): determine effective_s from the preliminary GEMM result
+        /* ADP always runs: determine effective_s from the preliminary GEMM result
          * BEFORE applying any shift delta.  Both ADP kernels read sftA_init and
          * sftB_init (the values set in step 1a/1b, before any += delta).
          * The refine delta is then applied using log2P_{effective_s} so that
-         * X_true is sized to fit within M_{effective_s}/2, not M_{num_moduli}/2.  */
-        if(settings.dynamic_mode)
+         * X_true is sized to fit within M_{effective_s}/2.                        */
         {
             _pstart();
             (void)hipMemsetAsync(adp_buf, 0, 2 * sizeof(float), stream);
@@ -2731,9 +2687,9 @@ namespace FixedPointEmulation
             const float adp_bits = static_cast<float>(
                 (settings.adp_mantissa_bits > 0)
                     ? settings.adp_mantissa_bits
-                    : fixedPointEmulationAdpMantissaBits(std::is_same_v<T, double> ? HIP_R_64F : HIP_R_32F))
-            /* assume that relatice componentwise error scales O(sqrt(K)) */
-                    - std::floor(0.5f * std::log2(static_cast<float>(k)));
+                    : fixedPointEmulationAdpMantissaBits(std::is_same_v<T, double> ? HIP_R_64F : HIP_R_32F));
+            /* assume that relative componentwise error scales O(sqrt(K)) */
+                    //- std::floor(0.5f * std::log2(static_cast<float>(k)));
 
             /* A-side: reads row_max[] and sftA[] before apply_kernel modifies sftA. */
             hipLaunchKernelGGL(adp_reduce_A_kernel,
@@ -2774,21 +2730,35 @@ namespace FixedPointEmulation
             if(log2P_needed > log2P[S_MAX - 2u])
             {
                 /* ADP determined s=S_MAX is still insufficient for this input.
-                 * This occurs for matrices with extremely large dynamic range within
-                 * a single row/column (e.g. condition number ≫ 2^{2×log2P_18}).
-                 * The Ozaki shift-refinement would set A8i_final or B8i_final to
-                 * near-zero for the elements providing cancellation, giving wrong
-                 * results regardless of s.  Fall back to native DGEMM.
-                 * Rate-limited warning (≤5 per process).                         */
-                hipblaslt_cerr << "[hipBLASLt " << type_name << " emulation] WARNING: ADP overflow for GEMM "
-                               << "(m=" << m << ", n=" << n << ", k=" << k
-                               << "): " << "A-side log2P_req=" << (h_adp[0] - 200.0f) << " bits, "
-                               << "B-side=" << (h_adp[1] - 200.0f) << " bits, "
-                               << "max required=" << log2P_needed
-                               << " > supported max=" << log2P[S_MAX - 2u] << " (s=" << S_MAX
-                               << " moduli, ~" << cum_bits[S_MAX - 2u]
-                               << " cumulative bits). Falling back to native " << native_str << "." << std::endl;
-                return rocblaslt_status_invalid_value;
+                 * Before giving up, check whether HIPBLASLT_EMULATION_NUM_MODULI
+                 * provides a forced override — if so, use it and proceed.
+                 * This allows test/debug code to force a specific s even when the
+                 * ADP analysis says no standard s is sufficient (accuracy is not
+                 * guaranteed, but the computation will run rather than returning
+                 * invalid_value).                                                 */
+                const unsigned override_s_adp = fixedPointEmulationNumModuli();
+                if(override_s_adp >= 2u && override_s_adp <= S_MAX)
+                {
+                    effective_s = override_s_adp;
+                }
+                else
+                {
+                    /* No valid override: fall back to native GEMM.
+                     * This occurs for matrices with extremely large dynamic range within
+                     * a single row/column (e.g. condition number ≫ 2^{2×log2P_18}).
+                     * The Ozaki shift-refinement would set A8i_final or B8i_final to
+                     * near-zero for the elements providing cancellation, giving wrong
+                     * results regardless of s.  Rate-limited warning (≤5 per process). */
+                    hipblaslt_cerr << "[hipBLASLt " << type_name << " emulation] WARNING: ADP overflow for GEMM "
+                                   << "(m=" << m << ", n=" << n << ", k=" << k
+                                   << "): " << "A-side log2P_req=" << (h_adp[0] - 200.0f) << " bits, "
+                                   << "B-side=" << (h_adp[1] - 200.0f) << " bits, "
+                                   << "max required=" << log2P_needed
+                                   << " > supported max=" << log2P[S_MAX - 2u] << " (s=" << S_MAX
+                                   << " moduli, ~" << cum_bits[S_MAX - 2u]
+                                   << " cumulative bits). Falling back to native " << native_str << "." << std::endl;
+                    return rocblaslt_status_invalid_value;
+                }
             }
 
             for(unsigned s = 2u; s <= S_MAX; ++s)
@@ -2799,6 +2769,13 @@ namespace FixedPointEmulation
                     break;
                 }
             }
+        }
+        /* Post-ADP testing override: HIPBLASLT_EMULATION_NUM_MODULI overrides the
+         * ADP-selected s.  Only for testing; accuracy is not guaranteed below ADP value. */
+        {
+            const unsigned override_s = fixedPointEmulationNumModuli();
+            if(override_s >= 2u && override_s <= S_MAX)
+                effective_s = override_s;
         }
 
         /* Apply shift-refinement delta using the correct log2P for effective_s.
@@ -3086,11 +3063,9 @@ FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle*
      * value", disabling the env-var fallback for that setting.               */
     using namespace FixedPointEmulation;
     FixedPointEmulationDecision result{};
-    result.status       = rocblaslt_status_success;
-    result.apply        = false;
-    result.num_moduli   = S_MAX; /* ADP upper-bound; overridden below by fixedPointEmulationEffectiveNumModuli */
-    result.sv_mask      = fixedPointEmulationSpecialValuesMask();
-    result.dynamic_mode = false;
+    result.status    = rocblaslt_status_success;
+    result.apply     = false;
+    result.sv_mask   = fixedPointEmulationSpecialValuesMask();
 
     /* Type and batch-count pre-checks (no env-var validation needed). */
     if((type_a != HIP_R_64F && type_a != HIP_R_32F) || batch_count != 1)
@@ -3112,27 +3087,12 @@ FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle*
     if(!get_perf_model_params(dev))
         return result;
 
-    /* Resolve num_moduli.
-     * Priority: desc->emulation_num_moduli (FIXED) > env var > ADP upper bound. */
-    {
-        const int desc_nm = desc ? desc->emulation_num_moduli : -1;
-        result.num_moduli = (desc_nm >= 2 && desc_nm <= static_cast<int>(S_MAX))
-            ? static_cast<unsigned>(desc_nm)
-            : (fixedPointEmulationNumModuli() != 0u ? fixedPointEmulationNumModuli() : S_MAX);
-    }
-
     /* Resolve special_values_mask.
      * Priority: desc->emulation_sv_mask (non-~0u) > env var. */
     {
         const unsigned int desc_sv = desc ? desc->emulation_sv_mask : ~0u;
         if(desc_sv != ~0u)
             result.sv_mask = desc_sv;
-    }
-
-    /* dynamic_mode: ADP when no fixed moduli count is set. */
-    {
-        const int desc_nm = desc ? desc->emulation_num_moduli : -1;
-        result.dynamic_mode = (desc_nm < 2) && (fixedPointEmulationNumModuli() == 0u);
     }
 
     /* ADP target precision.
@@ -3163,21 +3123,6 @@ FixedPointEmulationDecision fixedPointEmulationDecision(const _rocblaslt_handle*
     return result;
 }
 
-unsigned fixedPointEmulationEffectiveNumModuli(const _rocblaslt_matmul_desc* desc)
-{
-    using namespace FixedPointEmulation;
-    /* Priority: desc field in [2..18] -> FIXED from desc.
-     * desc field == -1 (sentinel) -> check env var; if absent -> S_MAX for ADP. */
-    if(desc && desc->emulation_num_moduli >= 2
-       && desc->emulation_num_moduli <= static_cast<int>(S_MAX))
-        return static_cast<unsigned>(desc->emulation_num_moduli);
-    const unsigned env_s = fixedPointEmulationNumModuli();
-    /* 0 = env var absent -> ADP mode: return S_MAX as the moduli upper bound.
-     * ADP selects the actual per-call s from the data; the workspace always
-     * uses S_MAX.  Fixed env var -> use that exact count.                   */
-    return env_s != 0u ? env_s : S_MAX;
-}
-
 size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
                                          hipDataType                        type_a,
                                          hipblasOperation_t                 opA,
@@ -3189,24 +3134,8 @@ size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
 {
     using namespace FixedPointEmulation;
     assert(h != nullptr && "fixedPointEmulationWorkspaceSize requires a valid handle");
-    /* In ADP mode the workspace must cover S_MAX=18 moduli so that any
-     * adaptive effective_s fits without reallocation.  In fixed mode use
-     * the resolved moduli count directly.                                   */
-    const unsigned num_moduli = decision.dynamic_mode ? S_MAX : decision.num_moduli;
-    /* Optimal workspace: chunk_size = s (all moduli in one pass).
-     *
-     * emulated_gemm_impl uses settings.num_moduli (= fixedPointEmulationEffectiveNumModuli(h))
-     * for the chunk-size / n_chunks check that decides whether to split, regardless of
-     * whether dynamic mode is active (where num_moduli parameter = S_MAX but
-     * settings.num_moduli is the user-configured max, e.g. 16).
-     *
-     * Using num_moduli (= ws_moduli = S_MAX in dynamic mode) here instead would
-     * cause the workspace function to decide to split for problem sizes where the
-     * implementation goes to the monolithic path.  The monolithic path needs the full
-     * (m, n) workspace, which is larger than max(WS(half), WS(half)), resulting in
-     * the workspace being under-allocated and a buffer overflow at runtime.           */
-    /* split_num_moduli matches settings.num_moduli in emulated_gemm_impl (= decision.num_moduli). */
-    const unsigned split_num_moduli = decision.num_moduli;
+    /* Always ADP mode: workspace always covers S_MAX moduli. */
+    const unsigned num_moduli = S_MAX;
     /* When the fused kernel is forced (HIPBLASLT_EMULATION_FUSED=on/force), use the
      * fused chunk formula (excludes C32i from workspace budget).  This eliminates
      * binary-halving for all practical shapes, avoiding per-leaf pipeline overhead.
@@ -3247,17 +3176,13 @@ size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
 
 unsigned fixedPointEmulationNumModuli()
 {
-    /* Returns 0 when the env var is absent or invalid, meaning pure ADP mode.
-     * Returns [2..S_MAX] when the env var sets a fixed moduli count.
-     * Callers that need a concrete upper bound for ADP should substitute S_MAX
-     * for a 0 return value; use fixedPointEmulationEffectiveNumModuli(h) to get the
-     * fully resolved count (handle override → env var → S_MAX for ADP).       */
-    static const unsigned v = []() -> unsigned {
-        const auto parsed = fixedPointEmulationParseNumModuliEnv(
-            std::getenv("HIPBLASLT_EMULATION_NUM_MODULI"));
-        return (parsed.state == FIXED_POINT_EMULATION_ENV_VALID) ? parsed.value : 0u;
-    }();
-    return v;
+    /* Re-read on every call (no static cache) so that test code can use
+     * setenv("HIPBLASLT_EMULATION_NUM_MODULI", "8", 1) between runs.
+     * Returns 0 when the env var is absent or invalid (pure ADP mode).
+     * Returns [2..S_MAX] when the env var specifies a post-ADP override. */
+    const auto parsed = fixedPointEmulationParseNumModuliEnv(
+        std::getenv("HIPBLASLT_EMULATION_NUM_MODULI"));
+    return (parsed.state == FIXED_POINT_EMULATION_ENV_VALID) ? parsed.value : 0u;
 }
 
 FixedPointEmulationEnvValue fixedPointEmulationParseToleranceEnv(const char* value)
@@ -3313,14 +3238,11 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
      * settings.workspace / settings.workspace_bytes.  If none is provided
      * or the budget makes emulation slower than native, fall back to native. */
     const _rocblaslt_handle* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
-    /* Use the effective resolved count; 0 from fixedPointEmulationNumModuli() means
-     * env var absent → substitute the ADP default of 16.                      */
-    const unsigned num_moduli  = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
-                                     ? settings.num_moduli
-                                     : fixedPointEmulationEffectiveNumModuli(nullptr);
-    const int      device      = h->device;
+    /* Always ADP mode: layout always S_MAX moduli. */
+    const unsigned num_moduli = S_MAX;
+    const int      device     = h->device;
 
-    FixedPointEmulationSettings effectiveSettings = settings;
+    const FixedPointEmulationSettings& effectiveSettings = settings;
 
     {
         const size_t W = settings.workspace_bytes;
@@ -3342,7 +3264,6 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
 
         /* Case 2: workspace provided — compute budget-constrained chunk_size. */
         const bool tA_g = (opA != HIPBLAS_OP_N), tB_g = (opB != HIPBLAS_OP_N);
-        const bool dyn_g = effectiveSettings.dynamic_mode;
         const size_t cola8i_g = pad(static_cast<size_t>(m));
         const size_t padn_g   = pad(static_cast<size_t>(n));
         const size_t base_oh  =
@@ -3354,53 +3275,43 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
             + 2 * sizeof(float)             /* adp_buf    */
             + OZ2_INT8_GEMM_WS_BYTES;       /* = 0        */
 
-        const unsigned s_layout_g = dyn_g ? S_MAX : num_moduli;
-        const size_t   W_var1 = (W > base_oh) ? W - base_oh : 0u;
-        const unsigned cs1    = compute_chunk_size(m, n, k, s_layout_g, W_var1);
+        /* Always dynamic: S_MAX moduli for layout. */
+        const size_t W_var1 = (W > base_oh) ? W - base_oh : 0u;
+        const unsigned cs1  = compute_chunk_size(m, n, k, S_MAX, W_var1);
 
         size_t W_var;
-        if(cs1 < s_layout_g)
+        if(cs1 < S_MAX)
         {
-            const size_t ldc32i_g  = cola8i_g;
-            const size_t szC32i_g  = ldc32i_g * static_cast<size_t>(n);
-            const size_t zlo_oh    = 2u * szC32i_g * sizeof(double);
+            const size_t szC32i_g = cola8i_g * static_cast<size_t>(n);
+            const size_t zlo_oh   = 2u * szC32i_g * sizeof(double);
             W_var = (W > base_oh + zlo_oh) ? W - base_oh - zlo_oh : 0u;
         }
         else { W_var = W_var1; }
 
         /* EAGER strategy means "always emulate, bypass the performance model".
-         * Only apply the performance gate in PERFORMANT mode.
-         * In EAGER mode the gate is skipped so small N problems (where the
-         * performance model is inaccurate and incorrectly predicts emulation
-         * is slower) still proceed with emulation as the user requested.      */
+         * Only apply the performance gate in PERFORMANT mode.                */
         const bool is_eager_g = settings.eager;
 
-        /* ADP-aware performance model s: use the minimum s satisfying the precision
-         * target (adp_bits + 2 safety bits) instead of S_MAX in dynamic mode.      */
+        /* ADP-aware performance model s. */
         const int adp_bits_g = (settings.adp_mantissa_bits > 0)
             ? static_cast<int>(settings.adp_mantissa_bits)
             : fixedPointEmulationAdpMantissaBits(HIP_R_64F);
-        const unsigned pm_s_g = perf_model_s(num_moduli, dyn_g, adp_bits_g);
+        const unsigned pm_s_g = adp_expected_num_moduli(adp_bits_g);
 
-        /* Pass W (workspace_bytes) so effective_time_ms recomputes the budget at each
-         * recursive level — consistent with the fix to fixedPointEmulationPerformanceCheck_fp64. */
         const double t_emul_W  = is_eager_g ? 0.0
-            : effective_time_ms(tA_g, tB_g, m, n, k, pm_s_g, device, dyn_g, W,
-                                HIP_R_64F);
+            : effective_time_ms(tA_g, tB_g, m, n, k, pm_s_g, device, W, HIP_R_64F);
         const double t_native_g = is_eager_g ? 1.0
             : perf_model_times(tA_g, tB_g, m, n, k, pm_s_g,
-                               device, dyn_g, ~size_t{0}, HIP_R_64F).t_native_ms;
+                               device, ~size_t{0}, HIP_R_64F).t_native_ms;
         if(!is_eager_g && t_emul_W > t_native_g)
         {
             const double t_emul_opt = effective_time_ms(tA_g, tB_g, m, n, k,
-                                                        pm_s_g, device, dyn_g, ~size_t{0},
-                                                        HIP_R_64F);
+                                                        pm_s_g, device, ~size_t{0}, HIP_R_64F);
             if(t_emul_opt <= t_native_g
                && s_ws_small_warns.fetch_add(1, std::memory_order_relaxed) < 5)
             {
                 FixedPointEmulationDecision ws_dec{};
-                ws_dec.dynamic_mode = dyn_g;
-                ws_dec.num_moduli   = num_moduli;
+                ws_dec.workspace_cap = ~size_t{0};
                 const size_t opt_ws = fixedPointEmulationWorkspaceSize(h, HIP_R_64F, opA, opB, m, n, k, ws_dec);
                 hipblaslt_cerr
                     << "[hipBLASLt WARNING] FP64 emulation workspace (" << (W >> 20)
@@ -3453,22 +3364,18 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
         float t_total = 0.f;
         (void)hipEventElapsedTime(&t_total, ev_start, ev_end);
 
-        /* Use effective_s_used for profiling chunk sizes so the CSV reflects
-         * what was actually computed per pass (not the configured maximum).  */
         const unsigned prof_s     = accum.effective_s_used ? accum.effective_s_used : num_moduli;
         const unsigned chunk_size = compute_chunk_size(m, n, k, prof_s, ~size_t{0});
         const unsigned scale_chunk_size = chunk_size;
         const bool     tA               = (opA != HIPBLAS_OP_N);
         const bool     tB               = (opB != HIPBLAS_OP_N);
-        /* Use the split-aware model: each component is the sum across all leaves.
-         * t_native_ms remains for the original (m,n,k) problem.           */
         const int adp_bits_prof_64 = (settings.adp_mantissa_bits > 0)
             ? static_cast<int>(settings.adp_mantissa_bits)
             : fixedPointEmulationAdpMantissaBits(HIP_R_64F);
         const PerfModelTimes pm = effective_perf_model_times(
             tA, tB, m, n, k,
-            perf_model_s(num_moduli, settings.dynamic_mode, adp_bits_prof_64),
-            device, settings.dynamic_mode, ~size_t{0}, HIP_R_64F);
+            adp_expected_num_moduli(adp_bits_prof_64),
+            device, ~size_t{0}, HIP_R_64F);
 
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f)
@@ -3641,17 +3548,12 @@ bool fixedPointEmulationPerformanceCheck(const _rocblaslt_handle*      h,
     const bool tA     = (opA != HIPBLAS_OP_N);
     const bool tB     = (opB != HIPBLAS_OP_N);
     /* ADP mode: no fixed moduli set in desc or env var. */
-    const int  desc_nm = desc ? desc->emulation_num_moduli : -1;
-    const bool     dyn        = (desc_nm < 2) && (fixedPointEmulationNumModuli() == 0u);
-    const unsigned num_moduli = fixedPointEmulationEffectiveNumModuli(desc);
-    /* Use type-specific performance model (FP32 vs FP64) so the gate correctly
-     * compares emulation time against native SGEMM or DGEMM respectively.
-     * Use ADP-aware s estimate to avoid overestimating emulation cost in dynamic mode. */
+    /* Always ADP mode. */
     const int adp_bits_pc = fixedPointEmulationAdpMantissaBits(type_a);
-    const unsigned pm_num = perf_model_s(num_moduli, dyn, adp_bits_pc);
-    const double t_emul   = effective_time_ms(tA, tB, m, n, k, pm_num, device, dyn,
+    const unsigned pm_num = adp_expected_num_moduli(adp_bits_pc);
+    const double t_emul   = effective_time_ms(tA, tB, m, n, k, pm_num, device,
                                               workspace_bytes, type_a);
-    const double t_native = perf_model_times(tA, tB, m, n, k, pm_num, device, dyn,
+    const double t_native = perf_model_times(tA, tB, m, n, k, pm_num, device,
                                              ~size_t{0}, type_a).t_native_ms;
     return t_emul <= t_native;
 }
@@ -3702,12 +3604,11 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
     using namespace FixedPointEmulation;
 
     const _rocblaslt_handle* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
-    const unsigned num_moduli  = (settings.num_moduli >= 2u && settings.num_moduli <= S_MAX)
-                                     ? settings.num_moduli
-                                     : fixedPointEmulationEffectiveNumModuli(nullptr);
-    const int device = h->device;
+    /* Always ADP mode: layout always S_MAX moduli. */
+    const unsigned num_moduli = S_MAX;
+    const int      device     = h->device;
 
-    FixedPointEmulationSettings effectiveSettings = settings;
+    const FixedPointEmulationSettings& effectiveSettings = settings;
 
     {
         const size_t W = settings.workspace_bytes;
@@ -3727,7 +3628,6 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
         }
 
         const bool tA_g = (opA != HIPBLAS_OP_N), tB_g = (opB != HIPBLAS_OP_N);
-        const bool dyn_g = effectiveSettings.dynamic_mode;
         const size_t cola8i_g = pad(static_cast<size_t>(m));
         const size_t padn_g   = pad(static_cast<size_t>(n));
         const size_t base_oh  =
@@ -3735,11 +3635,11 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
             + cola8i_g * sizeof(int32_t) + padn_g * sizeof(int32_t) + 2 * sizeof(float)
             + OZ2_INT8_GEMM_WS_BYTES;
 
-        const unsigned s_layout_g = dyn_g ? S_MAX : num_moduli;
-        const size_t   W_var1 = (W > base_oh) ? W - base_oh : 0u;
-        const unsigned cs1    = compute_chunk_size(m, n, k, s_layout_g, W_var1);
+        /* Always dynamic: S_MAX moduli for layout. */
+        const size_t W_var1 = (W > base_oh) ? W - base_oh : 0u;
+        const unsigned cs1  = compute_chunk_size(m, n, k, S_MAX, W_var1);
         size_t W_var;
-        if(cs1 < s_layout_g)
+        if(cs1 < S_MAX)
         {
             const size_t szC32i_g = cola8i_g * static_cast<size_t>(n);
             const size_t zlo_oh   = 2u * szC32i_g * sizeof(double);
@@ -3749,28 +3649,27 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
 
         const bool is_eager_g = settings.eager;
 
-        /* ADP-aware performance model s: use the minimum s satisfying the precision
-         * target (adp_bits + 2 safety bits) instead of S_MAX in dynamic mode.      */
+        /* ADP-aware performance model s. */
         const int adp_bits_g = (settings.adp_mantissa_bits > 0)
             ? static_cast<int>(settings.adp_mantissa_bits)
             : fixedPointEmulationAdpMantissaBits(HIP_R_32F);
-        const unsigned pm_s_g = perf_model_s(num_moduli, dyn_g, adp_bits_g);
+        const unsigned pm_s_g = adp_expected_num_moduli(adp_bits_g);
 
         /* FP32 performance model: compare against native SGEMM, not DGEMM. */
         const double t_emul_W  = is_eager_g ? 0.0
-            : effective_time_ms(tA_g, tB_g, m, n, k, pm_s_g, device, dyn_g, W, HIP_R_32F);
+            : effective_time_ms(tA_g, tB_g, m, n, k, pm_s_g, device, W, HIP_R_32F);
         const double t_native_g = is_eager_g ? 1.0
-            : perf_model_times(tA_g, tB_g, m, n, k, pm_s_g, device, dyn_g, ~size_t{0}, HIP_R_32F).t_native_ms;
+            : perf_model_times(tA_g, tB_g, m, n, k, pm_s_g, device,
+                               ~size_t{0}, HIP_R_32F).t_native_ms;
         if(!is_eager_g && t_emul_W > t_native_g)
         {
             const double t_emul_opt = effective_time_ms(tA_g, tB_g, m, n, k,
-                                                        pm_s_g, device, dyn_g, ~size_t{0}, HIP_R_32F);
+                                                        pm_s_g, device, ~size_t{0}, HIP_R_32F);
             if(t_emul_opt <= t_native_g
                && s_ws_small_warns.fetch_add(1, std::memory_order_relaxed) < 5)
             {
                 FixedPointEmulationDecision ws_dec{};
-                ws_dec.dynamic_mode = dyn_g;
-                ws_dec.num_moduli   = num_moduli;
+                ws_dec.workspace_cap = ~size_t{0};
                 const size_t opt_ws = fixedPointEmulationWorkspaceSize(
                     h, HIP_R_32F, opA, opB, m, n, k, ws_dec);
                 hipblaslt_cerr
@@ -3824,8 +3723,8 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
             : fixedPointEmulationAdpMantissaBits(HIP_R_32F);
         const PerfModelTimes pm = effective_perf_model_times(
             tA, tB, m, n, k,
-            perf_model_s(num_moduli, settings.dynamic_mode, adp_bits_prof_32),
-            device, settings.dynamic_mode, ~size_t{0}, HIP_R_32F);
+            adp_expected_num_moduli(adp_bits_prof_32),
+            device, ~size_t{0}, HIP_R_32F);
 
         std::FILE* _f = std::fopen(_pf, "a");
         if(_f)

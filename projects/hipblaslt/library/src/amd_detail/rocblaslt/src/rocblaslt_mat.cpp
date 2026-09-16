@@ -163,9 +163,7 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
             const int desc_strat = matmul_descr ? matmul_descr->emulation_strategy : -1;
             const bool emul_eager = (desc_strat == 2) || (desc_strat != 1 && fixedPointEmulationIsEager());
             FixedPointEmulationSettings emulSettings{};
-            emulSettings.num_moduli        = emulDecision.num_moduli;
             emulSettings.sv_mask           = emulDecision.sv_mask;
-            emulSettings.dynamic_mode      = emulDecision.dynamic_mode;
             emulSettings.eager             = emul_eager;
             emulSettings.adp_mantissa_bits = emulDecision.adp_mantissa_bits;
             emulSettings.workspace         = workspace;

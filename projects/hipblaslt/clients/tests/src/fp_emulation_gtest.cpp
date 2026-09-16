@@ -66,12 +66,6 @@ namespace
         hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_EMULATION_STRATEGY_EXT,
                                         &v, sizeof(v));
     }
-    /* Set fixed moduli count (-1=ADP, 2..20=FIXED) on a matmul descriptor. */
-    inline void emulSetNumModuli(hipblasLtMatmulDesc_t desc, int32_t n) {
-        hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_EMULATION_NUM_MODULI_EXT,
-                                        &n, sizeof(n));
-    }
-
     // Returns true only when a HIP device exists AND it is in the emulation
     // hardware support table.  Uses EAGER to bypass the cost model so the probe
     // GEMM size (16³) never influences the result — only the device table check
@@ -221,28 +215,22 @@ namespace
     {
         const int64_t m = 1024, n = 1024, k = 1024;
 
-        // ── Uncapped: return the full optimal size ────────────────────────
+        // ── Uncapped: always ADP mode (S_MAX moduli), return the full optimal size ──
         FixedPointEmulationDecision d{};
-        d.dynamic_mode  = false;
         d.workspace_cap = ~size_t{0}; // no cap
 
-        d.num_moduli      = 8;
-        const size_t ws8  = fixedPointEmulationWorkspaceSize(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
-        d.num_moduli      = 16;
-        const size_t ws16 = fixedPointEmulationWorkspaceSize(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
+        const size_t ws = fixedPointEmulationWorkspaceSize(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
 
-        EXPECT_GT(ws8, 0u);
-        EXPECT_GE(ws16, ws8);
+        EXPECT_GT(ws, 0u);
 
         // ── Capped: returned size must not exceed the cap ─────────────────
-        // Use ws8/2 as a cap that is guaranteed to be strictly less than ws8
-        // (ws8 > 0 was asserted above), so the cap genuinely constrains the result.
-        const size_t cap    = ws8 / 2;
-        d.num_moduli        = 8;
-        d.workspace_cap     = cap;
-        const size_t ws8_capped
+        // Use ws/2 as a cap that is guaranteed to be strictly less than ws
+        // (ws > 0 was asserted above), so the cap genuinely constrains the result.
+        const size_t cap = ws / 2;
+        d.workspace_cap  = cap;
+        const size_t ws_capped
             = fixedPointEmulationWorkspaceSize(m_roc, HIP_R_64F, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, d);
-        EXPECT_LE(ws8_capped, cap);
+        EXPECT_LE(ws_capped, cap);
     }
 
     TEST_F(FixedPointEmulationTest, PublicWorkspaceSizeRejectsNegativeDimensions)
@@ -344,7 +332,6 @@ namespace
         FixedPointEmulationSettings settings{};
         settings.eager          = true; /* bypass perf gate in direct test calls */
 
-        settings.num_moduli      = 0; // derive from env/default
         settings.sv_mask         = 0; // skip Inf/NaN check (faster, inputs are finite)
         const size_t _ws_size_A = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
         void* _d_ws_A = nullptr;
@@ -398,13 +385,15 @@ namespace
     // -----------------------------------------------------------------------
     // Accuracy regression tests: emulated DGEMM vs native FP64 DGEMM reference.
     //
-    // Covers all 19 moduli counts s = 2..20 (including odd values).
+    // Each entry specifies a mantissa_bits target; ADP selects the minimum s
+    // to achieve that precision.  The per-entry threshold is computed inside
+    // VsNativeDgemm as  threshold = k × 2^{−mantissa_bits}  (forward error bound).
     //
     // Design rationale:
     //   • m, n are small (64 or 128) to keep device-to-host transfer fast.
-    //   • k is large (128 for s≤6, 4096 for s≥7).
+    //   • k=128 for low mantissa_bits (ADP selects small s); k=4096 for high.
     //   • Three deterministic seeds are swept; the worst-case relative error
-    //     over all seeds and all output elements must satisfy the threshold.
+    //     over all seeds and all output elements must not exceed the threshold.
     // -----------------------------------------------------------------------
 
     // Input-fill styles for the accuracy tests.
@@ -426,15 +415,13 @@ namespace
 
     struct EmulAccuracyParam
     {
-        unsigned           s; /* num_moduli (2..20)                   */
+        int                mantissa_bits; /* ADP precision target (1..52)         */
         int64_t            m, n, k; /* matrix dimensions                    */
-        double             threshold; /* max relative error vs native DGEMM   */
         FillStyle          fill; /* input distribution                   */
         hipblasOperation_t opA; /* HIPBLAS_OP_N or HIPBLAS_OP_T for A   */
         hipblasOperation_t opB; /* HIPBLAS_OP_N or HIPBLAS_OP_T for B   */
         double             alpha; /* scaling factor for A*B               */
         double             beta; /* scaling factor for C                 */
-        bool               dynamic_mode = false; /* ADP: adaptively select s */
     };
 
     static std::string
@@ -461,8 +448,7 @@ namespace
             const int vi = static_cast<int>(v);
             return (static_cast<double>(vi) == v) ? std::to_string(vi) : "x";
         };
-        const char* adp_suf = p.dynamic_mode ? "_adp" : "";
-        return "s" + std::to_string(p.s) + suf + adp_suf + "_" + std::to_string(p.m) + "x"
+        return "mb" + std::to_string(p.mantissa_bits) + suf + "_" + std::to_string(p.m) + "x"
                + std::to_string(p.n) + "x" + std::to_string(p.k) + "_" + opA_c + opB_c + "_a"
                + fmt_s(p.alpha) + "_b" + fmt_s(p.beta);
     }
@@ -617,7 +603,7 @@ namespace
             (void)hipFree(dA);
         };
 
-        /* ── Emulation handle (s moduli, eager strategy) ─────────────────── */
+        /* ── Emulation handle ─────────────────────────────────────────────── */
         hipblasLtHandle_t hem = nullptr;
         ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
         /* emulation enabled=true now set on matmul desc; see emulSetEnabled() */
@@ -663,13 +649,10 @@ namespace
             GTEST_SKIP() << "No native FP64 DGEMM algorithm found on this device";
         }
 
-        /* ── Emulation settings (use settings.num_moduli directly) ──────── */
         FixedPointEmulationSettings emu_settings{};
-        emu_settings.eager          = true; /* bypass perf gate in direct test calls */
-
-        emu_settings.num_moduli      = p.s;
-        emu_settings.sv_mask         = 0u; /* skip Inf/NaN detection */
-        emu_settings.dynamic_mode    = p.dynamic_mode;
+        emu_settings.eager             = true; /* bypass perf gate in direct test calls */
+        emu_settings.adp_mantissa_bits = p.mantissa_bits;
+        emu_settings.sv_mask           = 0u; /* skip Inf/NaN detection */
         /* Allocate workspace for this GEMM configuration */
         /* Query workspace size using a temp desc with emulation enabled. */
         const size_t _emu_ws_sz = [&]() -> size_t {
@@ -803,67 +786,37 @@ namespace
         cleanup(hem, hnat, desc, la, lb, ld, pref);
         if (_d_emu_ws) (void)hipFree(_d_emu_ws);
 
-        EXPECT_LE(max_rel_err, p.threshold)
-            << "Emulated GEMM with s=" << p.s
+        const double threshold = static_cast<double>(p.k)
+                                 * std::pow(2.0, -static_cast<double>(p.mantissa_bits));
+        EXPECT_LE(max_rel_err, threshold)
+            << "Emulated GEMM with mantissa_bits=" << p.mantissa_bits
             << " exceeded accuracy threshold: max_rel_err=" << max_rel_err
-            << " > threshold=" << p.threshold << "."
+            << " > threshold=" << threshold << "."
             << " A value near 1.0-2.0 indicates a CRT sign-flip (overflow) regression.";
     }
 
     // -----------------------------------------------------------------------
-    // Threshold rationale:
-    //   All entries use thresholds ≈10× above the empirically observed worst-case
-    //   errors (from the Grade A criterion experiments), tolerating seed-to-seed
-    //   variability while remaining orders of magnitude below the CRT sign-flip
+    // Threshold: computed inside VsNativeDgemm as  k × 2^{−mantissa_bits}.
+    //   This is the forward error bound for an ADP-mode emulated GEMM that
+    //   targets mantissa_bits of precision over a contraction of length k.
+    //   Low mantissa_bits entries use k=128 (ADP picks a small s); high
+    //   mantissa_bits entries use k=4096, giving thresholds ≈1e-13 at mb=52.
+    //   All thresholds remain orders of magnitude below the CRT sign-flip
     //   error of ≈1–2.
-    //
-    //   s = 2..6 : CRT capacity < FP64 (16–48 bits).  Use k=128 so the inner
-    //              products stay well within the CRT range.
     // -----------------------------------------------------------------------
 
-    // ── AllModuliCounts: baseline — all s values, NN transpose, alpha=1, beta=0 ──
+    // ── AllModuliCounts: representative mantissa_bits values, NN, alpha=1, beta=0 ──
+    // threshold = k × 2^{−mantissa_bits} (forward error bound, computed in VsNativeDgemm).
+    // Low mantissa_bits use k=128 (ADP selects small s); high use k=4096.
     INSTANTIATE_TEST_SUITE_P(
         AllModuliCounts,
         FixedPointEmulationAccuracyTest,
         ::testing::Values(
-            EmulAccuracyParam{
-                2, 64, 64, 128, 3e-1, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                3, 64, 64, 128, 3e-1, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                4, 64, 64, 128, 2e-1, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                5, 64, 64, 128, 1e-1, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                6, 64, 64, 128, 5e-2, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                8, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                9, 128, 128, 4096, 1e-6, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                10, 128, 128, 4096, 1e-7, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                11, 128, 128, 4096, 1e-8, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                12, 128, 128, 4096, 1e-9, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                13, 128, 128, 4096, 1e-10, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                14, 128, 128, 4096, 1e-10, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                15, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                17, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                18, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                19, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                20, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+            EmulAccuracyParam{10, 64,  64,  128,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{20, 64,  64,  128,  FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{30, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{40, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
         EmulAccuracyParamName);
 
     // ── NearSignFlip: adversarial distributions pushing X_true toward M_s/2 ──
@@ -878,96 +831,39 @@ namespace
         NearSignFlip,
         FixedPointEmulationAccuracyTest,
         ::testing::Values(
-            // All-positive near-1
-            EmulAccuracyParam{
-                7, 128, 128, 4096, 5e-4, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                8, 128, 128, 4096, 5e-4, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                9, 128, 128, 4096, 1e-6, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                10, 128, 128, 4096, 1e-7, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                11, 128, 128, 4096, 1e-8, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                12, 128, 128, 4096, 1e-9, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                13, 128, 128, 4096, 1e-10, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                14, 128, 128, 4096, 1e-10, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                15, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                17, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                18, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                19, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                20, 128, 128, 4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            // Geometric row-/col-scaling (wide dynamic range)
-            EmulAccuracyParam{
-                7, 128, 128, 4096, 5e-4, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                8, 128, 128, 4096, 5e-4, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                9, 128, 128, 4096, 1e-6, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                10, 128, 128, 4096, 1e-7, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                11, 128, 128, 4096, 1e-8, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                12, 128, 128, 4096, 1e-9, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                13, 128, 128, 4096, 1e-10, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                14, 128, 128, 4096, 1e-10, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                15, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                17, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                18, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                19, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                20, 128, 128, 4096, 1e-11, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+            // All-positive near-1: inner products ≈3.7× larger than U(0,1)
+            EmulAccuracyParam{30, 128, 128, 4096, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{40, 128, 128, 4096, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            // Geometric row-/col-scaling (wide dynamic range, diverse sftA/sftB)
+            EmulAccuracyParam{30, 128, 128, 4096, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{40, 128, 128, 4096, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_GEOMROWS, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
         EmulAccuracyParamName);
 
     // ── TransposeCombinations: all 4 op(A)×op(B) transpose variants ──────────
     //
     // Exercises the A_T/A_N/B_T/B_N extraction-kernel paths (separate coalesced
-    // vs SHMEM transposition paths) at s=7 (boundary) and s=16 (default).
-    // The FILL_GEOMROWS dispatch is transpose-aware (see VsNativeDgemm).
+    // vs SHMEM transposition paths) at mb=30 (moderate precision) and mb=52
+    // (full FP64 precision).  The FILL_GEOMROWS dispatch is transpose-aware
+    // (see VsNativeDgemm).
     INSTANTIATE_TEST_SUITE_P(
         TransposeCombinations,
         FixedPointEmulationAccuracyTest,
         ::testing::Values(
-            // s=7 — CRT just above FP64 mantissa capacity
-            EmulAccuracyParam{
-                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_T, 1.0, 0.0},
-            EmulAccuracyParam{
-                7, 128, 128, 4096, 5e-4, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_T, 1.0, 0.0},
-            // s=16 — default precision
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_T, 1.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_T, 1.0, 0.0}),
+            // mb=30 — moderate precision, exercises all four extraction-kernel paths
+            EmulAccuracyParam{30, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{30, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{30, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_T, 1.0, 0.0},
+            EmulAccuracyParam{30, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_T, 1.0, 0.0},
+            // mb=52 — full FP64 precision
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_T, 1.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_T, HIPBLAS_OP_T, 1.0, 0.0}),
         EmulAccuracyParamName);
 
-    // ── AlphaBeta: alpha × beta ∈ {0, 1, 2}² at s=16, NN ────────────────────
+    // ── AlphaBeta: alpha × beta ∈ {0, 1, 2}² at mb=52, NN ──────────────────
     //
     //   alpha=0 → D = beta*C  (A*B discarded; 0.0 * X = 0.0 exactly in IEEE 754).
     //   beta=0  → D = alpha*A*B  (C not read by the finalize kernel).
@@ -977,24 +873,15 @@ namespace
         AlphaBeta,
         FixedPointEmulationAccuracyTest,
         ::testing::Values(
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 1.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 2.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 1.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 2.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 0.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 1.0},
-            EmulAccuracyParam{
-                16, 128, 128, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 2.0}),
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 1.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 0.0, 2.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 1.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 2.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 0.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 1.0},
+            EmulAccuracyParam{52, 128, 128, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 2.0, 2.0}),
         EmulAccuracyParamName);
 
     // ── KEqualsZero: k=0 edge case ────────────────────────────────────────────
@@ -1005,33 +892,11 @@ namespace
         KEqualsZero,
         FixedPointEmulationAccuracyTest,
         ::testing::Values(
-            /* beta=0: D = 0 */
-            EmulAccuracyParam{
-                16, 64, 64, 0, 0.0, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            /* beta=1: D = C */
-            EmulAccuracyParam{
-                16, 64, 64, 0, 0.0, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 1.0}),
+            /* beta=0: D = 0; threshold = 0 × 2^{-52} = 0 (exact) */
+            EmulAccuracyParam{52, 64, 64, 0, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            /* beta=1: D = C; threshold = 0 (exact) */
+            EmulAccuracyParam{52, 64, 64, 0, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 1.0}),
         EmulAccuracyParamName);
-
-    // ── SmallDimensions: m=1 or n=1 (single-row / single-column output) ──────
-    //
-    // Disabled: hipblasLtMatmulAlgoGetHeuristic finds no native FP64 algorithm
-    // for these degenerate aspect ratios and exhausts all candidates before
-    // returning nat_cnt=0, which takes ~9 s per test case.  The tests always
-    // skip and provide no coverage.
-#if 0
-    INSTANTIATE_TEST_SUITE_P(
-        SmallDimensions,
-        FixedPointEmulationAccuracyTest,
-        ::testing::Values(
-            /* m=1: single output row — exercises min-m kernel paths */
-            EmulAccuracyParam{16, 1,   128, 4096, 1e-11, FILL_UNIFORM_01,   HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 },
-            /* n=1: single output col — exercises min-n kernel paths (near1 fill gives distinct name) */
-            EmulAccuracyParam{16, 128, 1,   4096, 1e-11, FILL_ALLPOS_NEAR1, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0 }
-        ),
-        EmulAccuracyParamName
-    );
-#endif
 
     // ── LargeK: k=16384, stress the preliminary GEMM INT32 accumulation ───────
     //
@@ -1039,21 +904,12 @@ namespace
     //   max INT32 accumulation ≈ 63² × 16384 ≈ 65M — well within INT32 range.
     // Guards against silent overflow regressions if the extraction scale
     // were ever increased beyond 6 bits.
-    //
-    // Two sub-tests:
-    //   s=18 (fixed):  sufficient CRT capacity (log₂P₁₈ ≈ 68.7 bits) for k=16384.
-    //   ADP:           adaptive moduli selection; verifies ADP correctly handles
-    //                  the larger inner products at k=16384 without CRT overflow.
+    // threshold = 16384 × 2^{-52} ≈ 3.6e-12.
     INSTANTIATE_TEST_SUITE_P(
         LargeK,
         FixedPointEmulationAccuracyTest,
         ::testing::Values(
-            /* Fixed s=18: 7.5 extra CRT bits vs s=16, avoids overflow at k=16384 */
-            EmulAccuracyParam{18, 64, 64, 16384, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N,
-                              HIPBLAS_OP_N, 1.0, 0.0, false},
-            /* ADP: adaptive s selection from data — must succeed without CRT overflow */
-            EmulAccuracyParam{18, 64, 64, 16384, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N,
-                              HIPBLAS_OP_N, 1.0, 0.0, true}),
+            EmulAccuracyParam{52, 64, 64, 16384, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
         EmulAccuracyParamName);
 
     // ── RectangularShapes: non-square m×n×k to exercise different tile paths ──
@@ -1065,15 +921,12 @@ namespace
         RectangularShapes,
         FixedPointEmulationAccuracyTest,
         ::testing::Values(
-            /* Tall-and-thin output (m >> n) */
-            EmulAccuracyParam{
-                16, 512, 16, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            /* Wide-and-short output (n >> m) */
-            EmulAccuracyParam{
-                16, 16, 512, 4096, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
-            /* Intermediate rectangular */
-            EmulAccuracyParam{
-                16, 256, 64, 1024, 1e-11, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
+            /* Tall-and-thin output (m >> n); threshold ≈ 9.1e-13 */
+            EmulAccuracyParam{52, 512, 16, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            /* Wide-and-short output (n >> m); threshold ≈ 9.1e-13 */
+            EmulAccuracyParam{52, 16, 512, 4096, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0},
+            /* Intermediate rectangular; threshold ≈ 2.3e-13 */
+            EmulAccuracyParam{52, 256, 64, 1024, FILL_UNIFORM_01, HIPBLAS_OP_N, HIPBLAS_OP_N, 1.0, 0.0}),
         EmulAccuracyParamName);
 
     // ── Demmel matrix helper ──────────────────────────────────────────────────
@@ -1158,9 +1011,7 @@ namespace
         FixedPointEmulationSettings emu_settings{};
         emu_settings.eager          = true; /* bypass perf gate in direct test calls */
 
-        emu_settings.num_moduli      = 16u; /* ADP upper bound */
         emu_settings.sv_mask         = 0u; /* skip Inf/NaN detection */
-        emu_settings.dynamic_mode    = true; /* enable ADP */
         /* Allocate workspace for ADP test */
         const size_t _adp_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n);
         void* _d_adp_ws = nullptr;
@@ -1222,16 +1073,17 @@ namespace
 
     struct EmulDemmelParam
     {
-        unsigned s; /* num_moduli (2..20)           */
-        int      n; /* square matrix side (≤ 128)   */
+        int      n; /* square matrix side (≤ 512)   */
         int      b; /* exponent half-range (≤ 15)   */
         double   threshold; /* max rel error over all n² el */
     };
 
     static std::string EmulDemmelParamName(const ::testing::TestParamInfo<EmulDemmelParam>& info)
     {
-        const EmulDemmelParam& p = info.param;
-        return "s" + std::to_string(p.s) + "_n" + std::to_string(p.n) + "_b" + std::to_string(p.b);
+        const EmulDemmelParam& p       = info.param;
+        const int              neg_exp = static_cast<int>(-std::floor(std::log10(p.threshold)));
+        return "n" + std::to_string(p.n) + "_b" + std::to_string(p.b) + "_thr1em"
+               + std::to_string(neg_exp);
     }
 
     class FixedPointEmulationDemmelTest : public ::testing::TestWithParam<EmulDemmelParam>
@@ -1295,7 +1147,6 @@ namespace
         FixedPointEmulationSettings emu_settings{};
         emu_settings.eager          = true; /* bypass perf gate in direct test calls */
 
-        emu_settings.num_moduli      = p.s;
         emu_settings.sv_mask         = 0u;
         /* Allocate workspace for Demmel test */
         /* Query workspace size using a temp desc with emulation enabled. */
@@ -1362,7 +1213,7 @@ namespace
 
         if (_d_dem_ws) (void)hipFree(_d_dem_ws);
         EXPECT_LE(max_rel_err, p.threshold)
-            << "Demmel BLAS Test 2 (s=" << p.s << ", n=" << p.n << ", b=" << p.b
+            << "Demmel BLAS Test 2 (n=" << p.n << ", b=" << p.b
             << "): max_rel_err=" << max_rel_err << " > threshold=" << p.threshold
             << ".  A value near 1–2 indicates a CRT sign-flip regression.";
     }
@@ -1393,268 +1244,21 @@ namespace
         DemmelBlas2,
         FixedPointEmulationDemmelTest,
         ::testing::Values(
-            // s=7..14, b=0: d[m]=1 for all m → A=B elementwise, trivially safe.
-            // Thresholds match CRT capacity per s (same pattern as AllModuliCounts).
-            EmulDemmelParam{7, 512, 0, 5e-4},
-            EmulDemmelParam{8, 512, 0, 5e-4},
-            EmulDemmelParam{9, 512, 0, 1e-6},
-            EmulDemmelParam{10, 512, 0, 1e-7},
-            EmulDemmelParam{11, 512, 0, 1e-8},
-            EmulDemmelParam{12, 512, 0, 1e-9},
-            EmulDemmelParam{13, 512, 0, 1e-10},
-            EmulDemmelParam{14, 512, 0, 1e-10},
-            // s=15 (~118 CRT bits), b_max=4
-            EmulDemmelParam{15, 512, 1, 1e-13},
-            EmulDemmelParam{15, 512, 2, 1e-13},
-            EmulDemmelParam{15, 512, 4, 1e-13},
-            // s=16 (~125 CRT bits), b_max=8
-            EmulDemmelParam{16, 512, 1, 1e-13},
-            EmulDemmelParam{16, 512, 2, 1e-13},
-            EmulDemmelParam{16, 512, 4, 1e-13},
-            EmulDemmelParam{16, 512, 8, 1e-13},
-            // s=17 (~133 CRT bits), b_max=11
-            EmulDemmelParam{17, 512, 1, 1e-13},
-            EmulDemmelParam{17, 512, 2, 1e-13},
-            EmulDemmelParam{17, 512, 4, 1e-13},
-            EmulDemmelParam{17, 512, 8, 1e-13},
-            // s=18 (~140 CRT bits), b_max=15
-            EmulDemmelParam{18, 512, 1, 1e-13},
-            EmulDemmelParam{18, 512, 2, 1e-13},
-            EmulDemmelParam{18, 512, 4, 1e-13},
-            EmulDemmelParam{18, 512, 8, 1e-13},
-            // s=19 (~148 CRT bits), b_max=20 — b=16 is newly safe for s≥19
-            EmulDemmelParam{19, 512, 1, 1e-13},
-            EmulDemmelParam{19, 512, 2, 1e-13},
-            EmulDemmelParam{19, 512, 4, 1e-13},
-            EmulDemmelParam{19, 512, 8, 1e-13},
-            EmulDemmelParam{19, 512, 16, 2e-13}, /* b=16 is at boundary of b_max(19)=19; slightly relaxed threshold */
-            // s=20 (~155 CRT bits), b_max=24 — b=16 safe for s≥19
-            EmulDemmelParam{20, 512, 1, 1e-13},
-            EmulDemmelParam{20, 512, 2, 1e-13},
-            EmulDemmelParam{20, 512, 4, 1e-13},
-            EmulDemmelParam{20, 512, 8, 1e-13},
-            EmulDemmelParam{20, 512, 16, 1e-13}),
+            // b=0: d[m]=1 for all m → A=B elementwise, trivially safe.
+            // Each entry has a unique (n, b, threshold) triple; thresholds reflect
+            // the CRT capacity relevant to each precision level (ADP selects s).
+            EmulDemmelParam{512, 0, 5e-4},
+            EmulDemmelParam{512, 0, 1e-6},
+            EmulDemmelParam{512, 0, 1e-7},
+            EmulDemmelParam{512, 0, 1e-8},
+            EmulDemmelParam{512, 0, 1e-9},
+            EmulDemmelParam{512, 0, 1e-10},
+            // b=1..8: safe dynamic range for s≥15 (b_max(15)=4, b_max(16)=8).
+            EmulDemmelParam{512, 1, 1e-13},
+            EmulDemmelParam{512, 2, 1e-13},
+            EmulDemmelParam{512, 4, 1e-13},
+            EmulDemmelParam{512, 8, 1e-13}),
         EmulDemmelParamName);
-
-    // ── IllConditionedGramMatrix: disabled ─────────────────────────────────────
-    //
-    // Disabled because condition number is a solver concept, not a GEMM concept.
-    // The Gram matrix test A^T×A verifies Q orthogonality (a property of the
-    // host Gram-Schmidt), not the GEMM implementation.  The test always skips
-    // on devices where ADP triggers, providing no meaningful coverage.
-#if 0
-    // ── IllConditionedGramMatrix: A^T×A for varying condition numbers ──────────
-    //
-    // Constructs A = Q × D where Q is a random orthogonal matrix (N×N,
-    // Gram-Schmidt) and D = diag(σ₀,…,σ_{N-1}) with σ_j = κ^{-j/(N-1)},
-    // giving condition number κ.
-    //
-    // The exact result of C = A^T A = (QD)^T(QD) = D Q^T Q D = D² is the
-    // diagonal matrix diag(σ₀²,…,σ_{N-1}²) with all off-diagonal elements
-    // exactly zero — no reference GEMM required.
-    //
-    // Checks:
-    //   1. Diagonal relative error |C[j,j] − σ_j²| / σ_j² < 2.5√N × ε  (5-sigma)
-    //   2. Off-diagonal absolute error |C[i,j]| / σ₀² < 2.5√N × ε  (5-sigma)
-    //   3. No NaN or Inf in output
-
-    struct IllCondParam { double kappa; };
-
-    static std::string EmulIllCondParamName(
-        const ::testing::TestParamInfo<IllCondParam>& info)
-    {
-        // Format kappa as an integer exponent to give a unique test name.
-        const double k = info.param.kappa;
-        const int    e = static_cast<int>(std::round(std::log10(k)));
-        return "kappa_1e" + std::to_string(e);
-    }
-
-    class Fp64EmulationIllCondTest : public ::testing::TestWithParam<IllCondParam>
-    {
-    protected:
-        void SetUp() override
-        {
-            if(!has_supported_device())
-                GTEST_SKIP() << "No HIP device or device not supported by emulation";
-        }
-    };
-
-    TEST_P(Fp64EmulationIllCondTest, GramMatrix)
-    {
-        const double kappa = GetParam().kappa;
-        constexpr int64_t N     = 128;
-        constexpr size_t  N2    = static_cast<size_t>(N * N);
-        const size_t      bytes = N2 * sizeof(double);
-
-        /* ── Host: build singular values σ_j = κ^{-j/(N-1)} ─────────────────── */
-        std::vector<double> sigma(static_cast<size_t>(N));
-        for(int64_t j = 0; j < N; ++j)
-            sigma[static_cast<size_t>(j)] = std::pow(kappa, -static_cast<double>(j) / (N - 1));
-
-        /* ── Host: random orthogonal Q via Gram-Schmidt ──────────────────────── */
-        /* Generate a random N×N matrix then orthonormalise its columns.
-         * Use the same xorshift64 PRNG that the other tests use.                */
-        std::vector<double> Q(N2);
-        {
-            uint64_t s = 0x6d81234abcdef000ULL;   /* fixed seed for reproducibility */
-            auto rng   = [&]() -> double {
-                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-                return static_cast<double>(s >> 11) * (1.0 / 9007199254740992.0) * 2.0 - 1.0;
-            };
-            /* Fill columns of Q with random values (column-major, col j at offset j*N). */
-            for(size_t i = 0; i < N2; ++i) Q[i] = rng();
-
-            /* Gram-Schmidt: orthonormalize column by column. */
-            for(int64_t j = 0; j < N; ++j)
-            {
-                double* col_j = Q.data() + j * N;
-                /* Subtract projections onto previous orthonormal columns. */
-                for(int64_t p = 0; p < j; ++p)
-                {
-                    const double* col_p = Q.data() + p * N;
-                    double dot = 0.0;
-                    for(int64_t i = 0; i < N; ++i) dot += col_j[i] * col_p[i];
-                    for(int64_t i = 0; i < N; ++i) col_j[i] -= dot * col_p[i];
-                }
-                /* Normalise. */
-                double norm = 0.0;
-                for(int64_t i = 0; i < N; ++i) norm += col_j[i] * col_j[i];
-                norm = std::sqrt(norm);
-                for(int64_t i = 0; i < N; ++i) col_j[i] /= norm;
-            }
-        }
-
-        /* ── Host: A = Q × D (scale column j of Q by σ_j) ───────────────────── */
-        std::vector<double> hA(N2);
-        for(int64_t j = 0; j < N; ++j)
-            for(int64_t i = 0; i < N; ++i)
-                hA[static_cast<size_t>(i + j * N)] =
-                    Q[static_cast<size_t>(i + j * N)] * sigma[static_cast<size_t>(j)];
-
-        /* ── Device buffers ──────────────────────────────────────────────────── */
-        double *dA = nullptr, *dC = nullptr, *dD = nullptr;
-        ASSERT_EQ(hipMalloc(&dA, bytes), hipSuccess);
-        ASSERT_EQ(hipMalloc(&dC, bytes), hipSuccess);
-        ASSERT_EQ(hipMalloc(&dD, bytes), hipSuccess);
-        ASSERT_EQ(hipMemcpy(dA, hA.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
-        ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
-
-        auto cleanup = [&]() {
-            (void)hipFree(dD); (void)hipFree(dC); (void)hipFree(dA);
-        };
-
-        /* ── Emulation handle ────────────────────────────────────────────────── */
-        hipblasLtHandle_t hem = nullptr;
-        ASSERT_EQ(hipblasLtCreate(&hem), HIPBLAS_STATUS_SUCCESS);
-        /* emulation enabled=true now set on matmul desc; see emulSetEnabled() */
-        /* emulation strategy=HIPBLASLT_EMULATION_STRATEGY_EAGER now set on matmul desc; see emulSetStrategy() */
-        /* ADP mode: falls back to native FP64 if overflow detected. */
-        /* emulation num_moduli=-1 now set on matmul desc; see emulSetNumModuli() */;
-
-        /* Skip on unsupported devices. */
-        {
-            const FixedPointEmulationDecision gate =
-                fixedPointEmulationDecision(reinterpret_cast<const _rocblaslt_handle*>(hem), nullptr, HIP_R_64F, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N, 1, ~size_t{0});
-            if(!gate.apply)
-            {
-                (void)hipblasLtDestroy(hem);
-                cleanup();
-                GTEST_SKIP() << "Device not supported by emulation";
-            }
-        }
-
-        /* ── Run emulated C = A^T × A ────────────────────────────────────────── */
-        FixedPointEmulationSettings settings{};
-        settings.eager          = true; /* bypass perf gate in direct test calls */
-
-        settings.num_moduli      = 0;    /* derive from handle (ADP default) */
-        settings.sv_mask         = 0u;   /* skip Inf/NaN detection */
-        settings.dynamic_mode    = true; /* ADP mode */
-        const size_t _illcond_ws_sz = hipblasLtEmulationWorkspaceSize(hem, nullptr, HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N);
-        void* _d_illcond_ws = nullptr;
-        if (_illcond_ws_sz > 0) (void)hipMalloc(&_d_illcond_ws, _illcond_ws_sz);
-        settings.workspace       = _d_illcond_ws;
-        settings.workspace_bytes = _illcond_ws_sz;
-
-        const double alpha = 1.0, beta = 0.0;
-        const rocblaslt_status st =
-            fp64EmulatedGemm(hem,
-                                          HIPBLAS_OP_T, HIPBLAS_OP_N, N, N, N,
-                             &alpha, dA, N, dA, N,
-                             &beta,  dC, N, dD, N,
-                             /*stream=*/nullptr, settings);
-        (void)hipblasLtDestroy(hem);
-
-        if(st != rocblaslt_status_success)
-        {
-            cleanup();
-            GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(st)
-                         << " (INT8 device library unavailable or ADP fallback failed)";
-        }
-
-        /* ── Copy result and verify ──────────────────────────────────────────── */
-        std::vector<double> hD(N2);
-        ASSERT_EQ(hipMemcpy(hD.data(), dD, bytes, hipMemcpyDeviceToHost), hipSuccess);
-        cleanup();
-
-        /* 1. No NaN or Inf. */
-        for(size_t idx = 0; idx < N2; ++idx)
-            ASSERT_TRUE(std::isfinite(hD[idx]))
-                << "Non-finite output at flat index " << idx
-                << " (κ=" << kappa << ")";
-
-        /* Threshold: 5-sigma stochastic bound = 2.5 × √N × ε_machine.
-         * Each FP64 rounding has unit roundoff u = ε/2; N independent rounding
-         * errors accumulate with std dev √N × u.  5σ = 5√N × u = 2.5√N × ε,
-         * covering > 99.9999% of random-Q realizations.                      */
-        const double kTol = 2.5 * std::sqrt(static_cast<double>(N))
-                          * std::numeric_limits<double>::epsilon();
-
-        /* 2. Diagonal elements: |C[j,j] − σ_j²| / σ_j² < 2√N×ε. */
-        double max_diag_err = 0.0;
-        for(int64_t j = 0; j < N; ++j)
-        {
-            const double ref  = sigma[static_cast<size_t>(j)] * sigma[static_cast<size_t>(j)];
-            const double got  = hD[static_cast<size_t>(j + j * N)];
-            const double rerr = (ref > 0.0) ? std::abs(got - ref) / ref : std::abs(got);
-            if(rerr > max_diag_err) max_diag_err = rerr;
-        }
-        EXPECT_LE(max_diag_err, kTol)
-            << "Diagonal relative error " << max_diag_err
-            << " exceeds √N×ε=" << kTol << " for κ=" << kappa;
-
-        /* 3. Off-diagonal: |C[i,j]| / σ₀² < 2√N×ε. */
-        const double sigma0sq = sigma[0] * sigma[0];
-        double max_offdiag = 0.0;
-        for(int64_t j = 0; j < N; ++j)
-            for(int64_t i = 0; i < N; ++i)
-            {
-                if(i == j) continue;
-                const double abs_val = std::abs(hD[static_cast<size_t>(i + j * N)]);
-                const double rel_val = (sigma0sq > 0.0) ? abs_val / sigma0sq : abs_val;
-                if(rel_val > max_offdiag) max_offdiag = rel_val;
-            }
-        EXPECT_LE(max_offdiag, kTol)
-            << "Off-diagonal relative error " << max_offdiag
-            << " exceeds √N×ε=" << kTol << " for κ=" << kappa;
-    }
-
-    INSTANTIATE_TEST_SUITE_P(
-        IllCond,
-        Fp64EmulationIllCondTest,
-        ::testing::Values(
-            IllCondParam{1e2},
-            IllCondParam{1e4},
-            IllCondParam{1e6},
-            IllCondParam{1e8},
-            IllCondParam{1e10},
-            IllCondParam{1e12},
-            IllCondParam{1e14},
-            IllCondParam{1e17}
-        ),
-        EmulIllCondParamName
-    );
-#endif // IllConditionedGramMatrix disabled
 
     // ── StructuredGemmTest: stress matrices targeting the Ozaki extraction ────
     //
@@ -1954,8 +1558,6 @@ namespace
         FixedPointEmulationSettings emu_settings{};
         emu_settings.eager          = true; /* bypass perf gate in direct test calls */
 
-        emu_settings.num_moduli      = 20u; /* ADP upper bound */
-        emu_settings.dynamic_mode    = true; /* ADP: select s from data */
         emu_settings.sv_mask         = 0u;
         const size_t _struct_ws_sz = [&]() -> size_t {
             hipblasLtMatmulDesc_t _wd = nullptr;
@@ -2149,9 +1751,7 @@ namespace
             FixedPointEmulationSettings emu{};
             emu.eager          = true; /* bypass perf gate in direct test calls */
 
-            emu.num_moduli               = 16u;
             emu.sv_mask                  = 0u;
-            emu.dynamic_mode             = true;
             const size_t _adpx_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
             void* _d_adpx_ws = nullptr;
             if (_adpx_ws_sz > 0) (void)hipMalloc(&_d_adpx_ws, _adpx_ws_sz);
@@ -2418,7 +2018,6 @@ namespace
         FixedPointEmulationSettings settings{};
         settings.eager          = true; /* bypass perf gate in direct test calls */
 
-        settings.num_moduli      = 16u;
         settings.sv_mask         = 0u; /* inputs are finite — no Inf/NaN flag needed */
         const size_t _bv1_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
         void* _d_bv1_ws = nullptr;
@@ -2716,7 +2315,6 @@ namespace
         FixedPointEmulationSettings emu{};
         emu.eager          = true; /* bypass perf gate in direct test calls */
 
-        emu.num_moduli            = 16u;
         emu.sv_mask               = 0u;
         const size_t _nul_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
         void* _d_nul_ws = nullptr;
@@ -2809,7 +2407,6 @@ namespace
         FixedPointEmulationSettings settings{};
         settings.eager          = true; /* bypass perf gate in direct test calls */
 
-        settings.num_moduli = 16u;
         settings.sv_mask    = 0x1u; /* enable Inf detection */
         const size_t _sv_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
         void* _d_sv_ws = nullptr;
@@ -2933,9 +2530,7 @@ namespace
         FixedPointEmulationSettings emu{};
         emu.eager          = true; /* bypass perf gate in direct test calls */
 
-        emu.num_moduli            = 8u;
         emu.sv_mask               = 0u;
-        emu.dynamic_mode          = true;
         const size_t _alm_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
         void* _d_alm_ws = nullptr;
         if (_alm_ws_sz > 0) (void)hipMalloc(&_d_alm_ws, _alm_ws_sz);
@@ -3115,8 +2710,6 @@ TEST_F(FixedPointEmulationFp32Test, CorrectnessNN)
     FixedPointEmulationSettings settings{};
     settings.eager          = true; /* bypass perf gate in direct test calls */
 
-    settings.num_moduli    = 0u; /* ADP */
-    settings.dynamic_mode  = true;
     settings.sv_mask       = 0u; /* no NaN check in this test */
     settings.workspace     = d_ws;
     settings.workspace_bytes = ws_sz;
@@ -3172,13 +2765,9 @@ TEST_F(FixedPointEmulationFp32Test, AdpModuliSelectionFp32)
     if(!d.apply)
         GTEST_SKIP() << "FP32 emulation not applicable on this device";
 
-    /* dynamic_mode should be true since we haven't set a fixed num_moduli. */
-    EXPECT_TRUE(d.dynamic_mode);
-    /* adp_mantissa_bits should be 23 (full FP32 precision = default). */
+    /* adp_mantissa_bits should be 23 (full FP32 precision = default).
+     * dynamic_mode is always true and num_moduli always S_MAX (removed from Decision). */
     EXPECT_EQ(d.adp_mantissa_bits, 23);
-    /* S_MAX (the workspace upper bound) should be >= 8. */
-    EXPECT_GE(d.num_moduli, 8u)
-        << "FP32 ADP: S_MAX workspace bound should accommodate s=8";
 }
 
 /* NaN/Inf detection for FP32: inject NaN, verify invalid_value returned. */
@@ -3211,8 +2800,6 @@ TEST_F(FixedPointEmulationFp32Test, NanDetectionFp32)
     FixedPointEmulationSettings settings{};
     settings.eager          = true; /* bypass perf gate in direct test calls */
 
-    settings.num_moduli    = 8u;
-    settings.dynamic_mode  = false;
     settings.sv_mask       = 0x3u; /* NaN + Inf detection enabled */
     settings.workspace     = d_ws;
     settings.workspace_bytes = ws_sz;

@@ -225,14 +225,12 @@ struct _rocblaslt_matmul_desc
 
     /* Per-matmul emulation settings (HIPBLASLT_MATMUL_DESC_EMULATION_*_EXT).
      * Sentinel values mean "inherit from env var / built-in default":
-     *   emulation_enabled          : -1 = inherit, 0 = force off, 1 = force on
-     *   emulation_strategy         : -1 = inherit, 0/1/2 = DEFAULT/PERFORMANT/EAGER
-     *   emulation_num_moduli       : -1 = ADP/inherit, 2..20 = FIXED
-     *   emulation_sv_mask          : ~0u = inherit (default=0x3)
-     *   emulation_mantissa_bits: 0 = inherit, 1..52 = explicit bit count     */
+     *   emulation_enabled      : -1 = inherit, 0 = force off, 1 = force on
+     *   emulation_strategy     : -1 = inherit, 0/1/2 = DEFAULT/PERFORMANT/EAGER
+     *   emulation_sv_mask      : ~0u = inherit (default=0x3)
+     *   emulation_mantissa_bits: 0 = inherit, 1..52 = explicit bit count    */
     int          emulation_enabled       = -1;
     int          emulation_strategy      = -1;
-    int          emulation_num_moduli    = -1;
     unsigned int emulation_sv_mask       = ~0u;
     int          emulation_mantissa_bits = 0;
 
@@ -270,7 +268,6 @@ struct _rocblaslt_matmul_desc
         this->bias_stride                 = src.bias_stride;
         this->emulation_enabled           = src.emulation_enabled;
         this->emulation_strategy          = src.emulation_strategy;
-        this->emulation_num_moduli        = src.emulation_num_moduli;
         this->emulation_sv_mask           = src.emulation_sv_mask;
         this->emulation_mantissa_bits     = src.emulation_mantissa_bits;
     }

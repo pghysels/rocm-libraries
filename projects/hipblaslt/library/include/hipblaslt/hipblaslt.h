@@ -266,11 +266,10 @@ typedef enum {
   HIPBLASLT_MATMUL_DESC_EPILOGUE_ACT_ARG0_EXT,              /**<First extra argument for the activation function. Data type: ``float``. */
   HIPBLASLT_MATMUL_DESC_EPILOGUE_ACT_ARG1_EXT,              /**<Second extra argument for the activation function. Data type: ``float``. */
   HIPBLASLT_MATMUL_DESC_STREAMK_TILE_SCHEDULING_EXT = 104,      /**<Select the hipBLASLt StreamK tile scheduling mode for StreamK=5 hybrid kernels (static SK3 vs dynamic SK4 work-queue sub-paths). Provided as an ``_EXT`` attribute. Accepts values from ``hipblasLtStreamKTileSchedulingMode_t``: ``0`` (``OFF``, default) uses the SK3 static sub-path; when ``HIPBLASLT_MATMUL_DESC_SM_COUNT_TARGET`` is set to a positive value the library heuristic still runs per launch to pick SK4 when appropriate; ``1`` (``ON``) always requests the SK4 dynamic work-queue sub-path when the selected kernel supports it; ``2`` (``AUTO``) always lets the library's heuristic pick between static and dynamic per launch. Values outside ``{0, 1, 2}`` are rejected with ``HIPBLAS_STATUS_INVALID_VALUE``. Data type: ``int32_t``. */
-  HIPBLASLT_MATMUL_DESC_EMULATION_ENABLED_EXT             = 105, /**<Enable/disable FP64/FP32 emulation via Ozaki Scheme II for this matmul. Data type: ``int32_t``. 1=force on, 0=force off, -1=inherit from env var (default). */
-  HIPBLASLT_MATMUL_DESC_EMULATION_STRATEGY_EXT            = 106, /**<Emulation strategy for this matmul. Data type: ``int32_t`` (``hipblasLtEmulationStrategy_t``). 0=DEFAULT, 1=PERFORMANT, 2=EAGER; -1=inherit from env var (default). */
-  HIPBLASLT_MATMUL_DESC_EMULATION_NUM_MODULI_EXT          = 107, /**<Number of CRT moduli for emulation. Data type: ``int32_t``. 2..20=FIXED mode, -1=ADP/inherit (default). WARNING: FIXED mode does not guarantee accuracy for all inputs. */
-  HIPBLASLT_MATMUL_DESC_EMULATION_MAX_MANTISSA_BIT_COUNT_EXT           = 108, /**<ADP maximum mantissa bit count (precision target). Data type: ``int32_t``. 1..52 = explicit bit count for FP64 (1..23 for FP32); 0=inherit from env var (default). Only affects ADP mode. */
-  HIPBLASLT_MATMUL_DESC_EMULATION_SPECIAL_VALUES_MASK_EXT = 109, /**<Inf/NaN detection mask for emulation. Data type: ``uint32_t``. Bit 0=Inf, bit 1=NaN; ~0u=inherit from env var (default=0x3). Set to 0 to skip detection. */
+  HIPBLASLT_MATMUL_DESC_EMULATION_ENABLED_EXT                = 105, /**<Enable/disable FP64/FP32 emulation via Ozaki Scheme II for this matmul. Data type: ``int32_t``. 1=force on, 0=force off, -1=inherit from env var (default). */
+  HIPBLASLT_MATMUL_DESC_EMULATION_STRATEGY_EXT               = 106, /**<Emulation strategy for this matmul. Data type: ``int32_t`` (``hipblasLtEmulationStrategy_t``). 0=DEFAULT, 1=PERFORMANT, 2=EAGER; -1=inherit from env var (default). */
+  HIPBLASLT_MATMUL_DESC_EMULATION_MAX_MANTISSA_BIT_COUNT_EXT = 107, /**<ADP maximum mantissa bit count (precision target). Data type: ``int32_t``. 1..52 = explicit bit count for FP64 (1..23 for FP32); 0=inherit from env var (default). Only affects ADP mode. */
+  HIPBLASLT_MATMUL_DESC_EMULATION_SPECIAL_VALUES_MASK_EXT    = 108, /**<Inf/NaN detection mask for emulation. Data type: ``uint32_t``. Bit 0=Inf, bit 1=NaN; ~0u=inherit from env var (default=0x3). Set to 0 to skip detection. */
   HIPBLASLT_MATMUL_DESC_MAX,
 } hipblasLtMatmulDescAttributes_t;
 
@@ -1163,8 +1162,8 @@ hipblasStatus_t hipblasLtMatrixTransform(hipblasLtHandle_t              lightHan
  *  \details
  *  Returns the number of bytes needed in the workspace buffer that must be
  *  passed to \ref hipblasLtMatmul when emulation is active.  The size depends
- *  on the matrix dimensions and the number of CRT moduli configured via
- *  ``HIPBLASLT_MATMUL_DESC_EMULATION_NUM_MODULI_EXT`` on \p matmulDesc.
+ *  on the matrix dimensions (always uses S_MAX=20 moduli for the workspace
+ *  layout, since ADP mode is always active).
  *
  *  Pass the return value to \ref hipblasLtMatmulPreferenceSetAttribute as
  *  \c HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES to guarantee that the
