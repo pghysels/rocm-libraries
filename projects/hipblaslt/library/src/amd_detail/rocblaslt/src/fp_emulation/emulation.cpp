@@ -962,12 +962,13 @@ namespace FixedPointEmulation
             const float   sftA_f  = static_cast<float>(sftA_init[row]);
             const float   log2_rm = 0.5f * log2f(static_cast<float>(rm));
             /* CRT accuracy: ensures |X_true| < M_s/2.
+             *   log2P ≥ (adp_bits − sftA) + 0.5·log2(R_i)
              * Truncation accuracy: ensures the per-element truncation error
              *   |ΔA · B_int| · 2^{-sftA-sftB} is within the target relative tolerance.
-             *   Bound: n · 2^{6-sftB_init} / 2^{sftA_refined} ≤ 2^{-adp_bits} · D_true,
-             *   which translates to log2P ≥ adp_bits + 6 - 2·sftA_init + 0.5·log2(C32i). */
+             *   Data-independent floor (density term omitted):
+             *   log2P ≥ adp_bits + 6 − 2·sftA_init */
             const float   crt_val   = (adp_bits - sftA_f) + log2_rm + 200.0f;
-            const float   trunc_val = (adp_bits + 6.0f - 2.0f * sftA_f) + log2_rm + 200.0f;
+            const float   trunc_val = (adp_bits + 6.0f - 2.0f * sftA_f) + 200.0f;
             local_val = fmaxf(crt_val, trunc_val);
         }
 
@@ -1039,9 +1040,10 @@ namespace FixedPointEmulation
         {
             const float sftB_f     = static_cast<float>(sftB_init[col]);
             const float log2_cm    = 0.5f * log2f(static_cast<float>(local_max));
-            /* CRT accuracy (B-side) + truncation accuracy (A truncation affects B-side). */
+            /* CRT accuracy (B-side): log2P ≥ (adp_bits − sftB) + 0.5·log2(col_max). */
             const float crt_req    = (adp_bits - sftB_f) + log2_cm + 200.0f;
-            const float trunc_req  = (adp_bits + 6.0f - 2.0f * sftB_f) + log2_cm + 200.0f;
+            /* Truncation: data-independent floor, symmetric with adp_reduce_A_kernel. */
+            const float trunc_req  = (adp_bits + 6.0f - 2.0f * sftB_f) + 200.0f;
             const float req_biased = fmaxf(crt_req, trunc_req);
             adp_atomicMaxF(adp_B_out, req_biased);
         }
@@ -2688,8 +2690,6 @@ namespace FixedPointEmulation
                 (settings.adp_mantissa_bits > 0)
                     ? settings.adp_mantissa_bits
                     : fixedPointEmulationAdpMantissaBits(std::is_same_v<T, double> ? HIP_R_64F : HIP_R_32F));
-            /* assume that relative componentwise error scales O(sqrt(K)) */
-                    //- std::floor(0.5f * std::log2(static_cast<float>(k)));
 
             /* A-side: reads row_max[] and sftA[] before apply_kernel modifies sftA. */
             hipLaunchKernelGGL(adp_reduce_A_kernel,
