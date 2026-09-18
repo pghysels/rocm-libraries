@@ -1176,11 +1176,15 @@ hipblasStatus_t hipblasLtMatrixTransform(hipblasLtHandle_t              lightHan
  *                         May be NULL to use env-var / built-in defaults.
  *  @param[in]  opA        Transpose mode for matrix A.
  *  @param[in]  opB        Transpose mode for matrix B.
- *  @param[in]  m          Number of rows of op(A) and D.
- *  @param[in]  n          Number of columns of op(B) and D.
- *  @param[in]  k          Shared dimension of op(A) and op(B).
+ *  @param[in]  m           Number of rows of op(A) and D.
+ *  @param[in]  n           Number of columns of op(B) and D.
+ *  @param[in]  k           Shared dimension of op(A) and op(B).
+ *  @param[in]  batch_count Number of matrices in the batch.  Currently only
+ *                          ``batch_count=1`` is supported; any other value
+ *                          returns 0 (reserved for future batched support).
  *
- *  \retval  Workspace size in bytes, or 0 on error.
+ *  \retval  Workspace size in bytes, or 0 if emulation is not applicable
+ *           (device not supported, emulation disabled, or ``batch_count != 1``).
  */
 HIPBLASLT_EXPORT
 size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t     handle,
@@ -1189,7 +1193,8 @@ size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t     handle,
                                        hipblasOperation_t    opB,
                                        int64_t               m,
                                        int64_t               n,
-                                       int64_t               k);
+                                       int64_t               k,
+                                       int32_t               batch_count);
 
 #ifdef __cplusplus
 }

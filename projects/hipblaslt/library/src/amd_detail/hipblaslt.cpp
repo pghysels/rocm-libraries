@@ -845,16 +845,20 @@ size_t hipblasLtEmulationWorkspaceSize(hipblasLtHandle_t     handle,
                                        hipblasOperation_t    opB,
                                        int64_t               m,
                                        int64_t               n,
-                                       int64_t               k)
+                                       int64_t               k,
+                                       int32_t               batch_count)
 try
 {
     if(m < 0 || n < 0 || k < 0) return 0;
+    /* batch_count != 1: emulation only supports non-batched GEMMs for now.
+     * Return 0 so callers can detect the unsupported configuration.
+     * Reserved for future batched support. */
+    if(batch_count != 1) return 0;
     /* Resolve emulation settings via the canonical decision function.
      * Reads from matmulDesc (if non-null) then falls back to env vars.
      * Checks FP64 first, then FP32 — the workspace formula is type-independent
      * (depends only on m, n, k, and num_moduli), so the first applicable type
      * returns the correct size for either data type.
-     * batch_count=1 because emulation only supports non-batched GEMMs.
      * Returns 0 when no type has emulation enabled or the device is unsupported. */
     const auto* h    = reinterpret_cast<const _rocblaslt_handle*>(handle);
     const auto* desc = reinterpret_cast<const _rocblaslt_matmul_desc*>(matmulDesc);

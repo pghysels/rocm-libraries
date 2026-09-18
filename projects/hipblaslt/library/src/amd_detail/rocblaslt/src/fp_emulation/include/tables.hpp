@@ -23,14 +23,34 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <array>
 
 namespace FixedPointEmulation
 {
     /* =========================================================================
      * Fundamental emulation constants
      * ========================================================================= */
-    /* Maximum number of moduli supported (s = 2 .. S_MAX). */
-    static constexpr unsigned S_MAX = 20u;
+    /* Maximum number of moduli for FP64 (full precision range). */
+    static constexpr unsigned S_MAX_FP64 = 20u;
+    /* Maximum number of moduli for FP32 (reduced range; 12 moduli give
+     * ~46 bits of CRT capacity, far exceeding FP32's 23-bit precision). */
+    static constexpr unsigned S_MAX_FP32 = 12u;
+    /* S_MAX is an alias for S_MAX_FP64 and is used for table sizing only. */
+    static constexpr unsigned S_MAX = S_MAX_FP64;
+
+    /* Returns the maximum number of moduli for the given floating-point type T.
+     * Use these functions in kernels and workspace-size calculations instead of
+     * the raw constants, so that FP32 paths use the smaller S_MAX_FP32. */
+    template <typename T>
+    __host__ __device__ constexpr unsigned max_num_moduli() noexcept { return S_MAX_FP64; }
+    template <>
+    __host__ __device__ constexpr unsigned max_num_moduli<float>() noexcept { return S_MAX_FP32; }
+
+    /* hipDataType overload for non-templated callers. */
+    inline __host__ __device__ constexpr unsigned max_num_moduli(hipDataType t) noexcept
+    {
+        return (t == HIP_R_32F) ? S_MAX_FP32 : S_MAX_FP64;
+    }
 
     /* Alignment for INT8 arrays (128 bytes = 128 INT8 elements). */
     static constexpr size_t ALIGN = 128u;
@@ -41,86 +61,48 @@ namespace FixedPointEmulation
         return (n + ALIGN - 1u) / ALIGN * ALIGN;
     }
 
+
     /* =========================================================================
      * s-independent constants (same for all num_moduli values)
      * ========================================================================= */
 
-    __device__ __forceinline__ double neg_mod(unsigned i) noexcept
+    /* The S_MAX pairwise-coprime CRT moduli m_i, as positive integers.
+     * All derived tables (neg_mod, inv_mod, inv_mod_f) are computed from
+     * these values. */
+    static constexpr int moduli[S_MAX] = {
+        256, 255, 253, 251, 247, 241, 239, 233, 229, 227,
+        223, 217, 211, 199, 197, 193, 191, 181, 179, 173,
+    };
+
+    /* Negative of the i-th CRT modulus m_i, i.e. -m_i, as a double. */
+    __device__ __forceinline__ constexpr double neg_mod(unsigned i) noexcept
     {
-        static constexpr double v[S_MAX] = {-256.0,
-                                            -255.0,
-                                            -253.0,
-                                            -251.0,
-                                            -247.0,
-                                            -241.0,
-                                            -239.0,
-                                            -233.0,
-                                            -229.0,
-                                            -227.0,
-                                            -223.0,
-                                            -217.0,
-                                            -211.0,
-                                            -199.0,
-                                            -197.0,
-                                            -193.0,
-                                            -191.0,
-                                            -181.0,
-                                            -179.0,
-                                            -173.0};
+        return -(double)moduli[i];
+    }
+
+    /* Nearest double to 1/m_i, derived at compile time from moduli[].
+     * Used in the fast reduction r_i = X - m_i * round(X * inv_mod[i]). */
+    __device__ __forceinline__ constexpr double inv_mod(unsigned i) noexcept
+    {
+        constexpr auto v = []() constexpr {
+            std::array<double, S_MAX> a{};
+            for(unsigned k = 0; k < S_MAX; ++k)
+                a[k] = 1.0 / (double)moduli[k];
+            return a;
+        }();
         return v[i];
     }
 
-    __device__ __forceinline__ double inv_mod(unsigned i) noexcept
+    /* Nearest float to 1/m_i, derived at compile time from inv_mod[].
+     * Used in the fast reduction r_i = X - m_i * round(X * inv_mod_f[i]). */
+    __device__ __forceinline__ constexpr float inv_mod_f(unsigned i) noexcept
     {
-        static constexpr double v[S_MAX] = {
-            0x1.0000000000000p-8, /* 1/256 */
-            0x1.0101010101010p-8, /* 1/255 */
-            0x1.03091b51f5e1ap-8, /* 1/253 */
-            0x1.05197f7d73404p-8, /* 1/251 */
-            0x1.0953f39010954p-8, /* 1/247 */
-            0x1.0fef010fef011p-8, /* 1/241 */
-            0x1.12358e75d3033p-8, /* 1/239 */
-            0x1.19453808ca29cp-8, /* 1/233 */
-            0x1.1e2ef3b3fb874p-8, /* 1/229 */
-            0x1.20b470c67c0d9p-8, /* 1/227 */
-            0x1.25e22708092f1p-8, /* 1/223 */
-            0x1.2e025c04b8097p-8, /* 1/217 */
-            0x1.3698df3de0748p-8, /* 1/211 */
-            0x1.49539e3b2d067p-8, /* 1/199 */
-            0x1.4cab88725af6ep-8, /* 1/197 */
-            0x1.5390948f40febp-8, /* 1/193 */
-            0x1.571ed3c506b3ap-8, /* 1/191 */
-            0x1.6a13cd1537290p-8, /* 1/181 */
-            0x1.6e1f76b4337c7p-8, /* 1/179 */
-            0x1.7ad2208e0ecc3p-8  /* 1/173 */
-        };
-        return v[i];
-    }
-
-    __device__ __forceinline__ float inv_mod_f(unsigned i) noexcept
-    {
-        static constexpr float v[S_MAX] = {
-            0x1.000000p-8F, /* 1/256  (exact) */
-            0x1.010102p-8F, /* 1/255  */
-            0x1.03091cp-8F, /* 1/253  */
-            0x1.051980p-8F, /* 1/251  */
-            0x1.0953f4p-8F, /* 1/247  */
-            0x1.0fef02p-8F, /* 1/241  */
-            0x1.12358ep-8F, /* 1/239  */
-            0x1.194538p-8F, /* 1/233  */
-            0x1.1e2ef4p-8F, /* 1/229  */
-            0x1.20b470p-8F, /* 1/227  */
-            0x1.25e228p-8F, /* 1/223  */
-            0x1.2e025cp-8F, /* 1/217  */
-            0x1.3698e0p-8F, /* 1/211  */
-            0x1.49539ep-8F, /* 1/199  */
-            0x1.4cab88p-8F, /* 1/197  */
-            0x1.539094p-8F, /* 1/193  */
-            0x1.571ed4p-8F, /* 1/191  */
-            0x1.6a13cep-8F, /* 1/181  */
-            0x1.6e1f76p-8F, /* 1/179  */
-            0x1.7ad22p-8F   /* 1/173  */
-        };
+        constexpr auto v = []() constexpr {
+            std::array<float, S_MAX> a{};
+            for(unsigned k = 0; k < S_MAX; ++k)
+                a[k] = static_cast<float>(inv_mod(k));
+            return a;
+        }();
         return v[i];
     }
 
@@ -128,6 +110,9 @@ namespace FixedPointEmulation
      * s-dependent CRT product scalars  (indexed by s_idx = num_moduli - 2)
      * ========================================================================= */
 
+    /* High part of the double-double for the s-moduli product
+     * P_s = m_0 * m_1 * ... * m_{s-1}: nearest double to P_s.
+     * Indexed by s_idx = s - 2. */
     __device__ __forceinline__ double P_hi(unsigned s_idx) noexcept
     {
         static constexpr double v[S_MAX - 1] = {
@@ -148,12 +133,14 @@ namespace FixedPointEmulation
             -5.5185783079729035e+37, /* s=16 */
             -1.0540484568228245e+40, /* s=17 */
             -1.9078277068493124e+42, /* s=18 */
-            -0x1.ea07b6b4ad3d8p+147, /* s=19 */
-            -0x1.4b27367819129p+155, /* s=20 */
+            -3.6150895854019697e+44, /* s=19 */
+            -6.2655354614344461e+46, /* s=20 */
         };
         return v[s_idx];
     }
 
+    /* Low (correction) part of the double-double for P_s: P_s - P_hi, exact.
+     * Zero for s <= 7, where P_s fits exactly in a double. */
     __device__ __forceinline__ double P_lo(unsigned s_idx) noexcept
     {
         static constexpr double v[S_MAX - 1] = {
@@ -174,12 +161,15 @@ namespace FixedPointEmulation
             3.2597489231298749e+21,  /* s=16 */
             -2.5574812149594794e+23, /* s=17 */
             4.6796878119559867e+25,  /* s=18 */
-            0x1.087f623ab88f0p+89,   /* s=19 */
-            0x1.595f0ab0d75c5p+98,   /* s=20 */
+            6.5388753891946189e+26,  /* s=19 */
+            1.3882019028900199e+29,  /* s=20 */
         };
         return v[s_idx];
     }
 
+    /* Nearest double to 1/P_s.
+     * Used to fold an accumulated integer X into the symmetric range
+     * (-P_s/2, P_s/2] via X <- X - round(X * inv_P) * P_s. */
     __device__ __forceinline__ double inv_P(unsigned s_idx) noexcept
     {
         static constexpr double v[S_MAX - 1] = {
@@ -200,18 +190,15 @@ namespace FixedPointEmulation
             1.8120609044457363e-38, /* s=16 */
             9.4872298662080431e-41, /* s=17 */
             5.2415634619933945e-43, /* s=18 */
-            0x1.0b7a38d26e2fep-148, /* s=19 */
-            0x1.8bce042d07acep-156, /* s=20 */
+            2.7659888978867742e-45, /* s=19 */
+            1.5963847073268413e-47, /* s=20 */
         };
         return v[s_idx];
     }
 
-    /* =========================================================================
-     * s-dependent CRT coefficients qpi_hi and qpi_lo
-     * Indexed by (s_idx, mod_idx) where s_idx = num_moduli-2, mod_idx ∈ [0, s).
-     * C++ zero-initializes any omitted trailing elements in each row.
-     * ========================================================================= */
-
+    /* High part of the double-double for the i-th CRT basis element
+     * q_i = (P_s / m_i) * [(P_s / m_i)^{-1} mod m_i].
+     * Direct reconstruction weights: X = sum_i r_i * q_i  (mod P_s). */
     __device__ __forceinline__ double qpi_hi(unsigned s_idx, unsigned mod_idx) noexcept
     {
         static constexpr double v[S_MAX - 1][S_MAX] = {
@@ -447,6 +434,7 @@ namespace FixedPointEmulation
         return v[s_idx][mod_idx];
     }
 
+    /* Low (correction) part of the double-double for q_i: complement to qpi_hi. */
     __device__ __forceinline__ double qpi_lo(unsigned s_idx, unsigned mod_idx) noexcept
     {
         static constexpr double v[S_MAX - 1][S_MAX] = {
@@ -656,18 +644,8 @@ namespace FixedPointEmulation
         return v[s_idx][mod_idx];
     }
 
-    /* =========================================================================
-     * Per-s scalar tables: cumulative CRT capacity and shift-refinement log2P.
-     *
-     * cum_bits[s-2]  — cumulative number of significant bits provided by
-     *                  the s-moduli CRT product M_s (source: GEMMul8).
-     *
-     * log2P[s-2]     — the log2P constant for the shift-refinement formula
-     *                    sft_delta = floor(-0.5 * log2(row_max) + log2P)
-     *                  Uses GEMMul8 'safe' values (1 bit below the tightest
-     *                  bound) to guarantee a ≥ 2-bit safety margin between
-     *                  |X_true| and M_s/2 for any valid FP64 input.
-     * ========================================================================= */
+    /* Cumulative bit capacity of the s-moduli CRT ring:
+     * approximately sum_{i=0}^{s-1} log2(|m_i|). */
     static constexpr double cum_bits[S_MAX - 1] = {
         15.994,  /* s=2  */
         23.976,  /* s=3  */
@@ -690,26 +668,27 @@ namespace FixedPointEmulation
         155.371, /* s=20 */
     };
 
-    static const float log2P[S_MAX - 1] = {
-        6.49716520e+00F, /* s=2  */
-        1.04886732e+01F, /* s=3  */
-        1.44744443e+01F, /* s=4  */
-        1.84486274e+01F, /* s=5  */
-        2.24050731e+01F, /* s=6  */
-        2.63555068e+01F, /* s=7  */
-        3.02875995e+01F, /* s=8  */
-        3.42071990e+01F, /* s=9  */
-        3.81204757e+01F, /* s=10 */
-        4.20209236e+01F, /* s=11 */
-        4.59016990e+01F, /* s=12 */
-        4.97622489e+01F, /* s=13 */
-        5.35805625e+01F, /* s=14 */
-        5.73915863e+01F, /* s=15 */
-        6.11878166e+01F, /* s=16 */
-        6.49765319e+01F, /* s=17 */
-        6.87264480e+01F, /* s=18 */
-        7.24683559e+01F, /* s=19 */
-        7.61856700e+01F, /* s=20 */
+    /* log2(|P_s|).  GEMMul8 "safe" value, 1 bit below the tightest bound. */
+    static constexpr double log2P[S_MAX - 1] = {
+        6.49716520e+00, /* s=2  */
+        1.04886732e+01, /* s=3  */
+        1.44744443e+01, /* s=4  */
+        1.84486274e+01, /* s=5  */
+        2.24050731e+01, /* s=6  */
+        2.63555068e+01, /* s=7  */
+        3.02875995e+01, /* s=8  */
+        3.42071990e+01, /* s=9  */
+        3.81204757e+01, /* s=10 */
+        4.20209236e+01, /* s=11 */
+        4.59016990e+01, /* s=12 */
+        4.97622489e+01, /* s=13 */
+        5.35805625e+01, /* s=14 */
+        5.73915863e+01, /* s=15 */
+        6.11878166e+01, /* s=16 */
+        6.49765319e+01, /* s=17 */
+        6.87264480e+01, /* s=18 */
+        7.24683559e+01, /* s=19 */
+        7.61856700e+01, /* s=20 */
     };
 
 } // namespace FixedPointEmulation

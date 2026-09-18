@@ -50,7 +50,7 @@
 #include <cstdio> // std::fopen / std::fprintf / std::fclose / std::ftell
 #include <cstdlib> // std::getenv
 #include <cstring> // std::strcmp
-#include <limits> // std::numeric_limits (for fused kernel model)
+#include <limits> // std::numeric_limits
 #include <optional> // std::optional
 #include <unordered_map> // std::unordered_map
 #include <utility> // std::index_sequence, std::make_index_sequence
@@ -173,32 +173,18 @@ namespace FixedPointEmulation
     }
 
     /* Returns the minimum number of moduli s ∈ [2, S_MAX] such that
-     * log2P[s-2] >= (adp_bits + 2), used ONLY in the PERFORMANCE MODEL
-     * (perf_model_s) to predict which s ADP will select at runtime.
-     *
-     * The +2 adds two bits beyond the bare mantissa target:
-     *   +1 for the IEEE 754 implicit leading bit (the ADP formula operates on
-     *      the significand, which has one more bit than the stored mantissa)
-     *   +1 safety margin so the heuristic does not underestimate the required s
-     *      for slightly ill-conditioned inputs.
-     *
-     * NOTE: the +1 safety margin baked into the log2P table itself (added to
-     * prevent occasional CRT overflows in fixed-s mode) is a separate,
-     * independent correction applied at runtime during the shift-refinement
-     * step (refine_sftA_apply_kernel / refine_sftB_kernel).  It is NOT the
-     * same as — and does not interact with — this performance-model +2.
-     *
-     * Falls back to S_MAX when adp_bits <= 0 (sentinel) or when all moduli
-     * are needed to reach the target.                                        */
-    static unsigned adp_expected_num_moduli(int adp_bits) noexcept
+     * log2P[s-2] >= adp_bits, used ONLY in the PERFORMANCE MODEL to predict
+     * which s ADP will select at runtime.  Falls back to S_MAX when
+     * adp_bits <= 0 (sentinel) or when all moduli are needed to reach the
+     * target.                                                                */
+    static unsigned adp_expected_num_moduli(int adp_bits, unsigned max_s) noexcept
     {
         if(adp_bits <= 0)
-            return S_MAX;
-        const int target = adp_bits + 2;
-        for(unsigned s = 2u; s <= S_MAX; ++s)
-            if(log2P[s - 2u] >= static_cast<float>(target))
+            return max_s;
+        for(unsigned s = 2u; s <= max_s; ++s)
+            if(log2P[s - 2u] >= static_cast<float>(adp_bits))
                 return s;
-        return S_MAX;
+        return max_s;
     }
 
     /* =========================================================================
@@ -2233,12 +2219,12 @@ namespace FixedPointEmulation
         /* Type-specific label strings for warning messages. */
         constexpr const char* type_name  = std::is_same_v<T, double> ? "FP64" : "FP32";
         constexpr const char* native_str = std::is_same_v<T, double> ? "DGEMM" : "SGEMM";
-        /* Always ADP mode: workspace layout always covers S_MAX moduli.
+        /* Always ADP mode: workspace layout always covers max_num_moduli<T>() moduli.
          * fixedPointEmulationNumModuli() post-ADP override is applied later. */
-        const unsigned num_moduli = S_MAX;
-        /* Workspace budget: always use S_MAX because ADP selects effective_s
-         * at runtime — the workspace must accommodate up to S_MAX moduli.   */
-        const size_t ws_budget = compute_budget_from_ws(m, n, k, S_MAX, settings.workspace_bytes);
+        const unsigned num_moduli = max_num_moduli<T>();
+        /* Workspace budget: use max_num_moduli<T>() because ADP selects effective_s
+         * at runtime — the workspace must accommodate up to that many moduli. */
+        const size_t ws_budget = compute_budget_from_ws(m, n, k, num_moduli, settings.workspace_bytes);
 
         {
             const unsigned chunk_sz = compute_chunk_size(m, n, k, num_moduli, ws_budget);
@@ -2271,12 +2257,12 @@ namespace FixedPointEmulation
                  * fast but are not).  Skip the model and force the split immediately. */
                 const bool force_split = (ws_budget == 0u);
                 /* ADP-aware performance model s: use the minimum s that satisfies the
-                 * precision target (adp_bits + 2 safety bits) instead of S_MAX, to
-                 * avoid overestimating emulation cost in dynamic mode.                */
+                 * precision target instead of S_MAX, to avoid overestimating emulation
+                 * cost in dynamic mode.                                               */
                 const int adp_bits_impl = (settings.adp_mantissa_bits > 0)
                     ? static_cast<int>(settings.adp_mantissa_bits)
                     : fixedPointEmulationAdpMantissaBits(type_a_perf);
-                const unsigned pm_s_impl = adp_expected_num_moduli(adp_bits_impl);
+                const unsigned pm_s_impl = adp_expected_num_moduli(adp_bits_impl, num_moduli);
                 const double t_mono = force_split ? 0.0
                     : perf_model_times(tA, tB, m, n, k, pm_s_impl, device,
                                        ws_budget, type_a_perf)
@@ -2403,8 +2389,8 @@ namespace FixedPointEmulation
             }
         };
 
-        /* Always ADP (dynamic) mode: layout always covers S_MAX moduli. */
-        const unsigned layout_moduli = S_MAX;
+        /* Always ADP (dynamic) mode: layout always covers max_num_moduli<T>() moduli. */
+        const unsigned layout_moduli = num_moduli;
         const unsigned chunk_size = compute_chunk_size(m, n, k, layout_moduli, ws_budget);
 
         const size_t lda8i  = pad(static_cast<size_t>(k));
@@ -2727,9 +2713,9 @@ namespace FixedPointEmulation
 
             const float log2P_needed = std::max(h_adp[0], h_adp[1]) - 200.0f;
 
-            if(log2P_needed > log2P[S_MAX - 2u])
+            if(log2P_needed > log2P[num_moduli - 2u])
             {
-                /* ADP determined s=S_MAX is still insufficient for this input.
+                /* ADP determined the type's max moduli are still insufficient.
                  * Before giving up, check whether HIPBLASLT_EMULATION_NUM_MODULI
                  * provides a forced override — if so, use it and proceed.
                  * This allows test/debug code to force a specific s even when the
@@ -2737,7 +2723,7 @@ namespace FixedPointEmulation
                  * guaranteed, but the computation will run rather than returning
                  * invalid_value).                                                 */
                 const unsigned override_s_adp = fixedPointEmulationNumModuli();
-                if(override_s_adp >= 2u && override_s_adp <= S_MAX)
+                if(override_s_adp >= 2u && override_s_adp <= num_moduli)
                 {
                     effective_s = override_s_adp;
                 }
@@ -2754,14 +2740,14 @@ namespace FixedPointEmulation
                                    << "): " << "A-side log2P_req=" << (h_adp[0] - 200.0f) << " bits, "
                                    << "B-side=" << (h_adp[1] - 200.0f) << " bits, "
                                    << "max required=" << log2P_needed
-                                   << " > supported max=" << log2P[S_MAX - 2u] << " (s=" << S_MAX
-                                   << " moduli, ~" << cum_bits[S_MAX - 2u]
+                                   << " > supported max=" << log2P[num_moduli - 2u] << " (s=" << num_moduli
+                                   << " moduli, ~" << cum_bits[num_moduli - 2u]
                                    << " cumulative bits). Falling back to native " << native_str << "." << std::endl;
                     return rocblaslt_status_invalid_value;
                 }
             }
 
-            for(unsigned s = 2u; s <= S_MAX; ++s)
+            for(unsigned s = 2u; s <= num_moduli; ++s)
             {
                 if(log2P[s - 2u] >= log2P_needed)
                 {
@@ -2774,7 +2760,7 @@ namespace FixedPointEmulation
          * ADP-selected s.  Only for testing; accuracy is not guaranteed below ADP value. */
         {
             const unsigned override_s = fixedPointEmulationNumModuli();
-            if(override_s >= 2u && override_s <= S_MAX)
+            if(override_s >= 2u && override_s <= num_moduli)
                 effective_s = override_s;
         }
 
@@ -2803,147 +2789,127 @@ namespace FixedPointEmulation
                            refine_log2P);
         _pstop(_t_refine); /* partial: refine_sftA_apply + refine_sftB */
 
-        /* ── Scale + Fused/non-fused dispatch ────────────────────────────────────────────
-         * (Scale always runs — its time is excluded from the gate comparison.)
-         *
-         * Fused path:  scale → oz2_fused_TN_kernel (reads INT8 A8i/B8i → writes FP64 D)
-         * Non-fused:   scale → hipblasLtMatmul (INT8 GEMM) → accum/finalize kernels        */
-        const size_t strideA8i = lda8i * cola8i;
-        const size_t strideB8i = ldb8i * static_cast<size_t>(n);
-
-        /* ── Scale dispatch lambda ─────────────────────────────────────────────── */
-        /* Shared by both fused and non-fused paths to avoid duplicating the
-         * 18-case switch.  Launches A and B scale kernels for one chunk and
-         * accumulates elapsed time into _t_scale.                                   */
-        auto launch_scale_chunk = [&](unsigned sc_start, unsigned sc_count) {
-            _pstart();
-            dispatch_by_index<S_MAX>(sc_count, [&](auto Count) {
-                constexpr unsigned TC = Count.value;
-                launch_scale_A<TC>(tA, A, m, lda, A8i, lda8i, cola8i, sftA, k, sc_start, stream);
-                launch_scale_B<TC>(tB, B, n, ldb, B8i, ldb8i, sftB, k, sc_start, stream);
-            });
-
-            _pstop(_t_scale);
-        };
-
+        /* Scale → INT8 GEMM → CRT accum/finalize.
+         * Flat single loop: each pass scales `actual` moduli into A8i[0..actual-1]
+         * then runs one batched GEMM of batch_count=actual.                       */
+        int32_t       batch_cur  = 0; /* set on first iteration */
+        const int64_t stride_A_b = static_cast<int64_t>(lda8i * cola8i);
+        const int64_t stride_B_b = static_cast<int64_t>(ldb8i * static_cast<size_t>(n));
+        const int64_t stride_C_b = static_cast<int64_t>(szC32i);
         {
-            /* Non-fused path: scale + hipblasLtMatmul (INT8 GEMM) + accum/finalize. */
-            /* Flat single loop: each pass scales `actual` moduli into A8i[0..actual-1]
-             * then runs one batched GEMM of batch_count=actual.                       */
-            int32_t       batch_cur  = 0; /* set on first iteration */
-            const int64_t stride_A_b = static_cast<int64_t>(strideA8i);
-            const int64_t stride_B_b = static_cast<int64_t>(strideB8i);
-            const int64_t stride_C_b = static_cast<int64_t>(szC32i);
+            auto _wt0 = WallClock::now();
+            hipblasLtMatrixLayoutSetAttribute(context.layoutA,
+                                              HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                              &stride_A_b,
+                                              sizeof(stride_A_b));
+            hipblasLtMatrixLayoutSetAttribute(context.layoutB,
+                                              HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                              &stride_B_b,
+                                              sizeof(stride_B_b));
+            hipblasLtMatrixLayoutSetAttribute(context.layoutCD,
+                                              HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                              &stride_C_b,
+                                              sizeof(stride_C_b));
+            if(_prof) _t_batch_attr += WallMs(WallClock::now() - _wt0).count();
+        }
+
+        for(unsigned chunk_start = 0; chunk_start < effective_s; chunk_start += chunk_size)
+        {
+            const unsigned actual = std::min(chunk_size, effective_s - chunk_start);
+
+            /* Scale: write actual moduli into A8i[0..actual-1] / B8i[0..actual-1] */
+            _pstart();
+            dispatch_by_index<max_num_moduli<T>()>(actual, [&](auto Count) {
+                constexpr unsigned TC = Count.value;
+                launch_scale_A<TC>(tA, A, m, lda, A8i, lda8i, cola8i, sftA, k, chunk_start, stream);
+                launch_scale_B<TC>(tB, B, n, ldb, B8i, ldb8i, sftB, k, chunk_start, stream);
+            });
+            _pstop(_t_scale);
+
+            /* Update batch_count when it changes (normally constant; may differ on
+             * the final pass when effective_s is not a multiple of chunk_size).    */
+            if(static_cast<int32_t>(actual) != batch_cur)
             {
+                batch_cur = static_cast<int32_t>(actual);
                 auto _wt0 = WallClock::now();
                 hipblasLtMatrixLayoutSetAttribute(context.layoutA,
-                                                  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                                  &stride_A_b,
-                                                  sizeof(stride_A_b));
+                                                  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                  &batch_cur,
+                                                  sizeof(batch_cur));
                 hipblasLtMatrixLayoutSetAttribute(context.layoutB,
-                                                  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                                  &stride_B_b,
-                                                  sizeof(stride_B_b));
+                                                  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                  &batch_cur,
+                                                  sizeof(batch_cur));
                 hipblasLtMatrixLayoutSetAttribute(context.layoutCD,
-                                                  HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                                                  &stride_C_b,
-                                                  sizeof(stride_C_b));
+                                                  HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                  &batch_cur,
+                                                  sizeof(batch_cur));
                 if(_prof) _t_batch_attr += WallMs(WallClock::now() - _wt0).count();
             }
 
-            for(unsigned chunk_start = 0; chunk_start < effective_s; chunk_start += chunk_size)
+            _pstart();
             {
-                const unsigned actual = std::min(chunk_size, effective_s - chunk_start);
-
-                /* Scale: write actual moduli into A8i[0..actual-1] / B8i[0..actual-1] */
-                launch_scale_chunk(chunk_start, actual);
-
-                /* Update batch_count when it changes (normally constant; may differ on
-                 * the final pass when effective_s is not a multiple of chunk_size).    */
-                if(static_cast<int32_t>(actual) != batch_cur)
+                /* A8i and B8i both start at position 0: the scale pass wrote actual
+                 * moduli into A8i[0..actual-1] / B8i[0..actual-1].                */
+                const hipblasStatus_t batch_st = hipblasLtMatmul(context.int8_handle,
+                                                                 context.matmulDesc,
+                                                                 &one_i,
+                                                                 A8i,
+                                                                 context.layoutA,
+                                                                 B8i,
+                                                                 context.layoutB,
+                                                                 &zero_i,
+                                                                 C32i_batch,
+                                                                 context.layoutCD,
+                                                                 C32i_batch,
+                                                                 context.layoutCD,
+                                                                 nullptr,
+                                                                 int8_ws,
+                                                                 int8_ws_size,
+                                                                 stream);
+                _pstop(_t_int8);
+                if(batch_st != HIPBLAS_STATUS_SUCCESS)
                 {
-                    batch_cur = static_cast<int32_t>(actual);
-                    auto _wt0 = WallClock::now();
-                    hipblasLtMatrixLayoutSetAttribute(context.layoutA,
-                                                      HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                                                      &batch_cur,
-                                                      sizeof(batch_cur));
-                    hipblasLtMatrixLayoutSetAttribute(context.layoutB,
-                                                      HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                                                      &batch_cur,
-                                                      sizeof(batch_cur));
-                    hipblasLtMatrixLayoutSetAttribute(context.layoutCD,
-                                                      HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                                                      &batch_cur,
-                                                      sizeof(batch_cur));
-                    if(_prof) _t_batch_attr += WallMs(WallClock::now() - _wt0).count();
+                    hipblaslt_cerr
+                        << "[hipBLASLt " << type_name << " emulation] WARNING: INT8 batch GEMM failed "
+                        << "(m=" << m << ", n=" << n << ", k=" << k
+                        << ", batch_count=" << batch_cur << ", moduli_offset=" << chunk_start
+                        << ", status=" << (int)batch_st << "). "
+                        << "Falling back to native " << native_str << "." << std::endl;
+                    (void)hipStreamSynchronize(stream);
+                    (void)hipGetLastError();
+                    return rocblaslt_status_internal_error;
                 }
-
-                _pstart();
-                {
-                    /* A8i and B8i both start at position 0: the scale pass wrote actual
-                     * moduli into A8i[0..actual-1] / B8i[0..actual-1].                */
-                    const hipblasStatus_t batch_st = hipblasLtMatmul(context.int8_handle,
-                                                                     context.matmulDesc,
-                                                                     &one_i,
-                                                                     A8i,
-                                                                     context.layoutA,
-                                                                     B8i,
-                                                                     context.layoutB,
-                                                                     &zero_i,
-                                                                     C32i_batch,
-                                                                     context.layoutCD,
-                                                                     C32i_batch,
-                                                                     context.layoutCD,
-                                                                     nullptr,
-                                                                     int8_ws,
-                                                                     int8_ws_size,
-                                                                     stream);
-                    _pstop(_t_int8);
-                    if(batch_st != HIPBLAS_STATUS_SUCCESS)
-                    {
-                        hipblaslt_cerr
-                            << "[hipBLASLt " << type_name << " emulation] WARNING: INT8 batch GEMM failed "
-                            << "(m=" << m << ", n=" << n << ", k=" << k
-                            << ", batch_count=" << batch_cur << ", moduli_offset=" << chunk_start
-                            << ", status=" << (int)batch_st << "). "
-                            << "Falling back to native " << native_str << "." << std::endl;
-                        (void)hipStreamSynchronize(stream);
-                        (void)hipGetLastError();
-                        return rocblaslt_status_internal_error;
-                    }
-                }
-
-                const bool is_first = (chunk_start == 0);
-                const bool is_last  = (chunk_start + actual >= effective_s);
-                const bool has_lo   = (effective_s > 7u);
-                _pstart();
-                dispatch_by_index<S_MAX>(actual, [&](auto Count) {
-                    dispatch_accum_chunk<Count.value>(is_first,
-                                                      is_last,
-                                                      has_lo,
-                                                      C32i_batch,
-                                                      Zhi,
-                                                      Zlo,
-                                                      m,
-                                                      n,
-                                                      ldc32i,
-                                                      chunk_start,
-                                                      effective_s,
-                                                      C,
-                                                      D,
-                                                      ldc,
-                                                      ldd,
-                                                      *alpha,
-                                                      *beta,
-                                                      sftA,
-                                                      sftB,
-                                                      stream);
-                });
-
-                _pstop(_t_accum);
             }
 
+            const bool is_first = (chunk_start == 0);
+            const bool is_last  = (chunk_start + actual >= effective_s);
+            const bool has_lo   = (effective_s > 7u);
+            _pstart();
+            dispatch_by_index<max_num_moduli<T>()>(actual, [&](auto Count) {
+                dispatch_accum_chunk<Count.value>(is_first,
+                                                  is_last,
+                                                  has_lo,
+                                                  C32i_batch,
+                                                  Zhi,
+                                                  Zlo,
+                                                  m,
+                                                  n,
+                                                  ldc32i,
+                                                  chunk_start,
+                                                  effective_s,
+                                                  C,
+                                                  D,
+                                                  ldc,
+                                                  ldd,
+                                                  *alpha,
+                                                  *beta,
+                                                  sftA,
+                                                  sftB,
+                                                  stream);
+            });
+
+            _pstop(_t_accum);
         }
 
         if(_prof)
@@ -3134,12 +3100,8 @@ size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
 {
     using namespace FixedPointEmulation;
     assert(h != nullptr && "fixedPointEmulationWorkspaceSize requires a valid handle");
-    /* Always ADP mode: workspace always covers S_MAX moduli. */
-    const unsigned num_moduli = S_MAX;
-    /* When the fused kernel is forced (HIPBLASLT_EMULATION_FUSED=on/force), use the
-     * fused chunk formula (excludes C32i from workspace budget).  This eliminates
-     * binary-halving for all practical shapes, avoiding per-leaf pipeline overhead.
-     * Consistent with the split decision in emulated_gemm_impl.              */
+    /* Always ADP mode: workspace covers max_num_moduli(type_a) moduli. */
+    const unsigned num_moduli = max_num_moduli(type_a);
     /* Optimal workspace: chunk_size = split_num_moduli (single pass, no budget constraint).
      * n_chunks = 1 → split check never fires.  Always return monolithic workspace.  */
 
@@ -3157,10 +3119,7 @@ size_t fixedPointEmulationWorkspaceSize(const _rocblaslt_handle*           h,
      * (chunk_ws < num_moduli).  Single-pass finalize writes D directly.  */
     const size_t szZhi_ws = (chunk_ws < num_moduli) ? szC32i : 0u;
 
-    /* C32i production slots:
-     *   Fused path: C32i is accumulated in registers — only 1 slot needed for
-     *               the preliminary GEMM result.
-     *   Non-fused:  chunk_ws slots for the batched INT8 GEMMs.                */
+    /* C32i production slots: chunk_ws slots for the batched INT8 GEMMs. */
     const size_t n_c32i_ws = static_cast<size_t>(chunk_ws);
 
     const size_t optimal = chunk_ws * lda8i * cola8i * sizeof(int8_t)
@@ -3238,8 +3197,8 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
      * settings.workspace / settings.workspace_bytes.  If none is provided
      * or the budget makes emulation slower than native, fall back to native. */
     const _rocblaslt_handle* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
-    /* Always ADP mode: layout always S_MAX moduli. */
-    const unsigned num_moduli = S_MAX;
+    /* Always ADP mode: layout uses max_num_moduli<double>() moduli. */
+    const unsigned num_moduli = max_num_moduli<double>();
     const int      device     = h->device;
 
     const FixedPointEmulationSettings& effectiveSettings = settings;
@@ -3275,12 +3234,11 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
             + 2 * sizeof(float)             /* adp_buf    */
             + OZ2_INT8_GEMM_WS_BYTES;       /* = 0        */
 
-        /* Always dynamic: S_MAX moduli for layout. */
         const size_t W_var1 = (W > base_oh) ? W - base_oh : 0u;
-        const unsigned cs1  = compute_chunk_size(m, n, k, S_MAX, W_var1);
+        const unsigned cs1  = compute_chunk_size(m, n, k, num_moduli, W_var1);
 
         size_t W_var;
-        if(cs1 < S_MAX)
+        if(cs1 < num_moduli)
         {
             const size_t szC32i_g = cola8i_g * static_cast<size_t>(n);
             const size_t zlo_oh   = 2u * szC32i_g * sizeof(double);
@@ -3296,7 +3254,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
         const int adp_bits_g = (settings.adp_mantissa_bits > 0)
             ? static_cast<int>(settings.adp_mantissa_bits)
             : fixedPointEmulationAdpMantissaBits(HIP_R_64F);
-        const unsigned pm_s_g = adp_expected_num_moduli(adp_bits_g);
+        const unsigned pm_s_g = adp_expected_num_moduli(adp_bits_g, num_moduli);
 
         const double t_emul_W  = is_eager_g ? 0.0
             : effective_time_ms(tA_g, tB_g, m, n, k, pm_s_g, device, W, HIP_R_64F);
@@ -3374,7 +3332,7 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t            handle,
             : fixedPointEmulationAdpMantissaBits(HIP_R_64F);
         const PerfModelTimes pm = effective_perf_model_times(
             tA, tB, m, n, k,
-            adp_expected_num_moduli(adp_bits_prof_64),
+            adp_expected_num_moduli(adp_bits_prof_64, num_moduli),
             device, ~size_t{0}, HIP_R_64F);
 
         std::FILE* _f = std::fopen(_pf, "a");
@@ -3550,7 +3508,7 @@ bool fixedPointEmulationPerformanceCheck(const _rocblaslt_handle*      h,
     /* ADP mode: no fixed moduli set in desc or env var. */
     /* Always ADP mode. */
     const int adp_bits_pc = fixedPointEmulationAdpMantissaBits(type_a);
-    const unsigned pm_num = adp_expected_num_moduli(adp_bits_pc);
+    const unsigned pm_num = adp_expected_num_moduli(adp_bits_pc, max_num_moduli(type_a));
     const double t_emul   = effective_time_ms(tA, tB, m, n, k, pm_num, device,
                                               workspace_bytes, type_a);
     const double t_native = perf_model_times(tA, tB, m, n, k, pm_num, device,
@@ -3604,8 +3562,8 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
     using namespace FixedPointEmulation;
 
     const _rocblaslt_handle* h = reinterpret_cast<const _rocblaslt_handle*>(handle);
-    /* Always ADP mode: layout always S_MAX moduli. */
-    const unsigned num_moduli = S_MAX;
+    /* Always ADP mode: layout uses max_num_moduli<float>() moduli. */
+    const unsigned num_moduli = max_num_moduli<float>();
     const int      device     = h->device;
 
     const FixedPointEmulationSettings& effectiveSettings = settings;
@@ -3635,11 +3593,10 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
             + cola8i_g * sizeof(int32_t) + padn_g * sizeof(int32_t) + 2 * sizeof(float)
             + OZ2_INT8_GEMM_WS_BYTES;
 
-        /* Always dynamic: S_MAX moduli for layout. */
         const size_t W_var1 = (W > base_oh) ? W - base_oh : 0u;
-        const unsigned cs1  = compute_chunk_size(m, n, k, S_MAX, W_var1);
+        const unsigned cs1  = compute_chunk_size(m, n, k, num_moduli, W_var1);
         size_t W_var;
-        if(cs1 < S_MAX)
+        if(cs1 < num_moduli)
         {
             const size_t szC32i_g = cola8i_g * static_cast<size_t>(n);
             const size_t zlo_oh   = 2u * szC32i_g * sizeof(double);
@@ -3653,7 +3610,7 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
         const int adp_bits_g = (settings.adp_mantissa_bits > 0)
             ? static_cast<int>(settings.adp_mantissa_bits)
             : fixedPointEmulationAdpMantissaBits(HIP_R_32F);
-        const unsigned pm_s_g = adp_expected_num_moduli(adp_bits_g);
+        const unsigned pm_s_g = adp_expected_num_moduli(adp_bits_g, num_moduli);
 
         /* FP32 performance model: compare against native SGEMM, not DGEMM. */
         const double t_emul_W  = is_eager_g ? 0.0
@@ -3723,7 +3680,7 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
             : fixedPointEmulationAdpMantissaBits(HIP_R_32F);
         const PerfModelTimes pm = effective_perf_model_times(
             tA, tB, m, n, k,
-            adp_expected_num_moduli(adp_bits_prof_32),
+            adp_expected_num_moduli(adp_bits_prof_32, num_moduli),
             device, ~size_t{0}, HIP_R_32F);
 
         std::FILE* _f = std::fopen(_pf, "a");

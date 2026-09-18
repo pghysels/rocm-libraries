@@ -26,18 +26,20 @@
  *   HIPBLASLT_EMULATION_FP64_MANTISSA_BIT_COUNT=N
  *     ADP precision target for FP64 inputs in mantissa bits [1..52].
  *     Default 52 (full IEEE 754 FP64 precision).  Lower values -> fewer moduli -> faster.
- *     Takes precedence over HIPBLASLT_EMULATION_TOLERANCE for FP64.
+ *     Takes precedence over HIPBLASLT_EMULATION_FP64_TOLERANCE.
  *   HIPBLASLT_EMULATION_FP32_MANTISSA_BIT_COUNT=N
  *     ADP precision target for FP32 inputs in mantissa bits [1..23].
  *     Default 23 (full IEEE 754 FP32 precision).  Lower values -> fewer moduli -> faster.
- *   HIPBLASLT_EMULATION_TOLERANCE=<value>
- *     target relative accuracy for ADP (dynamic) mode for FP64, expressed as a positive
- *     floating-point value (e.g. 1e-8, 1e-16).  ADP selects the minimum number
- *     of CRT moduli needed to achieve this accuracy; fewer moduli means faster
- *     GEMMs at the cost of lower precision.
+ *   HIPBLASLT_EMULATION_FP64_TOLERANCE=<value>
+ *     target relative accuracy for ADP (dynamic) mode for FP64 inputs, expressed as a
+ *     positive floating-point value (e.g. 1e-8, 1e-16).  ADP selects the minimum number
+ *     of CRT moduli needed to achieve this accuracy; fewer moduli means faster GEMMs.
  *     Default (absent): full IEEE 754 double precision (~1.11e-16, 52 mantissa bits).
- *     Only affects dynamic (ADP) mode; has no effect in fixed-s mode.
  *     If HIPBLASLT_EMULATION_FP64_MANTISSA_BIT_COUNT is also set, that takes precedence.
+ *   HIPBLASLT_EMULATION_FP32_TOLERANCE=<value>
+ *     target relative accuracy for ADP (dynamic) mode for FP32 inputs.
+ *     Default (absent): full IEEE 754 single precision (~5.96e-8, 23 mantissa bits).
+ *     If HIPBLASLT_EMULATION_FP32_MANTISSA_BIT_COUNT is also set, that takes precedence.
  *   HIPBLASLT_EMULATION_PROFILE=<path>
  *     append per-call profiling CSV rows to the given file path.
  *
@@ -132,11 +134,12 @@ unsigned fixedPointEmulationNumModuli();
 /* Returns the ADP target mantissa-bit count for the given input type.
  *   type_a == HIP_R_64F:
  *     1. Reads HIPBLASLT_EMULATION_FP64_MANTISSA_BIT_COUNT.
- *     2. Falls back to HIPBLASLT_EMULATION_TOLERANCE (legacy, kept for compat).
+ *     2. Falls back to HIPBLASLT_EMULATION_FP64_TOLERANCE.
  *     3. Default: 52 (full IEEE 754 FP64 precision).
  *   type_a == HIP_R_32F:
  *     1. Reads HIPBLASLT_EMULATION_FP32_MANTISSA_BIT_COUNT.
- *     2. Default: 23 (full IEEE 754 FP32 precision).
+ *     2. Falls back to HIPBLASLT_EMULATION_FP32_TOLERANCE.
+ *     3. Default: 23 (full IEEE 754 FP32 precision).
  * Value range: [1..52] for FP64, [1..23] for FP32.
  * Cached on first call per type.  Only consulted in ADP (dynamic) mode.   */
 int fixedPointEmulationAdpMantissaBits(hipDataType type_a);
@@ -153,8 +156,7 @@ struct FixedPointEmulationDecision
     /* ADP target precision in mantissa bits.
      * 52 = full IEEE 754 FP64 precision; 23 = full IEEE 754 FP32 precision.
      * Derived from the per-matmul desc attribute, then from the type-specific
-     * env var (FP64/FP32_MANTISSA_BIT_COUNT), or from HIPBLASLT_EMULATION_TOLERANCE
-     * for FP64 (legacy fallback).
+     * env var (FP64/FP32_MANTISSA_BIT_COUNT or FP64/FP32_TOLERANCE).
      * Only consulted when dynamic_mode = true.                              */
     int              adp_mantissa_bits; /* [1..52]; type default = full precision */
 };
@@ -222,8 +224,8 @@ struct FixedPointEmulationSettings
     /* ADP target precision in mantissa bits.
      * For FP64: [1..52]; 52 = full FP64 precision.
      * For FP32: [1..23]; 23 = full FP32 precision.
-     * 0 = sentinel: derive from env var (FP64/FP32_MANTISSA_BIT_COUNT,
-     *   or TOLERANCE for FP64 legacy) or type default.
+     * 0 = sentinel: derive from env var (FP64/FP32_MANTISSA_BIT_COUNT
+     *   or FP64/FP32_TOLERANCE) or type default.
      * Only consulted when dynamic_mode = true.                              */
     int          adp_mantissa_bits; /* 0 = env var default                    */
 };

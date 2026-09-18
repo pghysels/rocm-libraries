@@ -236,13 +236,13 @@ namespace
     TEST_F(FixedPointEmulationTest, PublicWorkspaceSizeRejectsNegativeDimensions)
     {
         EXPECT_EQ(
-            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, -1, 64, 64),
+            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, -1, 64, 64, 1),
             0u);
         EXPECT_EQ(
-            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, -1, 64),
+            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, -1, 64, 1),
             0u);
         EXPECT_EQ(
-            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, -1),
+            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, 64, 64, -1, 1),
             0u);
     }
 
@@ -333,7 +333,7 @@ namespace
         settings.eager          = true; /* bypass perf gate in direct test calls */
 
         settings.sv_mask         = 0; // skip Inf/NaN check (faster, inputs are finite)
-        const size_t _ws_size_A = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+        const size_t _ws_size_A = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
         void* _d_ws_A = nullptr;
         if (_ws_size_A > 0) (void)hipMalloc(&_d_ws_A, _ws_size_A);
         settings.workspace       = _d_ws_A;
@@ -660,7 +660,7 @@ namespace
             hipblasLtMatmulDescCreate(&_wd, HIPBLAS_COMPUTE_64F, HIP_R_64F);
             emulSetEnabled(_wd, 1);
             emulSetStrategy(_wd, HIPBLASLT_EMULATION_STRATEGY_EAGER);
-            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, p.opA, p.opB, p.m, p.n, p.k);
+            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, p.opA, p.opB, p.m, p.n, p.k, 1);
             hipblasLtMatmulDescDestroy(_wd);
             return _sz;
         }();
@@ -1013,7 +1013,7 @@ namespace
 
         emu_settings.sv_mask         = 0u; /* skip Inf/NaN detection */
         /* Allocate workspace for ADP test */
-        const size_t _adp_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n);
+        const size_t _adp_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, 1);
         void* _d_adp_ws = nullptr;
         if (_adp_ws_sz > 0) (void)hipMalloc(&_d_adp_ws, _adp_ws_sz);
         emu_settings.workspace       = _d_adp_ws;
@@ -1155,7 +1155,7 @@ namespace
             hipblasLtMatmulDescCreate(&_wd, HIPBLAS_COMPUTE_64F, HIP_R_64F);
             emulSetEnabled(_wd, 1);
             emulSetStrategy(_wd, HIPBLASLT_EMULATION_STRATEGY_EAGER);
-            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
             hipblasLtMatmulDescDestroy(_wd);
             return _sz;
         }();
@@ -1564,7 +1564,7 @@ namespace
             hipblasLtMatmulDescCreate(&_wd, HIPBLAS_COMPUTE_64F, HIP_R_64F);
             emulSetEnabled(_wd, 1);
             emulSetStrategy(_wd, HIPBLASLT_EMULATION_STRATEGY_EAGER);
-            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+            const size_t _sz = hipblasLtEmulationWorkspaceSize(hem, _wd, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
             hipblasLtMatmulDescDestroy(_wd);
             return _sz;
         }();
@@ -1752,7 +1752,7 @@ namespace
             emu.eager          = true; /* bypass perf gate in direct test calls */
 
             emu.sv_mask                  = 0u;
-            const size_t _adpx_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+            const size_t _adpx_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
             void* _d_adpx_ws = nullptr;
             if (_adpx_ws_sz > 0) (void)hipMalloc(&_d_adpx_ws, _adpx_ws_sz);
             emu.workspace                = _d_adpx_ws;
@@ -2019,7 +2019,7 @@ namespace
         settings.eager          = true; /* bypass perf gate in direct test calls */
 
         settings.sv_mask         = 0u; /* inputs are finite — no Inf/NaN flag needed */
-        const size_t _bv1_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
+        const size_t _bv1_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
         void* _d_bv1_ws = nullptr;
         if (_bv1_ws_sz > 0) (void)hipMalloc(&_d_bv1_ws, _bv1_ws_sz);
         settings.workspace       = _d_bv1_ws;
@@ -2316,7 +2316,7 @@ namespace
         emu.eager          = true; /* bypass perf gate in direct test calls */
 
         emu.sv_mask               = 0u;
-        const size_t _nul_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
+        const size_t _nul_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
         void* _d_nul_ws = nullptr;
         if (_nul_ws_sz > 0) (void)hipMalloc(&_d_nul_ws, _nul_ws_sz);
         emu.workspace             = _d_nul_ws;
@@ -2408,7 +2408,7 @@ namespace
         settings.eager          = true; /* bypass perf gate in direct test calls */
 
         settings.sv_mask    = 0x1u; /* enable Inf detection */
-        const size_t _sv_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+        const size_t _sv_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
         void* _d_sv_ws = nullptr;
         if (_sv_ws_sz > 0) (void)hipMalloc(&_d_sv_ws, _sv_ws_sz);
         settings.workspace       = _d_sv_ws;
@@ -2531,7 +2531,7 @@ namespace
         emu.eager          = true; /* bypass perf gate in direct test calls */
 
         emu.sv_mask               = 0u;
-        const size_t _alm_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N);
+        const size_t _alm_ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N, 1);
         void* _d_alm_ws = nullptr;
         if (_alm_ws_sz > 0) (void)hipMalloc(&_d_alm_ws, _alm_ws_sz);
         emu.workspace             = _d_alm_ws;
@@ -2702,7 +2702,7 @@ TEST_F(FixedPointEmulationFp32Test, CorrectnessNN)
     ASSERT_EQ(hipMemcpy(dB, hB.data(), szB * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
     ASSERT_EQ(hipMemset(dC, 0, szC * sizeof(float)), hipSuccess);
 
-    const size_t ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
+    const size_t ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
     void* d_ws = nullptr;
     if(ws_sz > 0) ASSERT_EQ(hipMalloc(&d_ws, ws_sz), hipSuccess);
 
@@ -2792,7 +2792,7 @@ TEST_F(FixedPointEmulationFp32Test, NanDetectionFp32)
     ASSERT_EQ(hipMemcpy(dB, hB.data(), szB * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
     ASSERT_EQ(hipMemset(dC, 0, szC * sizeof(float)), hipSuccess);
 
-    const size_t ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K);
+    const size_t ws_sz = hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K, 1);
     void* d_ws = nullptr;
     if(ws_sz > 0) ASSERT_EQ(hipMalloc(&d_ws, ws_sz), hipSuccess);
 
