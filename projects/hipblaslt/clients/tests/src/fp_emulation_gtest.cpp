@@ -1253,11 +1253,16 @@ namespace
             EmulDemmelParam{512, 0, 1e-8},
             EmulDemmelParam{512, 0, 1e-9},
             EmulDemmelParam{512, 0, 1e-10},
-            // b=1..8: safe dynamic range for s≥15 (b_max(15)=4, b_max(16)=8).
+            // b=1..8: safe dynamic range for s≤18 (b_max(16)=8, b_max(17)=11, b_max(18)=15).
             EmulDemmelParam{512, 1, 1e-13},
             EmulDemmelParam{512, 2, 1e-13},
             EmulDemmelParam{512, 4, 1e-13},
-            EmulDemmelParam{512, 8, 1e-13}),
+            EmulDemmelParam{512, 8, 1e-13},
+            // b=12,14: larger dynamic range forces ADP to select s=19 and s=20 respectively,
+            // exercising the P_hi/P_lo/inv_P table entries at those indices.
+            // b_max(19)=19 and b_max(20)=23 confirm both are within the safe accuracy range.
+            EmulDemmelParam{512, 12, 1e-13},
+            EmulDemmelParam{512, 14, 1e-13}),
         EmulDemmelParamName);
 
     // ── StructuredGemmTest: stress matrices targeting the Ozaki extraction ────
