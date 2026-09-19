@@ -173,7 +173,7 @@ namespace FixedPointEmulation
     }
 
     /* Returns the minimum number of moduli s ∈ [2, S_MAX] such that
-     * log2P[s-2] >= adp_bits, used ONLY in the PERFORMANCE MODEL to predict
+     * log2P(s-2) >= adp_bits, used ONLY in the PERFORMANCE MODEL to predict
      * which s ADP will select at runtime.  Falls back to S_MAX when
      * adp_bits <= 0 (sentinel) or when all moduli are needed to reach the
      * target.                                                                */
@@ -182,7 +182,7 @@ namespace FixedPointEmulation
         if(adp_bits <= 0)
             return max_s;
         for(unsigned s = 2u; s <= max_s; ++s)
-            if(log2P[s - 2u] >= static_cast<float>(adp_bits))
+            if(log2P(s - 2u) >= static_cast<float>(adp_bits))
                 return s;
         return max_s;
     }
@@ -1521,12 +1521,13 @@ namespace FixedPointEmulation
         {
             const unsigned t      = chunk_start + t_local;
             const double   dc     = dc_s[t_local];
-            const double   hi     = dc * qpi_hi(effective_s - 2, t);
+            const auto [qhi, qlo] = qpi(effective_s - 2, t);
+            const double   hi     = dc * qhi;
             const double   new_hi = Zhi + hi;
             const double   err    = hi - (new_hi - Zhi);
             Zhi                   = new_hi;
             if constexpr(HAS_LO)
-                Zlo = fma(dc, qpi_lo(effective_s - 2, t), Zlo + err);
+                Zlo = fma(dc, qlo, Zlo + err);
             else
                 Zlo += err;
         }
@@ -1583,12 +1584,13 @@ namespace FixedPointEmulation
         {
             const unsigned t      = chunk_start + t_local;
             const double   dc     = dc_s[t_local];
-            const double   hi     = dc * qpi_hi(effective_s - 2, t);
+            const auto [qhi, qlo] = qpi(effective_s - 2, t);
+            const double   hi     = dc * qhi;
             const double   new_hi = Zhi + hi;
             const double   err    = hi - (new_hi - Zhi);
             Zhi                   = new_hi;
             if constexpr(HAS_LO)
-                Zlo = fma(dc, qpi_lo(effective_s - 2, t), Zlo + err);
+                Zlo = fma(dc, qlo, Zlo + err);
             else
                 Zlo += err;
         }
@@ -1602,8 +1604,9 @@ namespace FixedPointEmulation
             Zhi                 = s_hi;
             Zlo                 = Zlo_in[idx] + err + Zlo;
         }
-        const double q = rint((Zhi + Zlo) * inv_P(effective_s - 2));
-        const double X = fma(P_lo(effective_s - 2), q, fma(P_hi(effective_s - 2), q, Zhi) + Zlo);
+        const double q        = rint((Zhi + Zlo) * inv_P(effective_s - 2));
+        const auto [phi, plo] = P_dd(effective_s - 2);
+        const double X        = fma(plo, q, fma(phi, q, Zhi) + Zlo);
         const int    inv_sft = -(static_cast<int>(sftA[i]) + static_cast<int>(sftB[l]));
         const size_t d_idx
             = static_cast<size_t>(i) + static_cast<size_t>(l) * static_cast<size_t>(ldd);
@@ -2713,7 +2716,7 @@ namespace FixedPointEmulation
 
             const float log2P_needed = std::max(h_adp[0], h_adp[1]) - 200.0f;
 
-            if(log2P_needed > log2P[num_moduli - 2u])
+            if(log2P_needed > log2P(num_moduli - 2u))
             {
                 /* ADP determined the type's max moduli are still insufficient.
                  * Before giving up, check whether HIPBLASLT_EMULATION_NUM_MODULI
@@ -2740,16 +2743,15 @@ namespace FixedPointEmulation
                                    << "): " << "A-side log2P_req=" << (h_adp[0] - 200.0f) << " bits, "
                                    << "B-side=" << (h_adp[1] - 200.0f) << " bits, "
                                    << "max required=" << log2P_needed
-                                   << " > supported max=" << log2P[num_moduli - 2u] << " (s=" << num_moduli
-                                   << " moduli, ~" << cum_bits[num_moduli - 2u]
-                                   << " cumulative bits). Falling back to native " << native_str << "." << std::endl;
+                                   << " > supported max=" << log2P(num_moduli - 2u) << " (s=" << num_moduli
+                                   << " moduli). Falling back to native " << native_str << "." << std::endl;
                     return rocblaslt_status_invalid_value;
                 }
             }
 
             for(unsigned s = 2u; s <= num_moduli; ++s)
             {
-                if(log2P[s - 2u] >= log2P_needed)
+                if(log2P(s - 2u) >= log2P_needed)
                 {
                     effective_s = s;
                     break;
@@ -2766,7 +2768,7 @@ namespace FixedPointEmulation
 
         /* Apply shift-refinement delta using the correct log2P for effective_s.
          * This ensures X_true ≤ M_{effective_s}/4 < M_{effective_s}/2 (CRT safe). */
-        const float refine_log2P = log2P[effective_s - 2u];
+        const float refine_log2P = log2P(effective_s - 2u);
 
         _pstart();
         hipLaunchKernelGGL(refine_sftA_apply_kernel,
