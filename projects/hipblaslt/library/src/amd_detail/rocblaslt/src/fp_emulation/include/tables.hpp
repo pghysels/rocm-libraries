@@ -594,21 +594,28 @@ namespace FixedPointEmulation
         return vc[s_idx][mod_idx];
     }
 
-    // log2P(s_idx): ADP capacity threshold for (s_idx+2) moduli.
-    // The minimum s satisfying log2P(s-2) >= log2P_needed is selected by
-    // adp_expected_num_moduli().  Computed lazily on first host call; host-only.
+    // log2P(s_idx): usable CRT capacity (bits) for (s_idx+2) moduli.
+    //
+    //   log2(P_s)/2 - 0.5: GEMMul8 ADP capacity (geometric mean of P_s,
+    //     -0.5 for conservative rounding).
+    //   - 1.0: REQUIRED one-bit CRT safety margin (do NOT remove).
+    //
+    // Used both to pick effective_s (min s with log2P(s-2) >= log2P_needed)
+    // and as refine_log2P in refine_sftA/B_kernel, which folds it into the
+    // per-row/col shifts (sft += floor(-0.5*log2(max_val) + log2P)).
+    // Reconstruction folds Z into (-M/2, M/2] via q=rint(Z/M), X=Z-q*M, so
+    // correctness needs |X_true| <= M/2.  But sftA/sftB are set BEFORE X_true
+    // is known, from preliminary GEMM maxima + a float __log2f that can
+    // under-predict by ~1 bit; the -1.0 targets |X_true| <= M/4 so worst-case
+    // error still lands inside M/2.
+    //
+    // Computed lazily on first host call; host-only.
     inline double log2P(unsigned s_idx) noexcept
     {
         static const auto v = []() {
             auto                          P = make_P_table();
             std::array<double, S_MAX - 1> a{};
             for(unsigned i = 0; i < S_MAX - 1; ++i)
-                // log2(P_s) / 2 - 0.5: GEMMul8 ADP capacity formula
-                //   (geometric mean of P_s, shifted by -0.5 for conservative rounding).
-                // - 1.0: extra safety margin for fixed-s mode, where CRT overflow is not
-                //   detected dynamically.
-                //   TODO: could be removed since ADP always detects overflow via
-                //   log2P_needed > log2P(S_MAX-2) and falls back to native GEMM.
                 a[i] = std::log2(P[i].to_double()) / 2.0 - 0.5 - 1.0;
             return a;
         }();
