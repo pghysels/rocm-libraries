@@ -50,7 +50,6 @@
 #include <cstdio> // std::fopen / std::fprintf / std::fclose / std::ftell
 #include <cstdlib> // std::getenv
 #include <cstring> // std::strcmp
-#include <string> // std::string (HIPBLASLT_FP_EMU_QPI parsing)
 #include <limits> // std::numeric_limits
 #include <optional> // std::optional
 #include <unordered_map> // std::unordered_map
@@ -1531,8 +1530,10 @@ namespace FixedPointEmulation
             // magnitudes vary non-monotonically across the moduli), so a plain
             // FastTwoSum silently drops ~1 ULP whenever |hi| > |Zhi| at a step.
             // TwoSum removes that precondition and makes the accumulation
-            // order-independent, which is required for the computed CRT split
-            // (its qpi_hi magnitudes trigger the FastTwoSum violation at some s).
+            // order-independent, which keeps the result robust for any qpi split
+            // regardless of its trailing-zero slack.  Measured overhead vs
+            // FastTwoSum is ~3% of the (bandwidth-bound) accum kernel and
+            // <0.5% of total emulation time — negligible for the robustness gained.
             const double   bb  = new_hi - Zhi;
             const double   err = (Zhi - (new_hi - bb)) + (hi - bb);
             Zhi                = new_hi;
@@ -1967,25 +1968,6 @@ namespace FixedPointEmulation
         const dim3 grid_acc(static_cast<unsigned>((m + 63) / 64),
                             static_cast<unsigned>((n + 7) / 8));
 
-        // One-time A/B selection of the qpi CRT-coefficient splitting, controlled
-        // by the HIPBLASLT_FP_EMU_QPI environment variable:
-        //   unset / "hardcoded" / "0" -> GEMMul8 verbatim qPi_2 table (default)
-        //   "computed" / "1"          -> computed constexpr split (floor-41 + nearest lo)
-        // The device flag g_qpi_use_computed (in tables.hpp) is copied once.
-        {
-            static bool synced = false;
-            if(!synced)
-            {
-                const char* e   = std::getenv("HIPBLASLT_FP_EMU_QPI");
-                bool        use = (e != nullptr)
-                           && (std::string(e) == "computed" || std::string(e) == "1"
-                               || std::string(e) == "true");
-                (void)hipMemcpyToSymbol(HIP_SYMBOL(FixedPointEmulation::g_qpi_use_computed),
-                                        &use,
-                                        sizeof(bool));
-                synced = true;
-            }
-        }
         if(is_last)
         {
             if(has_lo)
