@@ -18,7 +18,7 @@
  * separate from emulation.hpp (which must stay free of __device__
  * code so it can be included from plain C++ units).
  *
- * Constants (tables) are base on the open-source GEMMul8 implementation
+ * Constants (tables) are based on the open-source GEMMul8 implementation
  * (Y. Uchino, RIKEN R-CCS, https://github.com/RIKEN-RCCS/GEMMul8).
  */
 
@@ -504,8 +504,8 @@ namespace FixedPointEmulation
         bool     rb = P.bit(top - 53), st = P.any_bit_set_below(top - 54);
         if(rb && (st || (m & 1u)))
             ++m;
-        UInt256 ms = UInt256(m).shl(shift);
-        double  res;
+        UInt256 ms  = UInt256(m).shl(shift);
+        double  res = 0.0;
         if(P.ge(ms))
         {
             UInt256 diff = P.sub(ms);
