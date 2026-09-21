@@ -435,10 +435,19 @@ namespace FixedPointEmulation
             ma -= (1u << UInt256::QPI_N_TZ);
             ms = UInt256(ma).shl(shift);
         }
-        UInt256 diff = Q.sub(ms); // Q >= ms guaranteed
-        return static_cast<double>(diff.d[0])
-               + static_cast<double>(diff.d[1]) * 18446744073709551616.0;
+        UInt256 diff = Q.sub(ms); // Q >= ms guaranteed (qpi_hi <= qpi_exact)
+        // Correctly-rounded nearest double of the exact residual (more accurate
+        // than the old (double)d0 + (double)d1*2^64 two-step, which lost bits for
+        // residuals >= 2^64).  qpi_lo >= 0 is preserved by the floor-based hi.
+        return diff.to_double();
     }
+
+    // Runtime A/B switch (set from the host via HIPBLASLT_FP_EMU_QPI):
+    //   false (default) -> GEMMul8 verbatim hardcoded qPi_2 table
+    //   true            -> computed constexpr split (floor-41 hi + nearest lo)
+    // Declared inline __device__ so the single definition is shared across all
+    // translation units that include this header.
+    inline __device__ bool g_qpi_use_computed = false;
 
     constexpr uint32_t mod_inverse(uint32_t a, uint32_t m) noexcept
     {
@@ -729,6 +738,29 @@ namespace FixedPointEmulation
              0x1.4a1e8a895454cp+111, 0x1.77cf77e873cd7p+114, 0x1.d1d5597316f21p+111,
              0x1.ed07530f9a7fap+114, 0x1.3929cf709cf74p+114},
         };
+        // Computed constexpr table: floor-to-41-bits hi (qpi_hi <= qpi, so
+        // qpi_lo >= 0) plus the correctly-rounded nearest double of the exact
+        // residual.  Selected at runtime when g_qpi_use_computed is true
+        // (set from the host via the HIPBLASLT_FP_EMU_QPI env var), so the two
+        // splittings can be A/B compared for accuracy without recompiling.
+        static constexpr auto vc = []() constexpr {
+            std::array<std::array<std::pair<double, double>, S_MAX>, S_MAX - 1> t{};
+            auto Pt = make_P_table();
+            for(unsigned s = 1; s < S_MAX; ++s)
+                for(unsigned m = 0; m <= s; ++m)
+                {
+                    uint32_t mk = static_cast<uint32_t>(moduli[m]);
+                    UInt256  Mk = Pt[s - 1].div(mk);
+                    uint32_t rk = Mk.mod(mk);
+                    uint32_t Nk = mod_inverse(rk, mk);
+                    UInt256  qp = Mk.mul(Nk);
+                    t[s - 1][m].first  = qp.to_double_aligned();
+                    t[s - 1][m].second = qpi_lo_val(qp);
+                }
+            return t;
+        }();
+        if(g_qpi_use_computed)
+            return vc[s_idx][mod_idx];
         return {hi[s_idx][mod_idx], lo[s_idx][mod_idx]};
     }
 
