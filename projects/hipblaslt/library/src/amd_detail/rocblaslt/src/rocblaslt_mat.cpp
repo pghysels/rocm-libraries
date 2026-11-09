@@ -140,7 +140,10 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
     // Conditions for emulation:
     //   • Compute type is HIPBLAS_COMPUTE_{64F,32F}_EMULATED_FIXEDPOINT, or
     //     plain 64F/32F with HIPBLAS_EMULATE_{DOUBLE,SINGLE}_PRECISION=1
-    //     (A/B/C/D types are validated against the compute type)
+    //   • A, B, C and D are all of the emulated real type (FP64 / FP32); the
+    //     plain 64F/32F compute types are also used for complex and
+    //     mixed-precision (FP16 / BF16) GEMMs, which are never emulated
+    //   • Non-empty product (m, n, k > 0)
     //   • Non-batched, strided layout (batch_count == 1, batch_mode == STRIDED)
     //   • Plain GEMM epilogue (no activation, no bias, no auxiliary outputs)
     //   • alpha/beta are host (non-device-pointer) scalars
@@ -164,8 +167,19 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
        // Evaluated after !pointermode, so alpha is a host pointer here.
        && !hostScalarIsZero(alphaBetaScalarType(scale_type, compute_type, type_a), alpha))
     {
-        FixedPointEmulationSettings emulDecision = fixedPointEmulationDecision(
-            handle, matmul_descr, compute_type, m, n, k, num_batches_a, workspaceSizeInBytes);
+        FixedPointEmulationSettings emulDecision
+            = fixedPointEmulationDecision(handle,
+                                          matmul_descr,
+                                          compute_type,
+                                          type_a,
+                                          type_b,
+                                          type_c,
+                                          type_d,
+                                          m,
+                                          n,
+                                          k,
+                                          num_batches_a,
+                                          workspaceSizeInBytes);
         if(emulDecision.status != rocblaslt_status_success)
             return emulDecision.status;
         if(emulDecision.apply)

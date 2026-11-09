@@ -1221,8 +1221,10 @@ namespace FixedPointEmulation
         /* Minimum problem size guard — see FIXED_POINT_EMUL_MIN_MN.  Must come
          * before the split below (as in effective_time): splitting only shrinks
          * m and n, and without this guard a sub-problem that never fits, e.g.
-         * (m, n) = (0, 1), recurses into an identical copy of itself.          */
-        if(m < FIXED_POINT_EMUL_MIN_MN || n < FIXED_POINT_EMUL_MIN_MN)
+         * (m, n) = (0, 1), recurses into an identical copy of itself.
+         * k == 0 is an empty product (D = beta * C): the scale kernels would
+         * be launched with grid.x = 0 (hipErrorInvalidConfiguration).         */
+        if(m < FIXED_POINT_EMUL_MIN_MN || n < FIXED_POINT_EMUL_MIN_MN || k == 0)
             return native_gemm_fallback<T>(
                 h, opA, opB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, stream);
 
@@ -2144,13 +2146,17 @@ FixedPointEmulationEnvValue fixedPointEmulationParseNumModuliEnv(const char* val
     return {FIXED_POINT_EMULATION_ENV_VALID, static_cast<unsigned>(n)};
 }
 
-FixedPointEmulationSettings fixedPointEmulationDecision(const _rocblaslt_handle*      h,
-                                                        const _rocblaslt_matmul_desc* desc,
-                                                        rocblaslt_compute_type        compute_type,
-                                                        int64_t                       m,
-                                                        int64_t                       n,
-                                                        int64_t                       k,
-                                                        int32_t                       batch_count,
+FixedPointEmulationSettings fixedPointEmulationDecision(const _rocblaslt_handle*       h,
+                                                        const _rocblaslt_matmul_desc*  desc,
+                                                        rocblaslt_compute_type         compute_type,
+                                                        hipDataType                    a_type,
+                                                        hipDataType                    b_type,
+                                                        hipDataType                    c_type,
+                                                        hipDataType                    d_type,
+                                                        int64_t                        m,
+                                                        int64_t                        n,
+                                                        int64_t                        k,
+                                                        int32_t                        batch_count,
                                                         size_t workspace_bytes)
 {
     /* Data type being emulated: HIP_R_64F / HIP_R_32F for the fixed-point
@@ -2181,8 +2187,17 @@ FixedPointEmulationSettings fixedPointEmulationDecision(const _rocblaslt_handle*
         result.sv_support       = env_mask & 0x3u;
     }
 
-    /* Type and batch-count pre-checks (no env-var validation needed). */
-    if((type_a != HIP_R_64F && type_a != HIP_R_32F) || batch_count != 1)
+    /* Type, batch-count and size pre-checks (no env-var validation needed).
+     * All four matrices must be of the emulated real type: the plain 64F/32F
+     * compute types are also used for complex GEMMs and for FP16/BF16 with
+     * 32F compute, which the emulation kernels would read and write as
+     * FP64/FP32 (wrong results, and for FP16/BF16 writes past the end of D).
+     * An empty product (m, n or k == 0; with k == 0, D = beta * C) never
+     * needs emulation, so it is left to the native path and reports no
+     * emulation workspace.                                                 */
+    if((type_a != HIP_R_64F && type_a != HIP_R_32F) || a_type != type_a || b_type != type_a
+       || c_type != type_a || d_type != type_a || batch_count != 1 || m == 0 || n == 0
+       || k == 0)
         return result; /* apply=false, success */
 
     const hipblasLtEmulationDescriptor* ed = (desc && desc->emulation_desc) ? desc->emulation_desc : nullptr;
@@ -2377,6 +2392,12 @@ rocblaslt_status fp64EmulatedGemm(hipblasLtHandle_t                  handle,
     /* Always ADP mode: layout uses max_num_moduli<double>() moduli. */
     const unsigned num_moduli = max_num_moduli<double>();
     const int      device     = h->device;
+
+    /* Empty product: D = beta * C.  Nothing to emulate (and the scale
+     * kernels can't be launched with a zero-sized grid).                   */
+    if(k == 0)
+        return native_gemm_fallback<double>(
+            h, opA, opB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, stream);
 
     {
         const size_t W = decision.workspace_bytes;
@@ -2713,17 +2734,25 @@ bool fixedPointEmulationPerformanceCheck(const _rocblaslt_handle*      h,
 
 /* Convenience wrapper: returns true when emulation would be applied for this
  * type and problem (enabled + device supported + strategy gate passes).      */
-bool fixedPointEmulationWouldApply(const _rocblaslt_handle*      h,
-                                   const _rocblaslt_matmul_desc* desc,
-                                   rocblaslt_compute_type        compute_type,
-                                   int64_t                       m,
-                                   int64_t                       n,
-                                   int64_t                       k,
-                                   int32_t                       batch_count)
+bool fixedPointEmulationWouldApply(const _rocblaslt_handle*       h,
+                                   const _rocblaslt_matmul_desc*  desc,
+                                   rocblaslt_compute_type         compute_type,
+                                   hipDataType                    a_type,
+                                   hipDataType                    b_type,
+                                   hipDataType                    c_type,
+                                   hipDataType                    d_type,
+                                   int64_t                        m,
+                                   int64_t                        n,
+                                   int64_t                        k,
+                                   int32_t                        batch_count)
 {
     return fixedPointEmulationDecision(h,
                                        desc,
                                        compute_type,
+                                       a_type,
+                                       b_type,
+                                       c_type,
+                                       d_type,
                                        m,
                                        n,
                                        k,
@@ -2765,6 +2794,11 @@ rocblaslt_status fp32EmulatedGemm(hipblasLtHandle_t                  handle,
     /* Always ADP mode: layout uses max_num_moduli<float>() moduli. */
     const unsigned num_moduli = max_num_moduli<float>();
     const int      device     = h->device;
+
+    /* Empty product: D = beta * C (see fp64EmulatedGemm). */
+    if(k == 0)
+        return native_gemm_fallback<float>(
+            h, opA, opB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, stream);
 
     {
         const size_t W = decision.workspace_bytes;

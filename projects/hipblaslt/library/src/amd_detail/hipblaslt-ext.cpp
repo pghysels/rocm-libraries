@@ -1221,7 +1221,9 @@ namespace hipblaslt_ext
                 = static_cast<rocblaslt_compute_type>(problemtype.getTypeCompute());
             const FixedPointEmulationSettings emulDecision =
                 fixedPointEmulationDecision(h, nullptr, ctype,
-                                      m, n, k, batch_count, ~size_t{0});
+                                            problemtype.getTypeA(), problemtype.getTypeB(),
+                                            problemtype.getTypeC(), problemtype.getTypeD(),
+                                            m, n, k, batch_count, ~size_t{0});
             m_emul_workspace_bytes = emulDecision.apply
                 ? fixedPointEmulationWorkspaceSize(h, fixedPointEmulatedComputeDataType(ctype),
                                              problemtype.getOpA(), problemtype.getOpB(),
@@ -1284,11 +1286,13 @@ namespace hipblaslt_ext
                                       (*rocproblemtypes)[0],
                                       m_data,
                                       m_gemm_count));
-        if(status == HIPBLAS_STATUS_SUCCESS && matmul_descr && matA && matD)
+        if(status == HIPBLAS_STATUS_SUCCESS && matmul_descr && matA && matB && matC && matD)
         {
             /* Cache the FP64 emulation workspace requirement for this problem. */
             const auto* h        = reinterpret_cast<const _rocblaslt_handle*>(m_handle);
             const auto* A_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(matA);
+            const auto* B_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(matB);
+            const auto* C_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(matC);
             const auto* D_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(matD);
             const auto* desc_ptr = reinterpret_cast<const _rocblaslt_matmul_desc*>(matmul_descr);
             const int64_t m_sz = static_cast<int64_t>(D_layout->m);
@@ -1299,7 +1303,9 @@ namespace hipblaslt_ext
             const int32_t batch = A_layout->batch_count;
             const FixedPointEmulationSettings emulDecision =
                 fixedPointEmulationDecision(h, desc_ptr, desc_ptr->compute_type,
-                                      m_sz, n_sz, k_sz, batch, ~size_t{0});
+                                            A_layout->type, B_layout->type, C_layout->type,
+                                            D_layout->type,
+                                            m_sz, n_sz, k_sz, batch, ~size_t{0});
             m_emul_workspace_bytes = emulDecision.apply
                 ? fixedPointEmulationWorkspaceSize(
                       h, fixedPointEmulatedComputeDataType(desc_ptr->compute_type),

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -83,8 +84,19 @@ namespace
         const auto*                   _h = reinterpret_cast<const _rocblaslt_handle*>(h);
         const _rocblaslt_matmul_desc* _dp
             = reinterpret_cast<const _rocblaslt_matmul_desc*>(_tmpDesc);
-        const FixedPointEmulationSettings d = fixedPointEmulationDecision(
-            _h, _dp, rocblaslt_compute_f64_emulated_fixedpoint, 16, 16, 16, 1, ~size_t{0});
+        const FixedPointEmulationSettings d
+            = fixedPointEmulationDecision(_h,
+                                          _dp,
+                                          rocblaslt_compute_f64_emulated_fixedpoint,
+                                          HIP_R_64F,
+                                          HIP_R_64F,
+                                          HIP_R_64F,
+                                          HIP_R_64F,
+                                          16,
+                                          16,
+                                          16,
+                                          1,
+                                          ~size_t{0});
         hipblasLtEmulationDescDestroy(_ed);
         hipblasLtMatmulDescDestroy(_tmpDesc);
         hipblasLtDestroy(h);
@@ -344,12 +356,26 @@ namespace
             emulSetStrategy(m_ed, s);
         }
 
-        bool would_apply(hipDataType t, int64_t m, int64_t n, int64_t k, int32_t batch)
+        /* Decision for compute type t (emulated per m_enabled) with the given
+         * A, B, C and D types. */
+        bool would_apply(hipDataType t,
+                         hipDataType a_type,
+                         hipDataType b_type,
+                         hipDataType c_type,
+                         hipDataType d_type,
+                         int64_t     m,
+                         int64_t     n,
+                         int64_t     k,
+                         int32_t     batch)
         {
             const FixedPointEmulationSettings decision = fixedPointEmulationDecision(
                 m_roc,
                 reinterpret_cast<const _rocblaslt_matmul_desc*>(m_emul_desc),
                 emulComputeType(t, m_enabled),
+                a_type,
+                b_type,
+                c_type,
+                d_type,
                 m,
                 n,
                 k,
@@ -413,9 +439,11 @@ namespace
         set_strategy(HIPBLAS_EMULATION_STRATEGY_EAGER);
         if(fixedPointEmulationIsEnabled(HIP_R_64F))
             GTEST_SKIP() << "HIPBLAS_EMULATE_DOUBLE_PRECISION is set";
-        EXPECT_FALSE(would_apply(HIP_R_64F, 4096, 4096, 4096, 1));
+        EXPECT_FALSE(would_apply(
+            HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, 4096, 4096, 4096, 1));
         if(!fixedPointEmulationIsEnabled(HIP_R_32F))
-            EXPECT_FALSE(would_apply(HIP_R_32F, 4096, 4096, 4096, 1));
+            EXPECT_FALSE(would_apply(
+                HIP_R_32F, HIP_R_32F, HIP_R_32F, HIP_R_32F, HIP_R_32F, 4096, 4096, 4096, 1));
     }
 
     // The emulated compute type enables emulation even without any emulation
@@ -425,8 +453,19 @@ namespace
         emulAttach(m_emul_desc, nullptr);
         const auto* dp = reinterpret_cast<const _rocblaslt_matmul_desc*>(m_emul_desc);
         /* Default strategy may be PERFORMANT, so use a size the cost model accepts. */
-        const FixedPointEmulationSettings d = fixedPointEmulationDecision(
-            m_roc, dp, rocblaslt_compute_f64_emulated_fixedpoint, 4096, 4096, 4096, 1, ~size_t{0});
+        const FixedPointEmulationSettings d
+            = fixedPointEmulationDecision(m_roc,
+                                          dp,
+                                          rocblaslt_compute_f64_emulated_fixedpoint,
+                                          HIP_R_64F,
+                                          HIP_R_64F,
+                                          HIP_R_64F,
+                                          HIP_R_64F,
+                                          4096,
+                                          4096,
+                                          4096,
+                                          1,
+                                          ~size_t{0});
         EXPECT_EQ(d.status, rocblaslt_status_success);
         EXPECT_TRUE(d.apply);
         emulAttach(m_emul_desc, m_ed);
@@ -440,8 +479,19 @@ namespace
     {
         const auto* dp       = reinterpret_cast<const _rocblaslt_matmul_desc*>(m_emul_desc);
         auto        resolved = [&]() {
-            const FixedPointEmulationSettings d = fixedPointEmulationDecision(
-                m_roc, dp, rocblaslt_compute_f64_emulated_fixedpoint, 256, 256, 256, 1, ~size_t{0});
+            const FixedPointEmulationSettings d
+                = fixedPointEmulationDecision(m_roc,
+                                              dp,
+                                              rocblaslt_compute_f64_emulated_fixedpoint,
+                                              HIP_R_64F,
+                                              HIP_R_64F,
+                                              HIP_R_64F,
+                                              HIP_R_64F,
+                                              256,
+                                              256,
+                                              256,
+                                              1,
+                                              ~size_t{0});
             EXPECT_EQ(d.status, rocblaslt_status_success);
             return d.sv_support;
         };
@@ -486,18 +536,22 @@ namespace
         // ── FP64 ──────────────────────────────────────────────────────────────
         // Cost model must reject a small FP64 GEMM under PERFORMANT.
         set_strategy(HIPBLAS_EMULATION_STRATEGY_PERFORMANT);
-        EXPECT_FALSE(would_apply(HIP_R_64F, 16, 16, 16, 1));
+        EXPECT_FALSE(
+            would_apply(HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, 16, 16, 16, 1));
         // EAGER must accept it — proving it bypasses the cost model.
         set_strategy(HIPBLAS_EMULATION_STRATEGY_EAGER);
-        EXPECT_TRUE(would_apply(HIP_R_64F, 16, 16, 16, 1));
+        EXPECT_TRUE(
+            would_apply(HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, 16, 16, 16, 1));
 
         // ── FP32 ──────────────────────────────────────────────────────────────
         // The same strategy logic applies: PERFORMANT rejects small FP32 GEMMs
         // via its cost model, while EAGER bypasses it.
         set_strategy(HIPBLAS_EMULATION_STRATEGY_PERFORMANT);
-        EXPECT_FALSE(would_apply(HIP_R_32F, 16, 16, 16, 1));
+        EXPECT_FALSE(
+            would_apply(HIP_R_32F, HIP_R_32F, HIP_R_32F, HIP_R_32F, HIP_R_32F, 16, 16, 16, 1));
         set_strategy(HIPBLAS_EMULATION_STRATEGY_EAGER);
-        EXPECT_TRUE(would_apply(HIP_R_32F, 16, 16, 16, 1));
+        EXPECT_TRUE(
+            would_apply(HIP_R_32F, HIP_R_32F, HIP_R_32F, HIP_R_32F, HIP_R_32F, 16, 16, 16, 1));
     }
 
     // Batched GEMM is not supported by the emulation path.
@@ -505,7 +559,8 @@ namespace
     {
         set_enabled(true);
         set_strategy(HIPBLAS_EMULATION_STRATEGY_EAGER);
-        EXPECT_FALSE(would_apply(HIP_R_64F, 4096, 4096, 4096, 2));
+        EXPECT_FALSE(would_apply(
+            HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, 4096, 4096, 4096, 2));
     }
 
     // PERFORMANT strategy uses the cost model; small GEMMs should be rejected.
@@ -513,7 +568,8 @@ namespace
     {
         set_enabled(true);
         set_strategy(HIPBLAS_EMULATION_STRATEGY_PERFORMANT);
-        EXPECT_FALSE(would_apply(HIP_R_64F, 16, 16, 16, 1));
+        EXPECT_FALSE(
+            would_apply(HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, 16, 16, 16, 1));
     }
 
     // PERFORMANT strategy should accept large FP64 GEMMs where emulation wins.
@@ -521,7 +577,8 @@ namespace
     {
         set_enabled(true);
         set_strategy(HIPBLAS_EMULATION_STRATEGY_PERFORMANT);
-        EXPECT_TRUE(would_apply(HIP_R_64F, 4096, 4096, 4096, 1));
+        EXPECT_TRUE(would_apply(
+            HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, 4096, 4096, 4096, 1));
     }
 
     // On a device with only an architecture row, PERFORMANT emulates FP64
@@ -544,14 +601,18 @@ namespace
             const int64_t edge  = static_cast<int64_t>(std::ceil(12.0 * sup.fp64_min_ai));
             const int64_t large = edge + 2;
             const int64_t small = edge / 2;
-            EXPECT_TRUE(would_apply(HIP_R_64F, large, large, large, 1));
-            EXPECT_FALSE(would_apply(HIP_R_64F, small, small, small, 1));
+            EXPECT_TRUE(would_apply(
+                HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, large, large, large, 1));
+            EXPECT_FALSE(would_apply(
+                HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, small, small, small, 1));
             set_strategy(HIPBLAS_EMULATION_STRATEGY_EAGER);
-            EXPECT_TRUE(would_apply(HIP_R_64F, small, small, small, 1));
+            EXPECT_TRUE(would_apply(
+                HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, small, small, small, 1));
             set_strategy(HIPBLAS_EMULATION_STRATEGY_PERFORMANT);
         }
         if(sup.fp32_min_ai == FIXED_POINT_EMULATION_NEVER)
-            EXPECT_FALSE(would_apply(HIP_R_32F, 4096, 4096, 4096, 1));
+            EXPECT_FALSE(would_apply(
+                HIP_R_32F, HIP_R_32F, HIP_R_32F, HIP_R_32F, HIP_R_32F, 4096, 4096, 4096, 1));
     }
 
     TEST_F(FixedPointEmulationTest, EmulatedGemm_SmokeIdentity)
@@ -3207,6 +3268,10 @@ namespace
             h,
             reinterpret_cast<const _rocblaslt_matmul_desc*>(m_emul_desc),
             rocblaslt_compute_f32_emulated_fixedpoint,
+            HIP_R_32F,
+            HIP_R_32F,
+            HIP_R_32F,
+            HIP_R_32F,
             128,
             128,
             128,
@@ -4060,6 +4125,291 @@ namespace
                              [](const ::testing::TestParamInfo<hipDataType>& info) {
                                  return std::string(info.param == HIP_R_32F ? "FP32" : "FP64");
                              });
+
+    // The decision only emulates when A, B, C and D are all the emulated real
+    // type: the plain 64F/32F compute types are also used for complex GEMMs
+    // and for FP16/BF16 with 32F compute.  The check is in the decision, so it
+    // covers dispatch, the heuristic and the Ext workspace sizing alike.
+    TEST_F(FixedPointEmulationTest, WouldApply_RejectsNonRealMatrixTypes)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLAS_EMULATION_STRATEGY_EAGER);
+        auto all = [&](hipDataType t, hipDataType mat) {
+            return would_apply(t, mat, mat, mat, mat, 256, 256, 256, 1);
+        };
+        EXPECT_TRUE(all(HIP_R_64F, HIP_R_64F));
+        EXPECT_TRUE(all(HIP_R_32F, HIP_R_32F));
+        /* Complex. */
+        EXPECT_FALSE(all(HIP_R_64F, HIP_C_64F));
+        EXPECT_FALSE(all(HIP_R_32F, HIP_C_32F));
+        /* Mixed precision with 32F compute. */
+        EXPECT_FALSE(all(HIP_R_32F, HIP_R_16F));
+        EXPECT_FALSE(all(HIP_R_32F, HIP_R_16BF));
+        EXPECT_FALSE(would_apply(
+            HIP_R_32F, HIP_R_16F, HIP_R_16F, HIP_R_32F, HIP_R_32F, 256, 256, 256, 1));
+        /* A single mismatched matrix is enough to decline. */
+        EXPECT_FALSE(would_apply(
+            HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_64F, HIP_R_32F, 256, 256, 256, 1));
+        /* Emulated type of the other compute type. */
+        EXPECT_FALSE(all(HIP_R_64F, HIP_R_32F));
+    }
+
+    // An empty product never needs emulation (with k == 0, D = beta * C); the
+    // decision declines it and the workspace query reports 0.
+    TEST_F(FixedPointEmulationTest, WouldApply_RejectsEmptyProduct)
+    {
+        set_enabled(true);
+        set_strategy(HIPBLAS_EMULATION_STRATEGY_EAGER);
+        for(hipDataType t : {HIP_R_64F, HIP_R_32F})
+        {
+            EXPECT_FALSE(would_apply(t, t, t, t, t, 512, 100, 0, 1));
+            EXPECT_FALSE(would_apply(t, t, t, t, t, 0, 100, 512, 1));
+            EXPECT_FALSE(would_apply(t, t, t, t, t, 512, 0, 512, 1));
+        }
+        EXPECT_EQ(hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIP_R_64F, 512, 100, 0, 1),
+                  0u);
+        EXPECT_EQ(hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIP_R_64F, 0, 100, 512, 1),
+                  0u);
+        EXPECT_EQ(hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIP_R_64F, 512, 0, 512, 1),
+                  0u);
+        EXPECT_GT(
+            hipblasLtEmulationWorkspaceSize(m_handle, m_emul_desc, HIP_R_64F, 512, 100, 512, 1),
+            0u);
+    }
+
+    /* k == 0 under EAGER through the public API: D = beta * C, and no HIP
+     * error is left pending (the scale kernels used to be launched with a
+     * zero-sized grid, leaving hipErrorInvalidConfiguration).               */
+    template <typename T>
+    static void runKZeroCase()
+    {
+        using Tr = WsTypeTraits<T>;
+
+        constexpr int64_t M = 512, N = 100, K = 0;
+
+        PtrArrayResources r;
+        ASSERT_EQ(hipblasLtCreate(&r.handle), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&r.emul, Tr::emul_ctype, Tr::hip_type),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtEmulationDescCreate(&r.ed), HIPBLAS_STATUS_SUCCESS);
+        emulSetStrategy(r.ed, HIPBLAS_EMULATION_STRATEGY_EAGER);
+        emulAttach(r.emul, r.ed);
+
+        EXPECT_EQ(hipblasLtEmulationWorkspaceSize(r.handle, r.emul, Tr::hip_type, M, N, K, 1), 0u);
+
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.la, Tr::hip_type, M, K, M),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.lb, Tr::hip_type, K, N, 1),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.lc, Tr::hip_type, M, N, M),
+                  HIPBLAS_STATUS_SUCCESS);
+
+        const size_t   nC = size_t(M) * N;
+        std::vector<T> hC(nC), hD(nC);
+        {
+            std::mt19937                      rng(20261110u);
+            std::uniform_real_distribution<T> dist(T(-1), T(1));
+            for(T& v : hC)
+                v = dist(rng);
+        }
+        /* A and B hold no elements; pass valid (unused) pointers. */
+        T* dA = static_cast<T*>(r.alloc(sizeof(T)));
+        T* dB = static_cast<T*>(r.alloc(sizeof(T)));
+        T* dC = static_cast<T*>(r.alloc(nC * sizeof(T)));
+        T* dD = static_cast<T*>(r.alloc(nC * sizeof(T)));
+        ASSERT_TRUE(dA && dB && dC && dD) << "hipMalloc failed";
+        ASSERT_EQ(hipMemcpy(dC, hC.data(), nC * sizeof(T), hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dD, 0, nC * sizeof(T)), hipSuccess);
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        (void)hipGetLastError();
+
+        for(T alpha : {T(1), T(0)})
+        {
+            const T               beta = T(2);
+            const hipblasStatus_t st   = hipblasLtMatmul(r.handle, r.emul, &alpha, dA, r.la, dB,
+                                                       r.lb, &beta, dC, r.lc, dD, r.lc, nullptr,
+                                                       nullptr, 0, nullptr);
+            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+            if(st != HIPBLAS_STATUS_SUCCESS)
+                GTEST_SKIP() << "Native k == 0 hipblasLtMatmul failed on this device";
+            EXPECT_EQ(hipGetLastError(), hipSuccess) << "pending HIP error after k == 0, alpha "
+                                                     << alpha;
+            ASSERT_EQ(hipMemcpy(hD.data(), dD, nC * sizeof(T), hipMemcpyDeviceToHost),
+                      hipSuccess);
+            size_t mismatches = 0;
+            for(size_t i = 0; i < nC; ++i)
+                if(hD[i] != T(2) * hC[i])
+                    ++mismatches;
+            EXPECT_EQ(mismatches, 0u) << "D must equal beta * C for k == 0, alpha " << alpha;
+        }
+    }
+
+    class FixedPointEmulationKZeroTest : public ::testing::TestWithParam<hipDataType>
+    {
+    protected:
+        void SetUp() override
+        {
+            if(!has_supported_device())
+                GTEST_SKIP() << "No HIP device or device not supported by emulation";
+        }
+    };
+
+    TEST_P(FixedPointEmulationKZeroTest, NoPendingErrorAndBetaC)
+    {
+        if(GetParam() == HIP_R_32F)
+            runKZeroCase<float>();
+        else
+            runKZeroCase<double>();
+    }
+
+    INSTANTIATE_TEST_SUITE_P(KZero,
+                             FixedPointEmulationKZeroTest,
+                             ::testing::Values(HIP_R_64F, HIP_R_32F),
+                             [](const ::testing::TestParamInfo<hipDataType>& info) {
+                                 return std::string(info.param == HIP_R_32F ? "FP32" : "FP64");
+                             });
+
+    // ── NonRealTypes: env-var emulation must not touch complex / FP16 / BF16 ──
+    //
+    // With HIPBLAS_EMULATE_SINGLE_PRECISION=1, the plain 32F compute type
+    // enables emulation, but 32F compute is also used for CGEMM and for
+    // FP16 / BF16 matrices.  Those must run natively: correct D, nothing
+    // written past D, and the heuristic must not report emulation workspace.
+    // The env var is read once per process, so the test is skipped unless it
+    // is set when the test binary starts.
+    struct NonRealParam
+    {
+        const char* name;
+        hipDataType type;
+        size_t      elem_bytes;
+        uint32_t    one_bits; /* raw bits of 1 (real part for complex)     */
+        uint32_t    k_bits; /* raw bits of K = 256 (real part for complex) */
+    };
+
+    class FixedPointEmulationNonRealTypesTest : public ::testing::TestWithParam<NonRealParam>
+    {
+    protected:
+        void SetUp() override
+        {
+            if(!has_supported_device())
+                GTEST_SKIP() << "No HIP device or device not supported by emulation";
+            if(!fixedPointEmulationIsEnabled(HIP_R_32F))
+                GTEST_SKIP() << "Set HIPBLAS_EMULATE_SINGLE_PRECISION=1 to run";
+        }
+    };
+
+    TEST_P(FixedPointEmulationNonRealTypesTest, RunsNative)
+    {
+        const NonRealParam& p = GetParam();
+        constexpr int64_t   M = 256, N = 256, K = 256;
+        const bool          complex = (p.type == HIP_C_32F);
+        const size_t        part    = complex ? p.elem_bytes / 2 : p.elem_bytes;
+
+        PtrArrayResources r;
+        ASSERT_EQ(hipblasLtCreate(&r.handle), HIPBLAS_STATUS_SUCCESS);
+        /* Plain 32F compute: emulation is enabled only by the env var.  The
+         * EAGER descriptor makes sure the size cannot be why it runs natively. */
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&r.emul, HIPBLAS_COMPUTE_32F,
+                                            complex ? HIP_C_32F : HIP_R_32F),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtEmulationDescCreate(&r.ed), HIPBLAS_STATUS_SUCCESS);
+        emulSetStrategy(r.ed, HIPBLAS_EMULATION_STRATEGY_EAGER);
+        emulAttach(r.emul, r.ed);
+
+        /* An FP32 emulation workspace for this shape, so the call would
+         * emulate if the matrix types were not checked.                     */
+        const size_t emul_ws
+            = hipblasLtEmulationWorkspaceSize(r.handle, r.emul, HIP_R_32F, M, N, K, 1);
+        ASSERT_GT(emul_ws, 0u);
+
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.la, p.type, M, K, M), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.lb, p.type, K, N, K), HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.lc, p.type, M, N, M), HIPBLAS_STATUS_SUCCESS);
+
+        /* Heuristic: must not report the emulation workspace size. */
+        {
+            ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&r.pref), HIPBLAS_STATUS_SUCCESS);
+            const uint64_t max_ws = emul_ws;
+            ASSERT_EQ(hipblasLtMatmulPreferenceSetAttribute(
+                          r.pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws)),
+                      HIPBLAS_STATUS_SUCCESS);
+            hipblasLtMatmulHeuristicResult_t heur[4]{};
+            int                              cnt = 0;
+            if(hipblasLtMatmulAlgoGetHeuristic(
+                   r.handle, r.emul, r.la, r.lb, r.lc, r.lc, r.pref, 4, heur, &cnt)
+                   != HIPBLAS_STATUS_SUCCESS
+               || cnt == 0)
+                GTEST_SKIP() << "No native " << p.name << " kernel on this device";
+            for(int i = 0; i < cnt; ++i)
+                EXPECT_LT(heur[i].workspaceSize, emul_ws)
+                    << "result " << i << " reports the emulation workspace for " << p.name;
+        }
+
+        /* All-ones A and B; C is not read (beta = 0). */
+        auto fill = [&](size_t count, uint32_t bits) {
+            std::vector<uint8_t> v(count * p.elem_bytes, 0);
+            for(size_t i = 0; i < count; ++i)
+                std::memcpy(v.data() + i * p.elem_bytes, &bits, part);
+            return v;
+        };
+        const size_t               nA = size_t(M) * K, nB = size_t(K) * N, nD = size_t(M) * N;
+        const std::vector<uint8_t> hA = fill(nA, p.one_bits), hB = fill(nB, p.one_bits);
+        const size_t               dBytes = nD * p.elem_bytes;
+        /* D is followed by a guard region as large as D itself, which an
+         * FP32 write of D (as emulation does) would overrun into.           */
+        constexpr uint8_t GUARD = 0xA5;
+
+        void* dA  = r.alloc(nA * p.elem_bytes);
+        void* dB  = r.alloc(nB * p.elem_bytes);
+        void* dC  = r.alloc(dBytes);
+        void* dD  = r.alloc(2 * dBytes);
+        void* dWs = r.alloc(emul_ws);
+        ASSERT_TRUE(dA && dB && dC && dD && dWs) << "hipMalloc failed";
+        ASSERT_EQ(hipMemcpy(dA, hA.data(), hA.size(), hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemcpy(dB, hB.data(), hB.size(), hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dC, 0, dBytes), hipSuccess);
+        ASSERT_EQ(hipMemset(dD, GUARD, 2 * dBytes), hipSuccess);
+
+        float alpha[2] = {1.f, 0.f}, beta[2] = {0.f, 0.f};
+        const hipblasStatus_t st = hipblasLtMatmul(r.handle, r.emul, alpha, dA, r.la, dB, r.lb,
+                                                   beta, dC, r.lc, dD, r.lc, nullptr, dWs,
+                                                   emul_ws, nullptr);
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(st, HIPBLAS_STATUS_SUCCESS);
+
+        std::vector<uint8_t> hD(2 * dBytes);
+        ASSERT_EQ(hipMemcpy(hD.data(), dD, hD.size(), hipMemcpyDeviceToHost), hipSuccess);
+
+        /* Every entry is K (exact in every type here); imaginary parts 0.  */
+        const std::vector<uint8_t> expect = fill(nD, p.k_bits);
+        size_t                     wrong  = 0;
+        for(size_t i = 0; i < nD; ++i)
+            if(std::memcmp(hD.data() + i * p.elem_bytes, expect.data() + i * p.elem_bytes,
+                           p.elem_bytes)
+               != 0)
+                ++wrong;
+        EXPECT_EQ(wrong, 0u) << p.name << ": entries of D differ from K = " << K;
+
+        size_t overrun = 0;
+        for(size_t i = dBytes; i < hD.size(); ++i)
+            if(hD[i] != GUARD)
+                ++overrun;
+        EXPECT_EQ(overrun, 0u) << p.name << ": bytes written past the end of D";
+    }
+
+    INSTANTIATE_TEST_SUITE_P(
+        NonRealTypes,
+        FixedPointEmulationNonRealTypesTest,
+        ::testing::Values(
+            /* FP16: 1.0 = 0x3C00, 256.0 = 0x5C00 */
+            NonRealParam{"FP16", HIP_R_16F, 2, 0x3C00u, 0x5C00u},
+            /* BF16: 1.0 = 0x3F80, 256.0 = 0x4380 */
+            NonRealParam{"BF16", HIP_R_16BF, 2, 0x3F80u, 0x4380u},
+            /* Complex FP32: real parts 1.0f = 0x3F800000, 256.0f = 0x43800000 */
+            NonRealParam{"CGEMM", HIP_C_32F, 8, 0x3F800000u, 0x43800000u}),
+        [](const ::testing::TestParamInfo<NonRealParam>& info) {
+            return std::string(info.param.name);
+        });
 
 } // namespace
 

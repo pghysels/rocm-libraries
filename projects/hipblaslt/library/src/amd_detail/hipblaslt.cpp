@@ -1382,8 +1382,8 @@ try
      * normal heuristic path has accepted the caller's arguments.  Pointer-array
      * layouts are never emulated (see rocblaslt_matmul_impl), so they keep the
      * native workspace size. */
-    if(status == HIPBLAS_STATUS_SUCCESS && handle && matmulDesc && Adesc && Ddesc
-       && heuristicResultsArray && returnAlgoCount
+    if(status == HIPBLAS_STATUS_SUCCESS && handle && matmulDesc && Adesc && Bdesc && Cdesc
+       && Ddesc && heuristicResultsArray && returnAlgoCount
        && reinterpret_cast<const _rocblaslt_matrix_layout*>(Adesc)->batch_mode
               == HIPBLASLT_BATCH_MODE_STRIDED)
     {
@@ -1392,6 +1392,8 @@ try
          * get_attribute API only exposes attributes managed via set_attribute;
          * creation-time fields (m, n, type) live in the struct itself.        */
         const auto* A_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(Adesc);
+        const auto* B_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(Bdesc);
+        const auto* C_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(Cdesc);
         const auto* D_layout = reinterpret_cast<const _rocblaslt_matrix_layout*>(Ddesc);
         const auto* desc_ptr = reinterpret_cast<const _rocblaslt_matmul_desc*>(matmulDesc);
 
@@ -1404,7 +1406,10 @@ try
         const rocblaslt_compute_type compute_type = desc_ptr->compute_type;
 
         const FixedPointEmulationSettings emulDecision =
-            fixedPointEmulationDecision(h, desc_ptr, compute_type, m, n, k, batch_count,
+            fixedPointEmulationDecision(h, desc_ptr, compute_type,
+                                        A_layout->type, B_layout->type, C_layout->type,
+                                        D_layout->type,
+                                        m, n, k, batch_count,
                                           reinterpret_cast<const _rocblaslt_matmul_preference*>(pref)->max_workspace_bytes);
         if(emulDecision.status != rocblaslt_status_success)
             return RocBlasLtStatusToHIPStatus(emulDecision.status);
@@ -1826,7 +1831,8 @@ try
                                                 : rocblaslt_compute_f32_emulated_fixedpoint);
     if(fixedPointEmulatedComputeDataType(ctype) != computeInputType) return 0;
     const FixedPointEmulationSettings d = fixedPointEmulationDecision(
-        h, desc, ctype, m, n, k, 1, ~size_t{0});
+        h, desc, ctype, computeInputType, computeInputType, computeInputType, computeInputType,
+        m, n, k, 1, ~size_t{0});
     if(d.status != rocblaslt_status_success || !d.apply) return 0;
     return fixedPointEmulationWorkspaceSize(h, computeInputType, opA, opB, m, n, k, d);
 }

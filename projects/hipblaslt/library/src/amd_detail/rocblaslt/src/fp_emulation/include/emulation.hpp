@@ -254,26 +254,42 @@ struct FixedPointEmulationSettings
  *
  * desc may be nullptr when called from code that has no matmul desc
  * (e.g. workspace size query with no attached desc).
- * Always selects ADP (dynamic) mode; num_moduli is always S_MAX.          */
-FixedPointEmulationSettings fixedPointEmulationDecision(const _rocblaslt_handle*      h,
-                                                        const _rocblaslt_matmul_desc* desc,
-                                                        rocblaslt_compute_type        compute_type,
-                                                        int64_t                       m,
-                                                        int64_t                       n,
-                                                        int64_t                       k,
-                                                        int32_t                       batch_count,
+ * Always selects ADP (dynamic) mode; num_moduli is always S_MAX.
+ *
+ * a_type, b_type, c_type, d_type: the A, B, C and D matrix types.  Emulation
+ * only applies when all four are the emulated real type of compute_type
+ * (HIP_R_64F / HIP_R_32F).
+ * The plain 64F / 32F compute types are also used for complex GEMMs
+ * (HIP_C_64F / HIP_C_32F) and for mixed precision (FP16 / BF16 with 32F
+ * compute); those must never be emulated.
+ * An empty product (m, n or k == 0) is never emulated either.            */
+FixedPointEmulationSettings fixedPointEmulationDecision(const _rocblaslt_handle*       h,
+                                                        const _rocblaslt_matmul_desc*  desc,
+                                                        rocblaslt_compute_type         compute_type,
+                                                        hipDataType                    a_type,
+                                                        hipDataType                    b_type,
+                                                        hipDataType                    c_type,
+                                                        hipDataType                    d_type,
+                                                        int64_t                        m,
+                                                        int64_t                        n,
+                                                        int64_t                        k,
+                                                        int32_t                        batch_count,
                                                         size_t workspace_bytes);
 
 /* Convenience wrapper: returns true when fixedPointEmulationDecision(...).apply
  * is true for this type and problem. Cheaper than the full decision when only
  * the apply/reject outcome is needed.                                       */
-bool fixedPointEmulationWouldApply(const _rocblaslt_handle*      h,
-                                   const _rocblaslt_matmul_desc* desc,
-                                   rocblaslt_compute_type        compute_type,
-                                   int64_t                       m,
-                                   int64_t                       n,
-                                   int64_t                       k,
-                                   int32_t                       batch_count);
+bool fixedPointEmulationWouldApply(const _rocblaslt_handle*       h,
+                                   const _rocblaslt_matmul_desc*  desc,
+                                   rocblaslt_compute_type         compute_type,
+                                   hipDataType                    a_type,
+                                   hipDataType                    b_type,
+                                   hipDataType                    c_type,
+                                   hipDataType                    d_type,
+                                   int64_t                        m,
+                                   int64_t                        n,
+                                   int64_t                        k,
+                                   int32_t                        batch_count);
 
 /* Returns the workspace size in bytes for the given problem and input type.
  * Always uses S_MAX (= 20) moduli for the layout (always ADP mode).
