@@ -3966,6 +3966,101 @@ namespace
                                  return std::string(info.param == HIP_R_32F ? "FP32" : "FP64");
                              });
 
+    /* alpha == 0 with A = B = nullptr: BLAS leaves A and B unreferenced, and
+     * the null-A/B check accepts this call.  Emulation reads A and B, so it
+     * must not run: an EAGER emulated request has to take the native path
+     * (D = beta * C) instead of faulting with an illegal memory access.    */
+    template <typename T>
+    static void runAlphaZeroNullABCase()
+    {
+        using Tr = WsTypeTraits<T>;
+
+        constexpr int64_t M = 100, N = 101, K = 102;
+
+        PtrArrayResources r;
+        ASSERT_EQ(hipblasLtCreate(&r.handle), HIPBLAS_STATUS_SUCCESS);
+
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&r.emul, Tr::emul_ctype, Tr::hip_type),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtEmulationDescCreate(&r.ed), HIPBLAS_STATUS_SUCCESS);
+        emulSetStrategy(r.ed, HIPBLAS_EMULATION_STRATEGY_EAGER);
+        emulAttach(r.emul, r.ed);
+
+        /* Workspace large enough for emulation, so the call would emulate
+         * (and fault) without the alpha == 0 guard.                         */
+        const size_t emul_ws
+            = hipblasLtEmulationWorkspaceSize(r.handle, r.emul, Tr::hip_type, M, N, K, 1);
+        if(emul_ws == 0)
+            GTEST_SKIP() << "Emulation does not apply on this device";
+
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.la, Tr::hip_type, M, K, M),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.lb, Tr::hip_type, K, N, K),
+                  HIPBLAS_STATUS_SUCCESS);
+        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.lc, Tr::hip_type, M, N, M),
+                  HIPBLAS_STATUS_SUCCESS);
+
+        const size_t   nC = size_t(M) * N;
+        std::vector<T> hC(nC), hD(nC);
+        {
+            std::mt19937                      rng(20261109u);
+            std::uniform_real_distribution<T> dist(T(-1), T(1));
+            for(T& v : hC)
+                v = dist(rng);
+        }
+        T*    dC  = static_cast<T*>(r.alloc(nC * sizeof(T)));
+        T*    dD  = static_cast<T*>(r.alloc(nC * sizeof(T)));
+        void* dWs = r.alloc(emul_ws);
+        ASSERT_TRUE(dC && dD && dWs) << "hipMalloc failed";
+        ASSERT_EQ(hipMemcpy(dC, hC.data(), nC * sizeof(T), hipMemcpyHostToDevice), hipSuccess);
+        ASSERT_EQ(hipMemset(dD, 0, nC * sizeof(T)), hipSuccess);
+
+        (void)hipGetLastError(); /* start from a clean error state */
+
+        const T               alpha = T(0), beta = T(2);
+        const hipblasStatus_t st    = hipblasLtMatmul(r.handle, r.emul, &alpha, nullptr, r.la,
+                                                   nullptr, r.lb, &beta, dC, r.lc, dD, r.lc,
+                                                   nullptr, dWs, emul_ws, nullptr);
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess)
+            << "alpha == 0 with null A/B must not fault (emulation must be skipped)";
+        ASSERT_EQ(st, HIPBLAS_STATUS_SUCCESS);
+        EXPECT_EQ(hipGetLastError(), hipSuccess);
+
+        ASSERT_EQ(hipMemcpy(hD.data(), dD, nC * sizeof(T), hipMemcpyDeviceToHost), hipSuccess);
+        /* 2 * C is exact in floating point, so compare exactly. */
+        size_t mismatches = 0;
+        for(size_t i = 0; i < nC; ++i)
+            if(hD[i] != T(2) * hC[i])
+                ++mismatches;
+        EXPECT_EQ(mismatches, 0u) << "D must equal beta * C (first: D[0]=" << hD[0]
+                                  << ", expected " << T(2) * hC[0] << ")";
+    }
+
+    class FixedPointEmulationAlphaZeroTest : public ::testing::TestWithParam<hipDataType>
+    {
+    protected:
+        void SetUp() override
+        {
+            if(!has_supported_device())
+                GTEST_SKIP() << "No HIP device or device not supported by emulation";
+        }
+    };
+
+    TEST_P(FixedPointEmulationAlphaZeroTest, NullABUsesNative)
+    {
+        if(GetParam() == HIP_R_32F)
+            runAlphaZeroNullABCase<float>();
+        else
+            runAlphaZeroNullABCase<double>();
+    }
+
+    INSTANTIATE_TEST_SUITE_P(AlphaZero,
+                             FixedPointEmulationAlphaZeroTest,
+                             ::testing::Values(HIP_R_64F, HIP_R_32F),
+                             [](const ::testing::TestParamInfo<hipDataType>& info) {
+                                 return std::string(info.param == HIP_R_32F ? "FP32" : "FP64");
+                             });
+
 } // namespace
 
 #endif // HIPBLASLT_HAS_HIPBLAS_EMULATION_TYPES

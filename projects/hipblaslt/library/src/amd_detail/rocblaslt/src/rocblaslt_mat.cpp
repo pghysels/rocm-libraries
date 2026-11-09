@@ -144,6 +144,8 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
     //   • Non-batched, strided layout (batch_count == 1, batch_mode == STRIDED)
     //   • Plain GEMM epilogue (no activation, no bias, no auxiliary outputs)
     //   • alpha/beta are host (non-device-pointer) scalars
+    //   • alpha != 0 (BLAS leaves A and B unreferenced when alpha == 0, so
+    //     callers may pass null A/B; the native path computes beta * C)
     //   • Arithmetic intensity exceeds the threshold (compute-bound region),
     //     unless the EAGER strategy is selected
     // Invalid emulation environment variables are ignored.
@@ -156,7 +158,11 @@ rocblaslt_status rocblaslt_matmul_impl(const rocblaslt_handle       handle,
        && E             == nullptr
        && !matmul_descr->pointermode
        && epilogue      == ROCBLASLT_EPILOGUE_DEFAULT
-       && batch_mode    == HIPBLASLT_BATCH_MODE_STRIDED)
+       && batch_mode    == HIPBLASLT_BATCH_MODE_STRIDED
+       // BLAS leaves A and B unreferenced when alpha == 0, so callers may pass
+       // null pointers; the native path computes beta * C without reading them.
+       // Evaluated after !pointermode, so alpha is a host pointer here.
+       && !hostScalarIsZero(alphaBetaScalarType(scale_type, compute_type, type_a), alpha))
     {
         FixedPointEmulationSettings emulDecision = fixedPointEmulationDecision(
             handle, matmul_descr, compute_type, m, n, k, num_batches_a, workspaceSizeInBytes);
