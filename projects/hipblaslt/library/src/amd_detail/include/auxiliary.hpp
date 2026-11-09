@@ -189,8 +189,10 @@ constexpr const char* hipblas_computetype_to_string(hipblasComputeType_t type)
            : type == HIPBLAS_COMPUTE_32I           ? "i32_r"
            : type == HIPBLAS_COMPUTE_32F_FAST_16F  ? "f32_f16_r"
            : type == HIPBLAS_COMPUTE_32F_FAST_16BF ? "f32_bf16_r"
+#if HIPBLASLT_HAS_HIPBLAS_EMULATION_TYPES
            : type == HIPBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT ? "f64_emulated_fixedpoint_r"
            : type == HIPBLAS_COMPUTE_32F_EMULATED_FIXEDPOINT ? "f32_emulated_fixedpoint_r"
+#endif
                                                    : "non-supported compute type";
 }
 

@@ -225,7 +225,7 @@ struct FixedPointEmulationSettings
     rocblaslt_status                         status;      /* invalid_value on bad env            */
     bool                                     apply;       /* true -> use emulation; false -> native path */
     uint32_t                                 sv_support;  /* resolved special-values bitmask (bit 0 = Inf, bit 1 = NaN) */
-    hipblasEmulationStrategy_t             strategy;    /* PERFORMANT or EAGER (resolved from desc/env and the device policy; never DEFAULT) */
+    rocblaslt_emulation_strategy             strategy;    /* PERFORMANT or EAGER (resolved from desc/env and the device policy; never DEFAULT) */
     void*                                    workspace;   /* caller workspace ptr; nullptr until filled before GEMM dispatch */
     size_t                                   workspace_bytes; /* caller workspace size; ~size_t{0} = no budget constraint */
     /* ADP target precision in mantissa bits.

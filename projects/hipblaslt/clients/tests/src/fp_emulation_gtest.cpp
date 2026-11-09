@@ -29,6 +29,11 @@
 #include <string>
 #include <vector>
 
+// These tests use HIPBLAS_COMPUTE_*_EMULATED_FIXEDPOINT and hipblasEmulationStrategy_t,
+// which need hipblas-common >= 1.5.0. Against an older hipblas-common they are compiled out;
+// the library itself still builds and emulates through the environment variables.
+#if HIPBLASLT_HAS_HIPBLAS_EMULATION_TYPES
+
 namespace
 {
 
@@ -574,7 +579,7 @@ namespace
 
         const double                alpha = 1.0, beta = 0.0;
         FixedPointEmulationSettings settings{};
-        settings.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        settings.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         settings.sv_support = 0u /* special values: none */; // skip Inf/NaN check (faster, inputs are finite)
         const size_t _ws_size_A = hipblasLtEmulationWorkspaceSize(
@@ -896,7 +901,7 @@ namespace
         }
 
         FixedPointEmulationSettings emu_settings{};
-        emu_settings.strategy             = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        emu_settings.strategy             = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
         emu_settings.adp_mantissa_bits = p.mantissa_bits;
         emu_settings.sv_support = 0u /* special values: none */; /* skip Inf/NaN detection */
         /* Allocate workspace for this GEMM configuration */
@@ -1293,7 +1298,7 @@ namespace
         ASSERT_EQ(hipMemset(dC, 0, bytes), hipSuccess);
 
         FixedPointEmulationSettings emu_settings{};
-        emu_settings.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        emu_settings.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         emu_settings.sv_support = 0u /* special values: none */; /* skip Inf/NaN detection */
         /* Allocate workspace for ADP test */
@@ -1431,7 +1436,7 @@ namespace
         /* emulation strategy=HIPBLAS_EMULATION_STRATEGY_EAGER now set on matmul desc; see emulSetStrategy() */
 
         FixedPointEmulationSettings emu_settings{};
-        emu_settings.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        emu_settings.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         emu_settings.sv_support = 0u /* special values: none */;
         /* Allocate workspace for Demmel test */
@@ -1853,7 +1858,7 @@ namespace
         }
 
         FixedPointEmulationSettings emu_settings{};
-        emu_settings.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        emu_settings.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         emu_settings.sv_support = 0u /* special values: none */;
         const size_t _struct_ws_sz = [&]() -> size_t {
@@ -2052,7 +2057,7 @@ namespace
         /* ── Step 1: ADP triggers at the fp64EmulatedGemm level ────────────── */
         {
             FixedPointEmulationSettings emu{};
-            emu.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+            emu.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
             emu.sv_support = 0u /* special values: none */;
             const size_t _adpx_ws_sz = hipblasLtEmulationWorkspaceSize(
@@ -2699,7 +2704,7 @@ namespace
 
         /* Emulated */
         FixedPointEmulationSettings emu{};
-        emu.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        emu.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         emu.sv_support = 0u /* special values: none */;
         const size_t _nul_ws_sz = hipblasLtEmulationWorkspaceSize(
@@ -2794,7 +2799,7 @@ namespace
         };
 
         FixedPointEmulationSettings settings{};
-        settings.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        settings.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         settings.sv_support = 1u /* special values: Inf */; /* enable Inf detection */
         const size_t _sv_ws_sz = hipblasLtEmulationWorkspaceSize(
@@ -2920,7 +2925,7 @@ namespace
 
         /* Emulated with ADP, num_moduli=8 upper bound */
         FixedPointEmulationSettings emu{};
-        emu.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        emu.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         emu.sv_support = 0u /* special values: none */;
         const size_t _alm_ws_sz = hipblasLtEmulationWorkspaceSize(
@@ -3129,7 +3134,7 @@ namespace
 
         const float                 alpha = 1.f, beta = 0.f;
         FixedPointEmulationSettings settings{};
-        settings.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        settings.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         settings.sv_support = 0u /* special values: none */; /* no NaN check in this test */
         settings.workspace       = d_ws;
@@ -3246,7 +3251,7 @@ namespace
 
         const float                 alpha = 1.f, beta = 0.f;
         FixedPointEmulationSettings settings{};
-        settings.strategy = HIPBLAS_EMULATION_STRATEGY_EAGER; /* bypass perf gate in direct test calls */
+        settings.strategy = rocblaslt_emulation_strategy_eager; /* bypass perf gate in direct test calls */
 
         settings.sv_support = 0xFFFFu /* special values: default (Inf + NaN) */; /* NaN + Inf detection enabled */
         settings.workspace       = d_ws;
@@ -3678,7 +3683,7 @@ namespace
         /* Internal entry point: status depends on the workspace and strategy. */
         {
             FixedPointEmulationSettings s{};
-            s.strategy        = p.strategy;
+            s.strategy        = static_cast<rocblaslt_emulation_strategy>(p.strategy);
             s.sv_support      = 0u;
             s.workspace       = dWs;
             s.workspace_bytes = ws_bytes;
@@ -3962,3 +3967,5 @@ namespace
                              });
 
 } // namespace
+
+#endif // HIPBLASLT_HAS_HIPBLAS_EMULATION_TYPES

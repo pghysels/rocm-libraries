@@ -52,7 +52,7 @@ constexpr uint32_t HIPBLASLT_EMULATION_SV_SUPPORT_DEFAULT = 0xFFFFu;
  *******************************************************************************/
 struct hipblasLtEmulationDescriptor
 {
-    hipblasEmulationStrategy_t             emulation_strategy   = HIPBLAS_EMULATION_STRATEGY_DEFAULT;              /**< DEFAULT = use process-wide env-var default (PERFORMANT unless overridden) */
+    rocblaslt_emulation_strategy             emulation_strategy   = rocblaslt_emulation_strategy_default;              /**< DEFAULT = use process-wide env-var default (PERFORMANT unless overridden) */
     uint32_t emulation_sv_support = HIPBLASLT_EMULATION_SV_SUPPORT_DEFAULT; /**< Special-values bitmask (bit 0 = Inf, bit 1 = NaN; 0 = none; 0xFFFF = DEFAULT = inherit HIPBLAS_EMULATION_SPECIAL_VALUES_SUPPORT_MASK, which defaults to 0x3). Same layout as cudaEmulationSpecialValuesSupport. */
     int32_t  emulation_fixedpoint_mantissa_control           = 0;       /**< Stored and returned by Get; not used by the emulation yet */
     int32_t  emulation_fixedpoint_max_mantissa_bits          = 0;       /**< 0 = inherit env var; 1..52 for FP64 (1..23 for FP32) */

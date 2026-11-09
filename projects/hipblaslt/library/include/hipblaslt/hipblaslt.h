@@ -50,6 +50,20 @@
 #include <hipblas/hipblas.h>
 #endif
 
+/*! \brief 1 if hipblas-common provides the emulation types, 0 otherwise.
+ *
+ *  hipblas-common 1.5.0 added ``HIPBLAS_COMPUTE_{64F,32F}_EMULATED_FIXEDPOINT`` and
+ *  ``hipblasEmulationStrategy_t``. Earlier releases do not define ``HIPBLAS_COMMON_VERSION``.
+ *  Without them, fixed-point emulation is still available: enable it through the environment
+ *  variables, or pass the strategy attribute as a plain ``int32_t``. */
+#ifndef HIPBLASLT_HAS_HIPBLAS_EMULATION_TYPES
+#if defined(HIPBLAS_COMMON_VERSION) && HIPBLAS_COMMON_VERSION >= 10500
+#define HIPBLASLT_HAS_HIPBLAS_EMULATION_TYPES 1
+#else
+#define HIPBLASLT_HAS_HIPBLAS_EMULATION_TYPES 0
+#endif
+#endif
+
 #include <memory>
 #include <regex>
 #include <vector>
@@ -516,7 +530,7 @@ typedef enum {
  */
 typedef enum {
   HIPBLASLT_MATMUL_PREF_SEARCH_MODE = 0,          /**<Search mode. Data type: ``uint32_t``. */
-  HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 1,  /**<Maximum allowed workspace memory. Default is 0 (no workspace memory allowed). Values above ``UINT32_MAX`` (4 GiB - 1), such as ``SIZE_MAX`` for no limit, are clamped to ``UINT32_MAX``, which is the value read back. Data type: ``uint64_t``. */
+  HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 1,  /**<Maximum allowed workspace memory. Default is 0 (no workspace memory allowed). ``SIZE_MAX`` means no limit. The value is stored and read back as set. Native kernels address the workspace with 32-bit offsets and are selected as if the limit were at most ``UINT32_MAX`` (4 GiB - 1); FP64/FP32 emulation can use a larger workspace. Data type: ``uint64_t``. */
   HIPBLASLT_MATMUL_PREF_SM_COUNT_TARGET = 2,      /**<Bias heuristic algorithm selection toward kernels that perform well at this targeted compute-unit count. ``0`` (default) means no constraint. Negative values are rejected with ``HIPBLAS_STATUS_INVALID_VALUE``. Data type: ``int32_t``. */
   HIPBLASLT_MATMUL_PREF_GROUPED_DESC_D_AVERAGE_ROWS = 3,    /**<Grouped GEMM only. Expected average number of rows of D per group. ``0`` (default) means not set. Data type: ``int64_t``. */
   HIPBLASLT_MATMUL_PREF_GROUPED_DESC_D_AVERAGE_COLS = 4,    /**<Grouped GEMM only. Expected average number of columns of D per group. ``0`` (default) means not set. Data type: ``int64_t``. */
@@ -1502,8 +1516,8 @@ hipblasStatus_t
  * memory. Pointer must be 16B aligned (that is, the lowest 4 bits of the address must
  * be 0).
  *  @param[in]
- *  workspaceSizeInBytes    Size of the workspace. Values above ``UINT32_MAX``
- * (4 GiB - 1) are clamped to ``UINT32_MAX``.
+ *  workspaceSizeInBytes    Size of the workspace. Native kernels use at most
+ * ``UINT32_MAX`` (4 GiB - 1) bytes of it; FP64/FP32 emulation can use more.
  *  @param[in]
  *  stream                  The HIP stream where all GPU work is
  * submitted.

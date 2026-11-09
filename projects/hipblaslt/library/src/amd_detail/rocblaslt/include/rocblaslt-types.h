@@ -327,6 +327,40 @@ typedef enum rocblaslt_compute_type_
                 Must match HIPBLAS_COMPUTE_32F_EMULATED_FIXEDPOINT. */
 } rocblaslt_compute_type;
 
+/*! \brief Internal emulation strategy.
+ *
+ *  Mirrors ``hipblasEmulationStrategy_t``, which only exists in hipblas-common >= 1.5.0. The
+ *  library uses this enum so that it builds, and emulation still works (through the
+ *  environment variables and the ``int32_t`` strategy attribute), against older
+ *  hipblas-common releases. */
+typedef enum rocblaslt_emulation_strategy_
+{
+    rocblaslt_emulation_strategy_default
+    = 0, /**< Use the process-wide default. Must match HIPBLAS_EMULATION_STRATEGY_DEFAULT. */
+    rocblaslt_emulation_strategy_performant
+    = 1, /**< Emulate only when predicted faster. Must match HIPBLAS_EMULATION_STRATEGY_PERFORMANT. */
+    rocblaslt_emulation_strategy_eager
+    = 2, /**< Always emulate when supported. Must match HIPBLAS_EMULATION_STRATEGY_EAGER. */
+} rocblaslt_emulation_strategy;
+
+#if HIPBLASLT_HAS_HIPBLAS_EMULATION_TYPES
+static_assert(static_cast<int>(rocblaslt_compute_f64_emulated_fixedpoint)
+                  == static_cast<int>(HIPBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT),
+              "rocblaslt_compute_f64_emulated_fixedpoint out of sync with hipblas-common");
+static_assert(static_cast<int>(rocblaslt_compute_f32_emulated_fixedpoint)
+                  == static_cast<int>(HIPBLAS_COMPUTE_32F_EMULATED_FIXEDPOINT),
+              "rocblaslt_compute_f32_emulated_fixedpoint out of sync with hipblas-common");
+static_assert(static_cast<int>(rocblaslt_emulation_strategy_default)
+                  == static_cast<int>(HIPBLAS_EMULATION_STRATEGY_DEFAULT),
+              "rocblaslt_emulation_strategy_default out of sync with hipblas-common");
+static_assert(static_cast<int>(rocblaslt_emulation_strategy_performant)
+                  == static_cast<int>(HIPBLAS_EMULATION_STRATEGY_PERFORMANT),
+              "rocblaslt_emulation_strategy_performant out of sync with hipblas-common");
+static_assert(static_cast<int>(rocblaslt_emulation_strategy_eager)
+                  == static_cast<int>(HIPBLAS_EMULATION_STRATEGY_EAGER),
+              "rocblaslt_emulation_strategy_eager out of sync with hipblas-common");
+#endif
+
 /*! \ingroup types_module
  *  \brief Specify the additional attributes of a matrix descriptor
  *

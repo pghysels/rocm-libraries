@@ -33,6 +33,18 @@
 #ifndef HIPBLAS_COMMON_H
 #define HIPBLAS_COMMON_H
 
+/*! \brief hipblas-common version.
+ *
+ *  This header is the single source of truth for the version: CMakeLists.txt parses these
+ *  macros. Releases before 1.5.0 do not define them, so test with
+ *  ``#if defined(HIPBLAS_COMMON_VERSION) && HIPBLAS_COMMON_VERSION >= 10500``. */
+#define HIPBLAS_COMMON_VERSION_MAJOR 1
+#define HIPBLAS_COMMON_VERSION_MINOR 5
+#define HIPBLAS_COMMON_VERSION_PATCH 0
+#define HIPBLAS_COMMON_VERSION                                              \
+    (HIPBLAS_COMMON_VERSION_MAJOR * 10000 + HIPBLAS_COMMON_VERSION_MINOR * 100 \
+     + HIPBLAS_COMMON_VERSION_PATCH)
+
 /*! \brief hipblas status codes definition */
 typedef enum
 {
@@ -88,11 +100,11 @@ typedef enum
     HIPBLAS_COMPUTE_32F_FAST_8BF_FNUZ   = 101, /**< 32-bit compute using bf8 mfma instruction */
     HIPBLAS_COMPUTE_32F_FAST_8F8BF_FNUZ = 102, /**< 32-bit compute using f8bf8 mfma instruction */
     HIPBLAS_COMPUTE_32F_FAST_8BF8F_FNUZ = 103, /**< 32-bit compute using bf8f8 mfma instruction */
-    HIPBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT = 200, /**< 64-bit GEMM computed with fixed-point emulation */
-    HIPBLAS_COMPUTE_32F_EMULATED_FIXEDPOINT = 201, /**< 32-bit GEMM computed with fixed-point emulation. No cuBLAS equivalent (cuBLAS emulates FP32 with BF16x9). */
+    HIPBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT = 200, /**< 64-bit GEMM computed with fixed-point emulation. Since 1.5.0. */
+    HIPBLAS_COMPUTE_32F_EMULATED_FIXEDPOINT = 201, /**< 32-bit GEMM computed with fixed-point emulation. No cuBLAS equivalent (cuBLAS emulates FP32 with BF16x9). Since 1.5.0. */
 } hipblasComputeType_t;
 
-/*! \brief Emulation strategy for the hipBLAS family (hipBLAS, hipBLASLt).
+/*! \brief Emulation strategy for the hipBLAS family (hipBLAS, hipBLASLt). Since 1.5.0.
  *
  *  Counterpart of cuBLAS's ``cublasEmulationStrategy_t``. Its values are identical to
  *  ``hipEmulationStrategy`` (the counterpart of ``cudaEmulationStrategy``), but the two are
