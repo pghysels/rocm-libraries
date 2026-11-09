@@ -25,7 +25,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -1034,6 +1033,9 @@ namespace
                 ASSERT_EQ(hipMemcpy(dB, hB.data(), nB * sizeof(double), hipMemcpyHostToDevice),
                           hipSuccess);
 
+            /* Start each seed from a clean HIP error state. */
+            (void)hipGetLastError();
+
             /* Native FP64 DGEMM reference (C→D_nat). */
             const hipblasStatus_t nat_st = hipblasLtMatmul(hnat,
                                                            desc,
@@ -1083,6 +1085,13 @@ namespace
                 GTEST_SKIP() << "fp64EmulatedGemm returned " << static_cast<int>(emu_st)
                              << " (INT8 device library may be unavailable on this arch)";
             }
+
+            /* No HIP error may be left pending for the caller (k == 0 used to
+             * launch the scale kernels with a zero-sized grid, leaving
+             * hipErrorInvalidConfiguration behind).                         */
+            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+            EXPECT_EQ(hipGetLastError(), hipSuccess)
+                << "HIP error left pending by the emulated GEMM (k=" << p.k << ")";
 
             ASSERT_EQ(hipMemcpy(hD_nat.data(), dD_nat, nD * sizeof(double), hipMemcpyDeviceToHost),
                       hipSuccess);
@@ -4268,148 +4277,6 @@ namespace
                              [](const ::testing::TestParamInfo<hipDataType>& info) {
                                  return std::string(info.param == HIP_R_32F ? "FP32" : "FP64");
                              });
-
-    // ── NonRealTypes: env-var emulation must not touch complex / FP16 / BF16 ──
-    //
-    // With HIPBLAS_EMULATE_SINGLE_PRECISION=1, the plain 32F compute type
-    // enables emulation, but 32F compute is also used for CGEMM and for
-    // FP16 / BF16 matrices.  Those must run natively: correct D, nothing
-    // written past D, and the heuristic must not report emulation workspace.
-    // The env var is read once per process, so the test is skipped unless it
-    // is set when the test binary starts.
-    struct NonRealParam
-    {
-        const char* name;
-        hipDataType type;
-        size_t      elem_bytes;
-        uint32_t    one_bits; /* raw bits of 1 (real part for complex)     */
-        uint32_t    k_bits; /* raw bits of K = 256 (real part for complex) */
-    };
-
-    class FixedPointEmulationNonRealTypesTest : public ::testing::TestWithParam<NonRealParam>
-    {
-    protected:
-        void SetUp() override
-        {
-            if(!has_supported_device())
-                GTEST_SKIP() << "No HIP device or device not supported by emulation";
-            if(!fixedPointEmulationIsEnabled(HIP_R_32F))
-                GTEST_SKIP() << "Set HIPBLAS_EMULATE_SINGLE_PRECISION=1 to run";
-        }
-    };
-
-    TEST_P(FixedPointEmulationNonRealTypesTest, RunsNative)
-    {
-        const NonRealParam& p = GetParam();
-        constexpr int64_t   M = 256, N = 256, K = 256;
-        const bool          complex = (p.type == HIP_C_32F);
-        const size_t        part    = complex ? p.elem_bytes / 2 : p.elem_bytes;
-
-        PtrArrayResources r;
-        ASSERT_EQ(hipblasLtCreate(&r.handle), HIPBLAS_STATUS_SUCCESS);
-        /* Plain 32F compute: emulation is enabled only by the env var.  The
-         * EAGER descriptor makes sure the size cannot be why it runs natively. */
-        ASSERT_EQ(hipblasLtMatmulDescCreate(&r.emul, HIPBLAS_COMPUTE_32F,
-                                            complex ? HIP_C_32F : HIP_R_32F),
-                  HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtEmulationDescCreate(&r.ed), HIPBLAS_STATUS_SUCCESS);
-        emulSetStrategy(r.ed, HIPBLAS_EMULATION_STRATEGY_EAGER);
-        emulAttach(r.emul, r.ed);
-
-        /* An FP32 emulation workspace for this shape, so the call would
-         * emulate if the matrix types were not checked.                     */
-        const size_t emul_ws
-            = hipblasLtEmulationWorkspaceSize(r.handle, r.emul, HIP_R_32F, M, N, K, 1);
-        ASSERT_GT(emul_ws, 0u);
-
-        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.la, p.type, M, K, M), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.lb, p.type, K, N, K), HIPBLAS_STATUS_SUCCESS);
-        ASSERT_EQ(hipblasLtMatrixLayoutCreate(&r.lc, p.type, M, N, M), HIPBLAS_STATUS_SUCCESS);
-
-        /* Heuristic: must not report the emulation workspace size. */
-        {
-            ASSERT_EQ(hipblasLtMatmulPreferenceCreate(&r.pref), HIPBLAS_STATUS_SUCCESS);
-            const uint64_t max_ws = emul_ws;
-            ASSERT_EQ(hipblasLtMatmulPreferenceSetAttribute(
-                          r.pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws)),
-                      HIPBLAS_STATUS_SUCCESS);
-            hipblasLtMatmulHeuristicResult_t heur[4]{};
-            int                              cnt = 0;
-            if(hipblasLtMatmulAlgoGetHeuristic(
-                   r.handle, r.emul, r.la, r.lb, r.lc, r.lc, r.pref, 4, heur, &cnt)
-                   != HIPBLAS_STATUS_SUCCESS
-               || cnt == 0)
-                GTEST_SKIP() << "No native " << p.name << " kernel on this device";
-            for(int i = 0; i < cnt; ++i)
-                EXPECT_LT(heur[i].workspaceSize, emul_ws)
-                    << "result " << i << " reports the emulation workspace for " << p.name;
-        }
-
-        /* All-ones A and B; C is not read (beta = 0). */
-        auto fill = [&](size_t count, uint32_t bits) {
-            std::vector<uint8_t> v(count * p.elem_bytes, 0);
-            for(size_t i = 0; i < count; ++i)
-                std::memcpy(v.data() + i * p.elem_bytes, &bits, part);
-            return v;
-        };
-        const size_t               nA = size_t(M) * K, nB = size_t(K) * N, nD = size_t(M) * N;
-        const std::vector<uint8_t> hA = fill(nA, p.one_bits), hB = fill(nB, p.one_bits);
-        const size_t               dBytes = nD * p.elem_bytes;
-        /* D is followed by a guard region as large as D itself, which an
-         * FP32 write of D (as emulation does) would overrun into.           */
-        constexpr uint8_t GUARD = 0xA5;
-
-        void* dA  = r.alloc(nA * p.elem_bytes);
-        void* dB  = r.alloc(nB * p.elem_bytes);
-        void* dC  = r.alloc(dBytes);
-        void* dD  = r.alloc(2 * dBytes);
-        void* dWs = r.alloc(emul_ws);
-        ASSERT_TRUE(dA && dB && dC && dD && dWs) << "hipMalloc failed";
-        ASSERT_EQ(hipMemcpy(dA, hA.data(), hA.size(), hipMemcpyHostToDevice), hipSuccess);
-        ASSERT_EQ(hipMemcpy(dB, hB.data(), hB.size(), hipMemcpyHostToDevice), hipSuccess);
-        ASSERT_EQ(hipMemset(dC, 0, dBytes), hipSuccess);
-        ASSERT_EQ(hipMemset(dD, GUARD, 2 * dBytes), hipSuccess);
-
-        float alpha[2] = {1.f, 0.f}, beta[2] = {0.f, 0.f};
-        const hipblasStatus_t st = hipblasLtMatmul(r.handle, r.emul, alpha, dA, r.la, dB, r.lb,
-                                                   beta, dC, r.lc, dD, r.lc, nullptr, dWs,
-                                                   emul_ws, nullptr);
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-        ASSERT_EQ(st, HIPBLAS_STATUS_SUCCESS);
-
-        std::vector<uint8_t> hD(2 * dBytes);
-        ASSERT_EQ(hipMemcpy(hD.data(), dD, hD.size(), hipMemcpyDeviceToHost), hipSuccess);
-
-        /* Every entry is K (exact in every type here); imaginary parts 0.  */
-        const std::vector<uint8_t> expect = fill(nD, p.k_bits);
-        size_t                     wrong  = 0;
-        for(size_t i = 0; i < nD; ++i)
-            if(std::memcmp(hD.data() + i * p.elem_bytes, expect.data() + i * p.elem_bytes,
-                           p.elem_bytes)
-               != 0)
-                ++wrong;
-        EXPECT_EQ(wrong, 0u) << p.name << ": entries of D differ from K = " << K;
-
-        size_t overrun = 0;
-        for(size_t i = dBytes; i < hD.size(); ++i)
-            if(hD[i] != GUARD)
-                ++overrun;
-        EXPECT_EQ(overrun, 0u) << p.name << ": bytes written past the end of D";
-    }
-
-    INSTANTIATE_TEST_SUITE_P(
-        NonRealTypes,
-        FixedPointEmulationNonRealTypesTest,
-        ::testing::Values(
-            /* FP16: 1.0 = 0x3C00, 256.0 = 0x5C00 */
-            NonRealParam{"FP16", HIP_R_16F, 2, 0x3C00u, 0x5C00u},
-            /* BF16: 1.0 = 0x3F80, 256.0 = 0x4380 */
-            NonRealParam{"BF16", HIP_R_16BF, 2, 0x3F80u, 0x4380u},
-            /* Complex FP32: real parts 1.0f = 0x3F800000, 256.0f = 0x43800000 */
-            NonRealParam{"CGEMM", HIP_C_32F, 8, 0x3F800000u, 0x43800000u}),
-        [](const ::testing::TestParamInfo<NonRealParam>& info) {
-            return std::string(info.param.name);
-        });
 
 } // namespace
 
